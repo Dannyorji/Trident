@@ -1268,6 +1268,44 @@ jobs:
         run: bash scripts/check-schema-drift.sh
 
   # ---------------------------------------------------------------------------
+  # Backup/restore drill (issue #619). Runs the real scripts/backup.sh and
+  # scripts/restore.sh against a scratch database on every CI run, rather
+  # than trusting them to work from a one-time manual drill — restore.sh's
+  # validation step previously referenced two tables that do not exist
+  # anywhere in the schema (token_transfers, contracts) and crashed on every
+  # real invocation; nothing caught that until this job existed.
+  # ---------------------------------------------------------------------------
+  backup-restore-drill:
+    name: Backup/restore drill
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: trident
+          POSTGRES_DB: trident_backup_check
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Create the restore-target scratch database
+        run: |
+          PGPASSWORD=trident psql -h localhost -U postgres -d postgres \
+            -c "CREATE DATABASE trident_restore_check;"
+
+      - name: Run the backup/restore drill
+        env:
+          DATABASE_URL: postgres://postgres:trident@localhost:5432/trident_backup_check
+          RESTORE_DATABASE_URL: postgres://postgres:trident@localhost:5432/trident_restore_check
+        run: bash scripts/test-backup-restore.sh
+
+  # ---------------------------------------------------------------------------
   # Helm — lint, template render, and kind cluster deployment validation
   # ---------------------------------------------------------------------------
   helm:

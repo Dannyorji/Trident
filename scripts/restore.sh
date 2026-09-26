@@ -38,7 +38,10 @@ fi
 echo "[+] Initiating restore into target database..."
 START_TIME=$(date +%s)
 
-# Restore with clean and single transaction mode
+# Restore with clean mode. Deliberately NOT `|| true`: a failed pg_restore
+# must abort this script, not fall through to validation queries that would
+# either crash on missing tables or silently report zero rows against a
+# database that was never actually restored.
 pg_restore \
   --clean \
   --if-exists \
@@ -46,7 +49,7 @@ pg_restore \
   --no-privileges \
   --verbose \
   --dbname="$TARGET_URL" \
-  "$BACKUP_FILE" || true
+  "$BACKUP_FILE"
 
 END_TIME=$(date +%s)
 DURATION=$((END_TIME - START_TIME))
@@ -54,11 +57,17 @@ DURATION=$((END_TIME - START_TIME))
 echo "[+] Database restore completed in ${DURATION}s."
 
 # 2. Validation Queries
+#
+# Table names verified against database/migrations/0001_init.sql and
+# 0010_token_events.sql: the real tables are indexed_contracts and
+# token_events, not "contracts"/"token_transfers" (neither of which exists
+# anywhere in the schema) — the previous query crashed here on every run
+# before reaching any of the checks below it.
 echo "[+] Validating partitioned tables and row counts..."
 psql "$TARGET_URL" -t -A -c "
 SELECT 'soroban_events count: ' || count(*) FROM soroban_events;
-SELECT 'token_transfers count: ' || count(*) FROM token_transfers;
-SELECT 'contracts count: ' || count(*) FROM contracts;
+SELECT 'token_events count: ' || count(*) FROM token_events;
+SELECT 'indexed_contracts count: ' || count(*) FROM indexed_contracts;
 SELECT 'api_keys count: ' || count(*) FROM api_keys;
 "
 
