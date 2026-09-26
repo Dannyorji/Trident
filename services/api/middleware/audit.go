@@ -27,6 +27,14 @@ type AuditEntry struct {
 	RequestID   string
 	Network     string
 	Timestamp   time.Time
+	// AttemptedKeyPrefix and FailureReason are set only for a failed
+	// authentication attempt (status 401, issue #609). APIKeyID is nil in
+	// that case since the key never resolved to a row, so these are the
+	// only trace of which key was tried and why. AttemptedKeyPrefix is a
+	// prefix only - the same 16-character convention handlers/apikeys.go
+	// uses for key_prefix at creation time - never the full attempted key.
+	AttemptedKeyPrefix string
+	FailureReason      string
 }
 
 // AuditWriter asynchronously writes audit log entries to PostgreSQL.
@@ -145,6 +153,13 @@ func (aw *AuditWriter) insertBatch(ctx context.Context, batch []AuditEntry) erro
 		if e.APIKeyID != nil {
 			apiKeyID = *e.APIKeyID
 		}
+		var attemptedKeyPrefix, failureReason any
+		if e.AttemptedKeyPrefix != "" {
+			attemptedKeyPrefix = e.AttemptedKeyPrefix
+		}
+		if e.FailureReason != "" {
+			failureReason = e.FailureReason
+		}
 		rows[i] = []any{
 			apiKeyID,
 			e.Endpoint,
@@ -156,6 +171,8 @@ func (aw *AuditWriter) insertBatch(ctx context.Context, batch []AuditEntry) erro
 			e.ResultCount,
 			e.RequestID,
 			e.Network,
+			attemptedKeyPrefix,
+			failureReason,
 			e.Timestamp,
 		}
 	}
@@ -163,7 +180,7 @@ func (aw *AuditWriter) insertBatch(ctx context.Context, batch []AuditEntry) erro
 	_, err := aw.pool.CopyFrom(
 		ctx,
 		pgx.Identifier{"audit_log"},
-		[]string{"api_key_id", "endpoint", "method", "ip", "user_agent", "status_code", "duration_ms", "result_count", "request_id", "network", "ts"},
+		[]string{"api_key_id", "endpoint", "method", "ip", "user_agent", "status_code", "duration_ms", "result_count", "request_id", "network", "attempted_key_prefix", "failure_reason", "ts"},
 		pgx.CopyFromRows(rows),
 	)
 	return err
@@ -277,18 +294,26 @@ func AuditMiddleware(writer *AuditWriter) func(http.Handler) http.Handler {
 			apiKeyID := AuditAPIKeyIDFromContext(r.Context())
 			network := AuditNetworkFromContext(r.Context())
 
+			var attemptedKeyPrefix, failureReason string
+			if wrapped.statusCode == http.StatusUnauthorized {
+				attemptedKeyPrefix = keyPrefixForAudit(r.Header.Get("X-API-Key"))
+				failureReason = authFailureReason(r.Header.Get("X-API-Key"))
+			}
+
 			entry := AuditEntry{
-				APIKeyID:    apiKeyID,
-				Endpoint:    r.URL.Path,
-				Method:      r.Method,
-				IP:          ExtractClientIP(r),
-				UserAgent:   r.Header.Get("User-Agent"),
-				StatusCode:  wrapped.statusCode,
-				DurationMs:  int(time.Since(start).Milliseconds()),
-				ResultCount: wrapped.resultCount,
-				RequestID:   r.Header.Get("X-Request-ID"),
-				Network:     network,
-				Timestamp:   start,
+				APIKeyID:           apiKeyID,
+				Endpoint:           r.URL.Path,
+				Method:             r.Method,
+				IP:                 ExtractClientIP(r),
+				UserAgent:          r.Header.Get("User-Agent"),
+				StatusCode:         wrapped.statusCode,
+				DurationMs:         int(time.Since(start).Milliseconds()),
+				ResultCount:        wrapped.resultCount,
+				RequestID:          r.Header.Get("X-Request-ID"),
+				Network:            network,
+				AttemptedKeyPrefix: attemptedKeyPrefix,
+				FailureReason:      failureReason,
+				Timestamp:          start,
 			}
 
 			writer.Write(entry)
@@ -301,6 +326,36 @@ func SetAuditResultCount(w http.ResponseWriter, count int) {
 	if wrapped, ok := w.(*auditResponseWriter); ok {
 		wrapped.resultCount = &count
 	}
+}
+
+// auditKeyPrefixLength matches handlers/apikeys.go's own key_prefix
+// convention (the first 16 characters of a real "trident_<hex>" key), so an
+// audited failed-auth attempt's prefix is directly comparable to a real
+// key's stored prefix.
+const auditKeyPrefixLength = 16
+
+// keyPrefixForAudit returns a safe, bounded prefix of an attempted API key
+// for audit logging - never the full key. Empty input (no X-API-Key header
+// at all) yields an empty prefix rather than a placeholder, since "no key
+// was sent" is itself recorded via failureReason.
+func keyPrefixForAudit(attemptedKey string) string {
+	if attemptedKey == "" {
+		return ""
+	}
+	if len(attemptedKey) <= auditKeyPrefixLength {
+		return attemptedKey
+	}
+	return attemptedKey[:auditKeyPrefixLength]
+}
+
+// authFailureReason gives a coarse, non-sensitive reason for a 401 suitable
+// for the audit log - never anything derived from the key's actual value
+// beyond whether one was present at all.
+func authFailureReason(attemptedKey string) string {
+	if attemptedKey == "" {
+		return "missing X-API-Key header"
+	}
+	return "key not recognized"
 }
 
 func (w *auditResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }

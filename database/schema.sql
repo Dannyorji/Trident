@@ -138,18 +138,25 @@ CREATE INDEX IF NOT EXISTS idx_api_keys_active ON api_keys (key_hash)
 -- Per-request audit trail for API key usage (migration 0006).
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS audit_log (
-    id           BIGSERIAL   PRIMARY KEY,
-    api_key_id   UUID        REFERENCES api_keys(id) ON DELETE SET NULL,
-    endpoint     TEXT        NOT NULL,
-    method       TEXT        NOT NULL,
-    ip           INET,
-    user_agent   TEXT,
-    status_code  INT         NOT NULL,
-    duration_ms  INT         NOT NULL,
-    result_count INT,
-    request_id   TEXT        NOT NULL,
-    network      TEXT,
-    ts           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    id                    BIGSERIAL   PRIMARY KEY,
+    api_key_id            UUID        REFERENCES api_keys(id) ON DELETE SET NULL,
+    endpoint              TEXT        NOT NULL,
+    method                TEXT        NOT NULL,
+    ip                    INET,
+    user_agent            TEXT,
+    status_code           INT         NOT NULL,
+    duration_ms           INT         NOT NULL,
+    result_count          INT,
+    request_id            TEXT        NOT NULL,
+    network               TEXT,
+    -- Set only on a failed authentication attempt (migration 0033, issue
+    -- #609): api_key_id is NULL in that case since the key never resolved to
+    -- a row, so these are the only trace of which key was tried and why it
+    -- was rejected. attempted_key_prefix is a prefix only - never the full
+    -- attempted key.
+    attempted_key_prefix  TEXT,
+    failure_reason        TEXT,
+    ts                    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- Covers the admin analytics queries (migration 0029). The INCLUDE columns

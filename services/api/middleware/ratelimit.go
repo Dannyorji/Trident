@@ -108,7 +108,14 @@ func (tc *TierCache) Invalidate(hash string) {
 }
 
 func (tc *TierCache) resolve(ctx context.Context, apiKey string, db TierDB) string {
-	hash := hashKey(apiKey)
+	// Must match the hash stored in api_keys.key_hash (handlers.sha256hex /
+	// sha256KeyHash: plain SHA-256), not hashKey's HMAC-SHA256 — the latter
+	// is only for the legacy API_KEY_HASHES env-var auth path. Using HMAC
+	// here meant a DB-issued key's tier could never be found by this lookup
+	// and every such key silently fell back to "free" (issue #608). It also
+	// has to match what admin's UpdateAPIKey passes to InvalidateTier, which
+	// is the raw key_hash column value (plain SHA-256).
+	hash := sha256KeyHash(apiKey)
 	if t, ok := tc.get(hash); ok {
 		return t
 	}

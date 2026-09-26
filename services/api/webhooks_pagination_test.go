@@ -10,6 +10,8 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"github.com/Depo-dev/trident/services/api/middleware"
 )
 
 // connectWebhookTestDB mirrors handlers_test.connectRealTestDB (this is
@@ -83,7 +85,7 @@ func TestListWebhooksHandler_Pagination(t *testing.T) {
 			url += "&cursor=" + cursorParam
 		}
 		req := httptest.NewRequest(http.MethodGet, url, nil)
-		req.Header.Set("X-API-Key", apiKeyID)
+		req = req.WithContext(middleware.WithAPIKeyID(req.Context(), apiKeyID))
 		rec := httptest.NewRecorder()
 		listWebhooksHandler(db).ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
@@ -161,9 +163,13 @@ func TestListWebhooksHandler_ScopedToOwnAPIKey(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/webhooks", nil)
-	req.Header.Set("X-API-Key", keyB)
+	req = req.WithContext(middleware.WithAPIKeyID(req.Context(), keyB))
 	rec := httptest.NewRecorder()
 	listWebhooksHandler(db).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
 
 	var resp listWebhooksResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
