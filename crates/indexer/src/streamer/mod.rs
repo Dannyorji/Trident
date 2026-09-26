@@ -239,7 +239,9 @@ impl Streamer {
                 // current cursor, which means historical events are missing.
                 if let Some(ref new_map) = filter {
                     if let Some(ref old_map) = self.contract_filter {
-                        let cursor = crate::db::get_cursor(&self.db).await.unwrap_or(0);
+                        let cursor = crate::db::get_cursor(&self.db, &self.config.network)
+                            .await
+                            .unwrap_or(0);
                         for (id, &index_from) in new_map {
                             if !old_map.contains_key(id)
                                 && index_from > 0
@@ -382,6 +384,58 @@ impl Streamer {
         }
     }
 
+    /// Recover from a `getEvents` rejection reporting that `cursor` predates
+    /// the RPC's retained history, by advancing to the oldest ledger the RPC
+    /// still retains (issue #388). Returns the new cursor value.
+    ///
+    /// The span strictly between the old `cursor` and the new `floor` is
+    /// permanently lost to live polling the moment the cursor jumps — this
+    /// records it durably as a `backfill_jobs` row and increments a
+    /// dedicated metric before advancing, so the loss is queryable and
+    /// alertable instead of visible only in a log line (issue #598).
+    ///
+    /// Takes `db`/`network` explicitly (rather than `&self`) so it can be
+    /// exercised directly in a test without spinning up a whole `Streamer`.
+    async fn recover_retained_floor(
+        db: &PgPool,
+        network: &str,
+        cursor: u64,
+        floor: u64,
+        source_error: &TridentError,
+    ) -> u64 {
+        let skipped_from = cursor + 1;
+        let skipped_to = floor.saturating_sub(1);
+
+        if skipped_from <= skipped_to {
+            let gap = db::LedgerGap {
+                from_ledger: skipped_from,
+                to_ledger: skipped_to,
+            };
+            if let Err(enqueue_err) = db::enqueue_backfill_job(db, gap, network).await {
+                tracing::warn!(
+                    from_ledger = skipped_from,
+                    to_ledger = skipped_to,
+                    error = %enqueue_err,
+                    "Failed to enqueue backfill job for a retained-floor skip"
+                );
+            }
+            metrics::record_retained_floor_ledgers_skipped(skipped_to - skipped_from + 1);
+        }
+
+        // page_request_params sends `cursor + 1`, so store floor - 1 to make
+        // the next request anchor exactly at the oldest retained ledger.
+        let new_cursor = floor.saturating_sub(1);
+        tracing::warn!(
+            error = %source_error,
+            retained_floor = floor,
+            cursor = new_cursor,
+            skipped_from,
+            skipped_to,
+            "startLedger predates the RPC's retained history; advancing to the oldest retained ledger"
+        );
+        new_cursor
+    }
+
     /// Start the polling loop. Runs until `shutdown` is cancelled, always
     /// finishing the current `poll_once` before stopping (never mid-batch).
     pub async fn run(&mut self, shutdown: CancellationToken) -> Result<(), TridentError> {
@@ -395,7 +449,7 @@ impl Streamer {
             self.config.max_events_per_poll
         );
 
-        let mut cursor = db::get_cursor(&self.db).await?;
+        let mut cursor = db::get_cursor(&self.db, &self.config.network).await?;
         tracing::info!(cursor, "Resuming from ledger cursor");
 
         // Populate contract specs / interface tags once at startup (issues
@@ -485,16 +539,14 @@ impl Streamer {
                                 // starts inside the retained window.
                                 match parse_retained_floor(&e.to_string()) {
                                     Some(floor) if cursor < floor.saturating_sub(1) => {
-                                        // page_request_params sends `cursor + 1`, so
-                                        // store floor - 1 to make the next request
-                                        // anchor exactly at the oldest retained ledger.
-                                        cursor = floor.saturating_sub(1);
-                                        tracing::warn!(
-                                            error = %e,
-                                            retained_floor = floor,
+                                        cursor = Self::recover_retained_floor(
+                                            &self.db,
+                                            &self.config.network,
                                             cursor,
-                                            "startLedger predates the RPC's retained history; advancing to the oldest retained ledger"
-                                        );
+                                            floor,
+                                            &e,
+                                        )
+                                        .await;
                                     }
                                     _ => {
                                         tracing::warn!(error = %e, "Transient poll failure, will retry next interval");
@@ -744,7 +796,8 @@ impl Streamer {
             );
 
             metrics::record_reorg();
-            db::handle_reorg_rollback(&self.db, reorg_seq, new_cursor).await?;
+            db::handle_reorg_rollback(&self.db, &self.config.network, reorg_seq, new_cursor)
+                .await?;
             *cursor = new_cursor;
         }
 
@@ -1270,15 +1323,21 @@ impl Streamer {
             poll_duration.as_secs_f64(),
             lag_at_start,
         );
-        if let Err(e) =
-            db::update_health_stats(&self.db, *cursor as i64, total as i32, poll_duration).await
+        if let Err(e) = db::update_health_stats(
+            &self.db,
+            &self.config.network,
+            *cursor as i64,
+            total as i32,
+            poll_duration,
+        )
+        .await
         {
             tracing::warn!(error = %e, "Failed to update health stats");
         }
 
         // Alerting (issue #75) — best-effort, never aborts the poll cycle.
         if self.alerter.is_enabled() {
-            match db::get_alert_state(&self.db).await {
+            match db::get_alert_state(&self.db, &self.config.network).await {
                 Ok(mut alert_state) => {
                     let ctx = AlertContext {
                         last_ledger_indexed: *cursor,
@@ -1288,7 +1347,9 @@ impl Streamer {
                         rpc_all_degraded: self.rpc.health_scorer().all_degraded(),
                     };
                     self.alerter.evaluate(&ctx, &mut alert_state).await;
-                    if let Err(e) = db::set_alert_state(&self.db, &alert_state).await {
+                    if let Err(e) =
+                        db::set_alert_state(&self.db, &self.config.network, &alert_state).await
+                    {
                         tracing::warn!(error = %e, "Failed to persist alert state");
                     }
                 }
@@ -1713,6 +1774,97 @@ mod tests {
         assert_eq!(page_request_params(floor - 1, None), (Some(7), None));
     }
 
+    /// #598: a retained-floor recovery must durably record the ledgers it
+    /// skips as a backfill_jobs row, not just a log line, so the range is
+    /// queryable and a backfill can target it afterwards.
+    #[tokio::test]
+    async fn recover_retained_floor_enqueues_the_skipped_range_as_a_backfill_job() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+        let network = format!("retainedfloortest-{}", uuid::Uuid::new_v4());
+
+        let old_cursor = 100u64;
+        let floor = 151u64; // RPC retains from 151 onward.
+        let source_error = TridentError::rpc(anyhow::anyhow!(
+            "getEvents: RPC error -32600: startLedger must be within the ledger range: 151 - 999"
+        ));
+
+        let new_cursor =
+            Streamer::recover_retained_floor(&pool, &network, old_cursor, floor, &source_error)
+                .await;
+
+        // floor - 1, so the next poll's cursor + 1 lands exactly on the floor.
+        assert_eq!(new_cursor, 150);
+
+        let row: (i64, i64, String) = sqlx::query_as(
+            "SELECT from_ledger, to_ledger, status FROM backfill_jobs WHERE network = $1",
+        )
+        .bind(&network)
+        .fetch_one(&pool)
+        .await
+        .expect("the skipped range must be queryable as a backfill_jobs row");
+
+        // The skipped span is strictly between the old cursor and the new
+        // floor: [101, 150] — ledger 151 itself was never lost, it's where
+        // the next poll resumes.
+        assert_eq!(row.0, 101, "from_ledger must be old_cursor + 1");
+        assert_eq!(row.1, 150, "to_ledger must be floor - 1");
+        assert_eq!(row.2, "pending");
+
+        sqlx::query("DELETE FROM backfill_jobs WHERE network = $1")
+            .bind(&network)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// A floor that is not actually ahead of the cursor (or lands adjacent
+    /// to it, i.e. nothing was skipped) must not enqueue an empty/inverted
+    /// range.
+    #[tokio::test]
+    async fn recover_retained_floor_enqueues_nothing_when_no_ledgers_were_actually_skipped() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+        let network = format!("retainedfloortest-{}", uuid::Uuid::new_v4());
+
+        // cursor = 100, floor = 101: the next poll resumes at exactly 101,
+        // nothing in between was skipped.
+        let source_error = TridentError::rpc(anyhow::anyhow!(
+            "startLedger must be within the ledger range: 101 - 999"
+        ));
+        let new_cursor =
+            Streamer::recover_retained_floor(&pool, &network, 100, 101, &source_error).await;
+        assert_eq!(new_cursor, 100);
+
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM backfill_jobs WHERE network = $1")
+            .bind(&network)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            count.0, 0,
+            "no ledgers were skipped, so no job should be enqueued"
+        );
+    }
+
     // Pure unit tests for jitter (issue #197) — no services required.
     #[test]
     fn jitter_stays_within_full_jitter_bounds() {
@@ -1910,10 +2062,13 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
-        sqlx::query("UPDATE system_state SET value = '0' WHERE key = 'latest_ledger_cursor'")
-            .execute(pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO system_state (key, value) VALUES ('latest_ledger_cursor:testnet', '0')
+             ON CONFLICT (key) DO UPDATE SET value = '0'",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -1936,7 +2091,7 @@ mod tests {
         let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
         reset_db(&s.db).await;
 
-        let mut cursor = db::get_cursor(&s.db).await.unwrap();
+        let mut cursor = db::get_cursor(&s.db, &s.config.network).await.unwrap();
         s.poll_once(&mut cursor).await.unwrap();
 
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM soroban_events")
@@ -1972,7 +2127,7 @@ mod tests {
             cooldown: Duration::from_secs(3600), // long enough not to elapse mid-test
         });
 
-        let mut cursor = db::get_cursor(&s.db).await.unwrap();
+        let mut cursor = db::get_cursor(&s.db, &s.config.network).await.unwrap();
 
         for _ in 0..3 {
             assert!(s.rpc_breaker.should_allow());
@@ -2190,7 +2345,7 @@ mod tests {
             cursor, ledger,
             "cursor must advance past the page despite the poison event"
         );
-        let stored_cursor = db::get_cursor(&s.db).await.unwrap();
+        let stored_cursor = db::get_cursor(&s.db, &s.config.network).await.unwrap();
         assert_eq!(stored_cursor, ledger);
 
         let good_count: (i64,) =
@@ -2387,7 +2542,7 @@ mod tests {
         let mut cursor = 0u64;
         s.poll_once(&mut cursor).await.unwrap();
 
-        let stored = db::get_cursor(&s.db).await.unwrap();
+        let stored = db::get_cursor(&s.db, &s.config.network).await.unwrap();
         assert_eq!(stored, 200, "cursor should advance to ledger 200");
         assert_eq!(cursor, 200);
     }
@@ -3387,10 +3542,13 @@ mod tests {
         .await
         .unwrap();
 
-        sqlx::query("UPDATE system_state SET value = '102' WHERE key = 'latest_ledger_cursor'")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO system_state (key, value) VALUES ('latest_ledger_cursor:testnet', '102')
+             ON CONFLICT (key) DO UPDATE SET value = '102'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         // Mock RPC latest ledger as 100 (indicating rollback of 101 & 102)
         Mock::given(method("POST"))

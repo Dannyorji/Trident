@@ -54,7 +54,10 @@ CREATE INDEX IF NOT EXISTS idx_soroban_events_ledger_timestamp ON soroban_events
 -- ---------------------------------------------------------------------------
 -- system_state
 -- Persistent cursor tracking so the indexer can resume after restart without
--- re-scanning from genesis.
+-- re-scanning from genesis. One row per network, keyed
+-- 'latest_ledger_cursor:<network>' (migration 0033, issue #600), so two
+-- indexers on different networks against the same database don't fight over
+-- a single cursor.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS system_state (
     key                   TEXT PRIMARY KEY,
@@ -71,10 +74,15 @@ CREATE TABLE IF NOT EXISTS system_state (
     alert_fired           BOOLEAN     NOT NULL DEFAULT FALSE
 );
 
--- Seed the cursor row so the indexer can always do an UPDATE rather than
--- an upsert on the hot path.
+-- Seed a cursor row per supported network (migration 0031's vocabulary) so
+-- the indexer can always do an UPDATE rather than an upsert on the hot path,
+-- for whichever network it's configured for.
 INSERT INTO system_state (key, value)
-VALUES ('latest_ledger_cursor', '0')
+VALUES
+    ('latest_ledger_cursor:mainnet', '0'),
+    ('latest_ledger_cursor:testnet', '0'),
+    ('latest_ledger_cursor:futurenet', '0'),
+    ('latest_ledger_cursor:sandbox', '0')
 ON CONFLICT (key) DO NOTHING;
 
 -- ---------------------------------------------------------------------------

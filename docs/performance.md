@@ -205,10 +205,12 @@ indexing my contract from ledger X" is a minutes or an hours answer.
 scripts/measure-catchup-throughput.sh --metrics-url http://localhost:9090/metrics
 ```
 
-To create a deficit to measure against, rewind the cursor and restart:
+To create a deficit to measure against, rewind the cursor and restart (the
+cursor key is namespaced per network — issue #600 — replace `<network>` with
+the one this indexer is configured for, e.g. `testnet`):
 
 ```bash
-psql "$DATABASE_URL" -c   "UPDATE system_state SET value = (value::bigint - 10000)::text    WHERE key = 'latest_ledger_cursor'"
+psql "$DATABASE_URL" -c   "UPDATE system_state SET value = (value::bigint - 10000)::text    WHERE key = 'latest_ledger_cursor:<network>'"
 ```
 
 The script reads the indexer's own metrics rather than timing it externally, so

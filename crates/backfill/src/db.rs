@@ -4,8 +4,13 @@ use uuid::Uuid;
 
 const EVENT_NS: Uuid = Uuid::NAMESPACE_DNS;
 
-fn event_uuid(contract_id: &str, ledger_sequence: u64, event_index: u32) -> Uuid {
-    let key = format!("{contract_id}:{ledger_sequence}:{event_index}");
+/// Must stay identical to `crates/indexer/src/db/mod.rs`'s `event_uuid`: a
+/// backfilled event and a live-indexed event for the same
+/// (transaction_hash, raw_event_index) must produce the same id, or
+/// `ON CONFLICT DO NOTHING` cannot tell a backfill replay from a genuinely
+/// new row (issue #599).
+fn event_uuid(transaction_hash: &str, raw_event_index: u32) -> Uuid {
+    let key = format!("{transaction_hash}:{raw_event_index}");
     Uuid::new_v5(&EVENT_NS, key.as_bytes())
 }
 
@@ -115,7 +120,7 @@ pub async fn insert_event(
     event: &SorobanEvent,
     network: &str,
 ) -> Result<(), TridentError> {
-    let id = event_uuid(&event.contract_id, event.ledger_sequence, event.event_index);
+    let id = event_uuid(&event.transaction_hash, event.raw_event_index);
     let event_type = match event.event_type {
         trident_common::EventType::Contract => "contract",
         trident_common::EventType::System => "system",

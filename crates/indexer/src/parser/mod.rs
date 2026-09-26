@@ -135,6 +135,7 @@ impl Parser {
                 ledger_timestamp: raw.ledger_closed_at.clone(),
                 transaction_hash: raw.tx_hash.clone(),
                 event_index,
+                raw_event_index: event_index,
                 event_type,
             },
             token,
@@ -233,6 +234,7 @@ mod tests {
             ledger_timestamp: "2026-08-09T20:00:00Z".to_string(),
             transaction_hash: tx.to_string(),
             event_index: index,
+            raw_event_index: index,
             event_type: EventType::Contract,
         }
     }

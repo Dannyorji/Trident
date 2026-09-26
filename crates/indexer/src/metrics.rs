@@ -153,6 +153,14 @@ pub const LEDGER_GAPS_DETECTED_TOTAL: &str = "trident_indexer_ledger_gaps_detect
 /// (by the backfill worker, or by the live poll loop catching back up), and
 /// is marked `done` here.
 pub const LEDGER_GAPS_CLOSED_TOTAL: &str = "trident_indexer_ledger_gaps_closed_total";
+/// A retained-floor recovery (issue #388) advanced the cursor past ledgers
+/// the RPC no longer retains, permanently losing that span from live polling
+/// (issue #598). Distinct from `LEDGER_GAPS_DETECTED_TOTAL`: this fires at
+/// the moment of loss, in the live poll path, rather than during the
+/// periodic `ledger_metadata` scan, so an operator can alert on it directly
+/// instead of relying on the gap scan to notice later.
+pub const RETAINED_FLOOR_LEDGERS_SKIPPED_TOTAL: &str =
+    "trident_indexer_retained_floor_ledgers_skipped_total";
 
 /// Install the global Prometheus recorder and start serving `/metrics` on
 /// `port`. Must be called once, before the streamer starts recording.
@@ -528,6 +536,13 @@ pub fn record_ledger_gaps_detected(count: u64) {
 pub fn record_ledger_gaps_closed(count: u64) {
     if count > 0 {
         counter!(LEDGER_GAPS_CLOSED_TOTAL).increment(count);
+    }
+}
+
+/// Count ledgers permanently skipped by a retained-floor recovery (issue #598).
+pub fn record_retained_floor_ledgers_skipped(count: u64) {
+    if count > 0 {
+        counter!(RETAINED_FLOOR_LEDGERS_SKIPPED_TOTAL).increment(count);
     }
 }
 

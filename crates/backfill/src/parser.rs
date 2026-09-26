@@ -133,6 +133,7 @@ impl Parser {
             ledger_timestamp: raw.ledger_closed_at.clone(),
             transaction_hash: raw.tx_hash.clone(),
             event_index,
+            raw_event_index: event_index,
             event_type,
         }))
     }
