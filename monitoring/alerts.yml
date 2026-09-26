@@ -126,6 +126,29 @@ groups:
             recognise yet.
           runbook_url: "docs/runbooks/alerts.md#tridentindexerparseerrorratehigh"
 
+      # Dead-lettered events (#568). trident_indexer_dead_lettered_total only
+      # increments once an undecodable event's audit row is durably written
+      # to parse_errors (issue #414) — so any increase is real, replayable
+      # data to look at, not scrape noise. Distinct from
+      # TridentIndexerPersistDeadLetterBacklog below, which tracks events
+      # that decoded fine but failed to persist (issue #208).
+      - alert: TridentIndexerDeadLetteredEventsDetected
+        expr: increase(trident_indexer_dead_lettered_total[1h]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: "Trident indexer dead-lettered {{ $value | humanize }} event(s) in the last hour"
+          description: >
+            trident_indexer_dead_lettered_total increased. One or more
+            events failed XDR decoding and were durably written to
+            parse_errors after the dead-letter insert's own retries (issue
+            #414). These events were skipped rather than indexed; inspect
+            parse_errors for the payload and error_message to identify the
+            cause.
+          runbook_url: "docs/runbooks/alerts.md#tridentindexerdeadletteredeventsdetected"
+
       # Unexpected ScVal variants (#506). The decoder matches every ScVal
       # variant exhaustively — a new XDR variant fails compilation, so this
       # cannot fire for "unknown" types. It fires when a structurally valid
@@ -155,6 +178,25 @@ groups:
             indexer logs name the variant and context. Identify the emitting
             contract from the logs and review what it is publishing.
           runbook_url: "docs/runbooks/alerts.md#tridentindexerunexpectedscvalvariant"
+      # A non-empty persist dead-letter queue is data missing from
+      # soroban_events until someone replays it — a silently growing DLQ is
+      # the same as data loss. Rows leave the pending state only through the
+      # documented replay procedure, so this fires for as long as any exist.
+      - alert: TridentIndexerPersistDeadLetterBacklog
+        expr: trident_indexer_persist_dead_letter_backlog > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: "Trident indexer has {{ $value | humanize }} event(s) awaiting replay in the persist dead-letter queue"
+          description: >
+            trident_indexer_persist_dead_letter_backlog is non-zero.
+            One or more events decoded fine but exhausted the persist retry
+            budget, so the streamer captured them in failed_events (issues
+            #208/#508) and advanced the cursor past them. The data is safe
+            but missing from soroban_events until replayed.
+          runbook_url: "docs/runbooks/alerts.md#tridentindexerpersistdeadletterbacklog"
 
       # A non-empty persist dead-letter queue is data missing from
       # soroban_events until someone replays it — a silently growing DLQ is

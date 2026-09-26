@@ -62,21 +62,23 @@ isolation, and a page of perfectly healthy events would land in
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `trident_indexer_dead_lettered_total` | counter | Items written to a dead-letter table — `parse_errors` (decode failures, issue #414) or `failed_events` (persist failures, issue #208). Only incremented once the row is durably written, so it never counts an event that was actually lost. |
+| `trident_indexer_dead_lettered_total` | counter | Items written to `parse_errors` (decode failures, issue #414). Only incremented once the row is durably written, so it never counts an event that was actually lost. |
+| `trident_indexer_persist_dead_lettered_total` | counter | Items written to `failed_events` (persist failures, issue #208) — see #568 for why this is a separate metric from the one above rather than a shared counter with a label. |
+| `trident_indexer_persist_dead_letter_backlog` | gauge | `failed_events` rows still awaiting replay (`replayed_at IS NULL`). |
 
 ## Alerting
 
-A healthy indexer keeps `trident_indexer_dead_lettered_total` flat. Any
-increase is worth paging on — unlike lag, which recovers on its own, a
-dead-lettered event needs a human to look at `failed_events`/`parse_errors`
-and decide whether to fix and replay it:
+A healthy indexer keeps both dead-letter counters flat. Any increase is
+worth paging on — unlike lag, which recovers on its own, a dead-lettered
+event needs a human to look at `failed_events`/`parse_errors` and decide
+whether to fix and replay it. Both are deployed rules in
+`monitoring/alerts.yml`, not just documentation:
 
-```yaml
-- alert: TridentEventsDeadLettered
-  expr: increase(trident_indexer_dead_lettered_total[15m]) > 0
-  annotations:
-    summary: "Events written to a dead-letter table — inspect parse_errors / failed_events"
-```
+- `TridentIndexerDeadLetteredEventsDetected` fires on any increase of
+  `trident_indexer_dead_lettered_total` (decode failures).
+- `TridentIndexerPersistDeadLetterBacklog` fires while
+  `trident_indexer_persist_dead_letter_backlog` is non-zero (persist
+  failures awaiting replay).
 
 ## Inspecting and replaying failed_events
 

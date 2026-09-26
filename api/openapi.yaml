@@ -1361,22 +1361,41 @@ paths:
     get:
       summary: List webhook subscriptions
       description: >-
-        Webhook subscriptions owned by the calling API key. Includes each
-        subscription's signing secret. Returns JSON null (not an empty
-        array) when the key owns no subscriptions.
+        Keyset-paginated webhook subscriptions owned by the calling API key
+        (issue #220), newest first (createdAt DESC, id DESC as tiebreaker).
+        Includes each subscription's signing secret. Returns JSON null (not
+        an empty array) when the key owns no subscriptions.
       operationId: listWebhooks
       tags:
         - Webhooks
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - name: cursor
+          in: query
+          required: false
+          description: Opaque pagination cursor from a previous response's next_cursor.
+          schema:
+            type: string
       responses:
         "200":
-          description: Subscriptions owned by the calling key (null when none)
+          description: Page of subscriptions owned by the calling key
           content:
             application/json:
               schema:
-                type: array
-                nullable: true
-                items:
-                  $ref: "#/components/schemas/WebhookSubscription"
+                $ref: "#/components/schemas/ListWebhooksResponse"
+        "400":
+          description: Invalid limit or cursor (plain-text body)
+          content:
+            text/plain:
+              schema:
+                type: string
         "401":
           $ref: "#/components/responses/Unauthorized"
         "429":
@@ -2573,6 +2592,25 @@ components:
           description: Present while deliveries are paused
         network:
           type: string
+    ListWebhooksResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - webhooks
+        - has_more
+        - next_cursor
+      properties:
+        webhooks:
+          type: array
+          items:
+            $ref: "#/components/schemas/WebhookSubscription"
+        has_more:
+          type: boolean
+          description: Whether another page is available.
+        next_cursor:
+          type: string
+          nullable: true
+          description: Opaque cursor for the next page (null if has_more is false).
     WebhookCreateRequest:
       type: object
       additionalProperties: false

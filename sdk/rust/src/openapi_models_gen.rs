@@ -62,6 +62,8 @@ pub struct OpenApiModels {
 
     pub list_contracts_response: Option<ListContractsResponse>,
 
+    pub list_webhooks_response: Option<ListWebhooksResponse>,
+
     pub liveness_response: Option<LivenessResponse>,
 
     pub ready_checks: Option<ReadyChecks>,
@@ -548,6 +550,43 @@ pub struct ListContractsResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListWebhooksResponse {
+    /// Whether another page is available.
+    pub has_more: bool,
+
+    /// Opaque cursor for the next page (null if has_more is false).
+    pub next_cursor: String,
+
+    pub webhooks: Vec<WebhookSubscription>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebhookSubscription {
+    /// Omitted when empty
+    pub api_key_id: Option<String>,
+
+    pub contract_id: String,
+
+    pub created_at: String,
+
+    pub id: String,
+
+    pub network: String,
+
+    /// Present while deliveries are paused
+    pub paused_at: Option<String>,
+
+    /// HMAC signing secret for deliveries; omitted when empty
+    pub secret: Option<String>,
+
+    pub target_url: String,
+
+    /// Topic filter; omitted when unfiltered
+    pub topic0: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LivenessResponse {
     /// Always "ok" while the process is up — no dependency checks.
     pub status: LivenessResponseStatus,
@@ -771,30 +810,4 @@ pub enum WebhookStatusResponseStatus {
     Paused,
 
     Resumed,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WebhookSubscription {
-    /// Omitted when empty
-    pub api_key_id: Option<String>,
-
-    pub contract_id: String,
-
-    pub created_at: String,
-
-    pub id: String,
-
-    pub network: String,
-
-    /// Present while deliveries are paused
-    pub paused_at: Option<String>,
-
-    /// HMAC signing secret for deliveries; omitted when empty
-    pub secret: Option<String>,
-
-    pub target_url: String,
-
-    /// Topic filter; omitted when unfiltered
-    pub topic0: Option<String>,
 }
