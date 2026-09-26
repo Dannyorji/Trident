@@ -111,9 +111,6 @@ const (
 	StatsLimitDefault = 50
 )
 
-// DefaultNetwork is applied when a request does not specify one.
-const DefaultNetwork = "testnet"
-
 // validNetworks holds the accepted values for the ?network filter.
 var validNetworks = map[string]bool{
 	"testnet": true,
@@ -121,6 +118,11 @@ var validNetworks = map[string]bool{
 }
 
 // QueryStatsParams holds validated parameters for GET /v1/stats/contracts.
+//
+// Network is deliberately not populated by ValidateQueryStats (issue #612):
+// unlike every other field here, it is never client-supplied. The caller
+// must set it from middleware.NetworkFromContext after validation succeeds,
+// matching how every other data endpoint enforces the key's network scope.
 type QueryStatsParams struct {
 	FromLedger    int64
 	FromLedgerPtr *int64 // nil if not specified (for SQL NULL handling)
@@ -137,10 +139,12 @@ type QueryStatsParams struct {
 // Validation rules:
 //   - from_ledger: non-negative integer if present; default 0 (all time)
 //   - to_ledger:   non-negative integer if present; default latest indexed
-//   - network:     one of "testnet", "mainnet"; default "testnet"
 //   - limit:       integer in [1, 100]; default 50
+//
+// network is not a parameter here: it is derived server-side from the
+// authenticated key's context, not from the query string (issue #612).
 func ValidateQueryStats(
-	fromLedgerStr, toLedgerStr, networkStr, limitStr string,
+	fromLedgerStr, toLedgerStr, limitStr string,
 ) (*QueryStatsParams, *ValidationError) {
 	p := &QueryStatsParams{}
 
@@ -155,12 +159,6 @@ func ValidateQueryStats(
 	if to != nil {
 		p.ToLedger = *to
 	}
-
-	network, verr := ValidateNetwork("network", networkStr, DefaultNetwork)
-	if verr != nil {
-		return nil, verr
-	}
-	p.Network = network
 
 	limit, verr := ValidateLimit("limit", limitStr, StatsLimitMin, StatsLimitMax, StatsLimitDefault)
 	if verr != nil {
