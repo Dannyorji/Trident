@@ -78,6 +78,13 @@ async fn run_replay(
         .map_err(|_| "DATABASE_URL must be set to use `trident-indexer replay`")?;
     let db = sqlx::PgPool::connect(&database_url).await?;
 
+    // Replayed rows must be tagged with this deployment's actual network
+    // (issue #595) — `failed_events` has no network column of its own, so
+    // there is nothing to recover it from other than the same `NETWORK` env
+    // var the daemon validates at startup.
+    let network =
+        config::normalize_network(&std::env::var("NETWORK").unwrap_or_else(|_| "testnet".into()))?;
+
     // Bare `replay` (no flags) behaves like `--list`: report what's
     // outstanding — the runbook's query, run from the CLI instead of psql —
     // without replaying anything, since a no-argument invocation is more
@@ -105,7 +112,7 @@ async fn run_replay(
     let mut replayed = 0u32;
     let mut skipped = 0u32;
     for id in ids {
-        match db::replay_failed_event(&db, id).await {
+        match db::replay_failed_event(&db, id, &network).await {
             Ok(db::ReplayOutcome::Replayed) => {
                 println!("replayed {id}");
                 replayed += 1;
