@@ -313,6 +313,7 @@ func main() {
 		authDB.DB = pool
 	}
 	authDB.Redis = redisClient
+	authDB.UsageTrack = usageTrack
 
 	registerRoutes(mux, routeDeps{
 		rlCfg:            rlCfg,
@@ -330,8 +331,6 @@ func main() {
 		hub:              hub,
 		keyValidator:     middleware.Validator(middleware.ParseKeyHashes(os.Getenv("API_KEY_HASHES"))),
 	})
-
-	_ = usageTrack // passed to middleware in future; declared for shutdown ordering
 
 	handler := middleware.NewBodySizeLimitFromEnv()(mux)
 	handler = middleware.TieredRateLimit(rlCfg)(handler)
