@@ -2725,7 +2725,17 @@ components:
           properties:
             code:
               type: string
-              description: Error code (e.g., INVALID_ARGUMENT, INTERNAL, UNAVAILABLE, CONFLICT)
+              description: Machine-readable error code. Matches httputil.ErrorCode exactly (services/api/internal/httputil/errors.go).
+              enum:
+                - NOT_FOUND
+                - UNAUTHORIZED
+                - RATE_LIMITED
+                - INVALID_ARGUMENT
+                - UNAVAILABLE
+                - INTERNAL
+                - PAYLOAD_TOO_LARGE
+                - FORBIDDEN
+                - CONFLICT
             message:
               type: string
               description: Human-readable error message

@@ -72,6 +72,10 @@ pub struct OpenApiModels {
 
     pub token_metadata_response: Option<TokenMetadataResponse>,
 
+    pub usage_response: Option<UsageResponse>,
+
+    pub usage_rollup_row: Option<UsageRollupRow>,
+
     pub version_response: Option<VersionResponse>,
 
     pub webhook_create_request: Option<WebhookCreateRequest>,
@@ -379,14 +383,43 @@ pub struct ErrorResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Error {
-    /// Error code (e.g., INVALID_ARGUMENT, INTERNAL, UNAVAILABLE, CONFLICT)
-    pub code: String,
+    /// Machine-readable error code. Matches httputil.ErrorCode exactly
+    /// (services/api/internal/httputil/errors.go).
+    pub code: Code,
 
     /// Human-readable error message
     pub message: String,
 
     /// Request ID for debugging
     pub request_id: Option<String>,
+}
+
+/// Machine-readable error code. Matches httputil.ErrorCode exactly
+/// (services/api/internal/httputil/errors.go).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum Code {
+    Conflict,
+
+    Forbidden,
+
+    Internal,
+
+    #[serde(rename = "INVALID_ARGUMENT")]
+    InvalidArgument,
+
+    #[serde(rename = "NOT_FOUND")]
+    NotFound,
+
+    #[serde(rename = "PAYLOAD_TOO_LARGE")]
+    PayloadTooLarge,
+
+    #[serde(rename = "RATE_LIMITED")]
+    RateLimited,
+
+    Unauthorized,
+
+    Unavailable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -585,6 +618,36 @@ pub struct TokenMetadataResponse {
 
     /// Token symbol, from symbol(). Null unless is_token is true.
     pub symbol: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageResponse {
+    pub api_key_id: String,
+
+    /// Daily buckets from the maintained usage_rollup table, oldest first; empty when the window
+    /// has no rollup rows.
+    pub days: Vec<UsageRollupRow>,
+
+    pub from: String,
+
+    pub to: String,
+
+    pub total_errors: i64,
+
+    pub total_requests: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageRollupRow {
+    pub avg_duration_ms: f64,
+
+    pub error_count: i64,
+
+    pub period_end: String,
+
+    pub period_start: String,
+
+    pub request_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
