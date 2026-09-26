@@ -824,3 +824,122 @@ distinct poisoned events, not retry bursts.
 
    The gauge refreshes on the next active poll cycle; the alert clears once
    no pending rows remain.
+
+---
+
+## TridentOutboxBacklogWarning
+
+**Means:** `trident_indexer_outbox_backlog` has been at or above 10,000 rows
+for 10 minutes. The outbox is the sole delivery guarantee for live
+subscribers (`crates/indexer/src/db/outbox.rs`); a growing backlog means the
+relay is publishing to Redis slower than events are landing.
+
+**Why this threshold:** 10,000 is the relay's own
+`OUTBOX_BACKLOG_ALERT_THRESHOLD` default (`crates/indexer/src/config.rs`),
+already used to emit a `tracing::warn!` log line — this alert simply pages on
+the same signal instead of leaving it as a log line nothing watches. 10
+minutes filters a brief publish stall that clears on its own.
+
+**First steps:**
+1. Check `trident_indexer_outbox_published_total`'s rate — is it still
+   advancing (a slow relay) or flat (a stopped one)?
+2. Check Redis connectivity/health from the indexer's perspective; a Redis
+   outage is the most common cause.
+3. Check `trident_indexer_outbox_publish_failures_total` for a climbing
+   failure count alongside the backlog (see
+   `TridentOutboxPublishFailuresHigh` below).
+
+---
+
+## TridentOutboxBacklogCritical
+
+**Means:** `trident_indexer_outbox_backlog` has been at or above 50,000 for
+5 minutes — five times the warning threshold.
+
+**Why this threshold:** at this level the relay is not merely slow, it has
+very likely stopped entirely (Redis down, or the relay loop crashed/hung).
+Live subscribers have stopped receiving events; this is a page, not a
+ticket.
+
+**First steps:**
+1. Confirm the relay process is actually running and not crash-looping.
+2. Confirm Redis is reachable from the indexer.
+3. If both check out, `trident_indexer_outbox_publish_failures_total`'s
+   error detail (indexer logs) should show the specific publish failure
+   mode.
+4. Once the underlying cause is fixed, the relay drains the accumulated
+   backlog automatically — no manual replay step, since the events remain
+   in `soroban_events`/the outbox table the whole time.
+
+---
+
+## TridentOutboxPublishFailuresHigh
+
+**Means:** `trident_indexer_outbox_publish_failures_total` has been
+increasing for 10 minutes.
+
+**Why this threshold:** every failed publish leaves its row in the outbox
+for the next attempt, directly feeding `trident_indexer_outbox_backlog` —
+this alert exists to fire *before* the backlog itself crosses a threshold,
+giving earlier warning than `TridentOutboxBacklogWarning` alone.
+
+**First steps:**
+1. Check the indexer logs for the specific publish failure (Redis
+   connection error, XADD rejection, serialization failure).
+2. If failures are climbing but the backlog is still low, the relay may be
+   compensating via retry — check whether `trident_indexer_outbox_backlog`
+   is still flat before treating this as urgent.
+3. See `TridentOutboxBacklogWarning`/`TridentOutboxBacklogCritical` above
+   for what to do once the backlog itself starts climbing.
+
+---
+
+## TridentDeadLetteredEventsHigh
+
+**Means:** `trident_indexer_dead_lettered_total` increased in the last
+hour. This counts events that were undecodable (a poison message where
+retry never helps, issue #414) and were written to `parse_errors` so the
+poll could advance past them — distinct from
+`trident_indexer_persist_dead_lettered_total` (well-formed events whose
+database *commit* failed, see `TridentIndexerPersistDeadLetterBacklog`
+above).
+
+**Why this threshold:** `TridentIndexerParseErrorRateHigh` already alerts
+on the *rate* of all parse failures, including ones that later succeed on
+retry. This counter only moves when an event is actually abandoned — a
+single occurrence is worth knowing about even if the overall parse-error
+rate stays well under that alert's 1% threshold.
+
+**First steps:**
+1. Query `parse_errors` for the newly dead-lettered rows and inspect
+   `raw_payload`/`error_message`.
+2. Check whether this coincides with an RPC/XDR schema change (same first
+   step as `TridentIndexerParseErrorRateHigh`).
+3. Dead-lettered events are not replayed automatically — the poison
+   message reasoning is that retry never helps for these specifically, so
+   fixing the parser is the only path back, followed by a manual backfill
+   of the affected ledger range if the events are needed.
+
+---
+
+## TridentIndexerDBPoolSaturated
+
+**Means:** over 90% of the indexer's Postgres connection pool has been
+checked out for 10 minutes.
+
+**Why this threshold:** identical reasoning to `TridentAPIDBPoolSaturated`
+above — 90% is a leading indicator before the pool is actually exhausted,
+and 10 minutes filters brief bursts. Before this alert, only the API's own
+pool was watched (`trident_api_db_pool_acquired_connections` /
+`trident_api_db_pool_max_connections`); the indexer's pool
+(`trident_indexer_db_pool_size` / `trident_indexer_db_pool_idle_connections`)
+had the gauges emitted but nothing alerting on them.
+
+**First steps:**
+1. Check for a slow or stuck query holding indexer connections open
+   (`pg_stat_activity`).
+2. Check whether this coincides with a backfill or reconciliation pass
+   running concurrently with normal ingest — both draw from the same pool.
+3. The indexer's pool size is configured separately from the API's; raising
+   it is a stopgap if the root cause is a query regression rather than
+   organic load growth.

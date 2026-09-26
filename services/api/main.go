@@ -313,6 +313,7 @@ func main() {
 		authDB.DB = pool
 	}
 	authDB.Redis = redisClient
+	authDB.UsageTrack = usageTrack
 
 	registerRoutes(mux, routeDeps{
 		rlCfg:            rlCfg,
@@ -329,8 +330,6 @@ func main() {
 		webhookDB:        webhookDB,
 		hub:              hub,
 	})
-
-	_ = usageTrack // passed to middleware in future; declared for shutdown ordering
 
 	handler := middleware.NewBodySizeLimitFromEnv()(mux)
 	handler = middleware.TieredRateLimit(rlCfg)(handler)

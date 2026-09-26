@@ -153,3 +153,31 @@ func refOf(s *openapi3.SchemaRef) string {
 	}
 	return s.Ref
 }
+
+// TestUsageEndpointsAreRouted guards against issue #615: KeyUsage and
+// AdminKeyUsageRollup were fully implemented, documented in their own doc
+// comments as live endpoints, and had their backing table (usage_rollup)
+// actively maintained by RunUsageRollupLoop, but neither was ever registered
+// in routeInventory() (routes.go) — a client hitting either documented path
+// got a 404 from the mux, not from the handler.
+func TestUsageEndpointsAreRouted(t *testing.T) {
+	routes := routeInventory()
+
+	want := []string{
+		opKey("GET", "/v1/usage"),
+		opKey("GET", "/v1/admin/keys/{id}/usage-rollup"),
+	}
+
+	for _, w := range want {
+		found := false
+		for _, r := range routes {
+			if opKey(r.Method, r.Path) == w {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("%s: not present in routeInventory() — implemented but never routed", w)
+		}
+	}
+}

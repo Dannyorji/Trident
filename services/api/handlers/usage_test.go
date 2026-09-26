@@ -116,3 +116,35 @@ func TestAdminKeyUsageRollup_InvalidWindow_Returns400(t *testing.T) {
 		t.Errorf("want 400, got %d", rr.Code)
 	}
 }
+
+// TestKeyUsage_UnknownParam_Returns400 guards against issue #615: an
+// unrecognised query parameter is a client bug (a typo'd ?form= silently
+// ignored would hide itself), so it must be rejected, matching the sibling
+// AdminKeyUsage handler's existing RejectUnknownParams convention rather than
+// silently falling through to the default window.
+func TestKeyUsage_UnknownParam_Returns400(t *testing.T) {
+	h := handlers.KeyUsage(handlers.UsageConfig{DB: unconnectedPool(t)})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/usage?form=2024-01-01T00:00:00Z", nil)
+	req = req.WithContext(middleware.WithAPIKeyID(req.Context(), uuid.NewString()))
+	rr := httptest.NewRecorder()
+	h(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("want 400 for an unrecognised query parameter, got %d", rr.Code)
+	}
+}
+
+func TestAdminKeyUsageRollup_UnknownParam_Returns400(t *testing.T) {
+	h := handlers.AdminKeyUsageRollup(handlers.AdminConfig{AdminKey: "secret", DB: unconnectedPool(t)})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/admin/keys/"+uuid.NewString()+"/usage-rollup?form=2024-01-01T00:00:00Z", nil)
+	req.SetPathValue("id", uuid.NewString())
+	req.Header.Set("X-Admin-Key", "secret")
+	rr := httptest.NewRecorder()
+	h(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("want 400 for an unrecognised query parameter, got %d", rr.Code)
+	}
+}
