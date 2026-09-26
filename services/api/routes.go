@@ -29,7 +29,6 @@ type routeDeps struct {
 	sorobanCaller    handlers.SorobanRPCCaller
 	webhookDB        *sql.DB
 	hub              *ws.Hub
-	keyValidator     func(string) bool
 	rlCfg            middleware.RateLimitConfig
 	authDB           middleware.DBAuthConfig
 }

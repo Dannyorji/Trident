@@ -12,6 +12,7 @@ import (
 
 	"github.com/Depo-dev/trident/services/api/gen"
 	"github.com/Depo-dev/trident/services/api/handlers"
+	"github.com/Depo-dev/trident/services/api/middleware"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -252,6 +253,51 @@ func TestBatchGetEvents_DuplicateIDsDeduplicated(t *testing.T) {
 	}
 	if n := calls.Load(); n != 2 {
 		t.Errorf("expected 2 backend calls after dedupe, got %d", n)
+	}
+}
+
+// TestBatchGetEvents_ScopesToAuthenticatedNetwork guards against issue #613:
+// the batch route must forward Network on every gRPC GetEvent call, exactly
+// like the single-event route (events.go:170), so a mainnet-only event id
+// cannot be read by batching it through a testnet-scoped key. Before the
+// fix, GetEventRequest{Id: id} omitted Network entirely, so the backend
+// received an empty/default network and a single id batched through this
+// route bypassed the scope GET /v1/events/{id} enforces.
+func TestBatchGetEvents_ScopesToAuthenticatedNetwork(t *testing.T) {
+	var gotNetwork string
+	handlers.SetEventsClient(&MockEventsClient{
+		GetEventFunc: func(_ context.Context, req *gen.GetEventRequest) (*gen.Event, error) {
+			gotNetwork = req.Network
+			// Simulates the real backend's per-network scoping: the event
+			// only "exists" on mainnet, so a request scoped to any other
+			// network must report it missing, never leak it.
+			if req.Network != "mainnet" {
+				return nil, status.Error(codes.NotFound, "not found")
+			}
+			return fakeEvent(req.Id), nil
+		},
+	})
+
+	req := batchPost(map[string]any{"ids": []string{uuid1}})
+	req = req.WithContext(middleware.WithNetwork(req.Context(), "testnet"))
+	w := httptest.NewRecorder()
+	handlers.BatchGetEvents(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if gotNetwork != "testnet" {
+		t.Fatalf("expected batch handler to forward the authenticated network %q to the backend, got %q", "testnet", gotNetwork)
+	}
+	var resp handlers.BatchEventsResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Events) != 0 {
+		t.Errorf("expected the mainnet-only event to be reported missing for a testnet-scoped request, got %d events", len(resp.Events))
+	}
+	if len(resp.Missing) != 1 || resp.Missing[0] != uuid1 {
+		t.Errorf("expected [%s] in missing, got %v", uuid1, resp.Missing)
 	}
 }
 
