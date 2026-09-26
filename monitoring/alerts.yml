@@ -133,14 +133,15 @@ groups:
       # (ContractInstance / LedgerKeyContractInstance / LedgerKeyNonce) is
       # decoded from live traffic: the value is stored faithfully, but the
       # emitting contract deserves a look.
+      #
+      # Fixed as part of issue #617: this rule previously had no for/labels/
+      # annotations at all, and the block below (belonging to it, runbook_url
+      # included) had been misattached to TridentIndexerPersistDeadLetterBacklog's
+      # alert instead — that rule fired with these ScVal-variant annotations
+      # rather than its own, and this one fired with no severity, no
+      # description, and no runbook link.
       - alert: TridentIndexerUnexpectedScValVariant
         expr: increase(trident_scval_unexpected_variant_total[1h]) > 0
-      # A non-empty persist dead-letter queue is data missing from
-      # soroban_events until someone replays it — a silently growing DLQ is
-      # the same as data loss. Rows leave the pending state only through the
-      # documented replay procedure, so this fires for as long as any exist.
-      - alert: TridentIndexerPersistDeadLetterBacklog
-        expr: trident_indexer_persist_dead_letter_backlog > 0
         for: 5m
         labels:
           severity: warning
@@ -154,6 +155,26 @@ groups:
             indexer logs name the variant and context. Identify the emitting
             contract from the logs and review what it is publishing.
           runbook_url: "docs/runbooks/alerts.md#tridentindexerunexpectedscvalvariant"
+
+      # A non-empty persist dead-letter queue is data missing from
+      # soroban_events until someone replays it — a silently growing DLQ is
+      # the same as data loss. Rows leave the pending state only through the
+      # documented replay procedure, so this fires for as long as any exist.
+      - alert: TridentIndexerPersistDeadLetterBacklog
+        expr: trident_indexer_persist_dead_letter_backlog > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: "Trident indexer has {{ $value | humanize }} event(s) pending replay in failed_events"
+          description: >
+            failed_events has pending rows: at least one well-formed event's
+            database commit failed through its full retry budget and was
+            captured for replay rather than blocking the ingest cursor
+            (issue #508). Data is safe but missing from soroban_events until
+            replayed — see the runbook for the replay procedure.
+          runbook_url: "docs/runbooks/alerts.md#tridentindexerpersistdeadletterbacklog"
 
   # ---------------------------------------------------------------------------
   # Ledger-range reconciliation against the RPC source (#511).
@@ -514,4 +535,105 @@ groups:
             immediately: `SELECT create_soroban_partition(<last_upper>,
             <last_upper + 2000000>);` — see the runbook for the exact values.
           runbook_url: "docs/runbooks/alerts.md#tridentpartitionexhausted"
+
+  # ---------------------------------------------------------------------------
+  # Outbox delivery guarantee (issue #617). The outbox is the sole delivery
+  # guarantee for live subscribers (crates/indexer/src/db/outbox.rs) — before
+  # this group, its backlog threshold existed only as a tracing::warn! log
+  # line inside the relay, not an alert. A stuck relay with Redis down
+  # produces a climbing gauge and a growing table that nothing paged on; the
+  # first signal was a customer report.
+  # ---------------------------------------------------------------------------
+  - name: trident.indexer.outbox
+    rules:
+      - alert: TridentOutboxBacklogWarning
+        expr: trident_indexer_outbox_backlog >= 10000
+        for: 10m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: "Trident indexer outbox backlog is {{ $value | humanize }} rows"
+          description: >
+            trident_indexer_outbox_backlog has been at or above 10,000 (the
+            relay's own backlog_alert_threshold default, OUTBOX_BACKLOG_ALERT_THRESHOLD)
+            for 10 minutes. The relay is falling behind publishing to Redis;
+            live subscribers are seeing growing delivery lag.
+          runbook_url: "docs/runbooks/alerts.md#tridentoutboxbacklogwarning"
+
+      - alert: TridentOutboxBacklogCritical
+        expr: trident_indexer_outbox_backlog >= 50000
+        for: 5m
+        labels:
+          severity: critical
+          service: indexer
+        annotations:
+          summary: "Trident indexer outbox backlog is critically high ({{ $value | humanize }} rows)"
+          description: >
+            trident_indexer_outbox_backlog has been at or above 50,000 for 5
+            minutes — five times the relay's own warning threshold. Redis is
+            very likely down or the relay loop has stopped entirely; live
+            subscribers have stopped receiving events. Check
+            trident_indexer_outbox_published_total for whether the counter
+            is still advancing at all.
+          runbook_url: "docs/runbooks/alerts.md#tridentoutboxbacklogcritical"
+
+      - alert: TridentOutboxPublishFailuresHigh
+        expr: |
+          rate(trident_indexer_outbox_publish_failures_total[10m]) > 0
+        for: 10m
+        labels:
+          severity: critical
+          service: indexer
+        annotations:
+          summary: "Trident indexer outbox publishes are failing"
+          description: >
+            trident_indexer_outbox_publish_failures_total has been
+            increasing for 10 minutes. Every failed publish leaves its row
+            in the outbox for the next attempt, directly feeding
+            trident_indexer_outbox_backlog — this alert is the earliest
+            signal, firing before the backlog itself crosses a threshold.
+          runbook_url: "docs/runbooks/alerts.md#tridentoutboxpublishfailureshigh"
+
+      - alert: TridentDeadLetteredEventsHigh
+        expr: |
+          increase(trident_indexer_dead_lettered_total[1h]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: "Trident indexer has dead-lettered {{ $value | humanize }} event(s) in the last hour"
+          description: >
+            trident_indexer_dead_lettered_total increased in the last hour.
+            This event was undecodable (a poison message where retry never
+            helps, distinct from PERSIST_DEAD_LETTERED_TOTAL's well-formed-
+            but-uncommittable events) and was written to parse_errors so the
+            poll could advance past it. Complements
+            TridentIndexerParseErrorRateHigh, which alerts on the *rate* of
+            all parse failures including ones that later succeed on retry;
+            this counter only moves when an event is actually abandoned,
+            which is what an alert should fire on regardless of the overall
+            error rate.
+          runbook_url: "docs/runbooks/alerts.md#tridentdeadletteredeventshigh"
+
+      - alert: TridentIndexerDBPoolSaturated
+        expr: |
+          ((trident_indexer_db_pool_size - trident_indexer_db_pool_idle_connections) / trident_indexer_db_pool_size) > 0.9
+        for: 10m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: >-
+            Trident indexer Postgres pool is close to exhausted
+            ({{ $value | humanizePercentage }} in use)
+          description: >
+            Over 90% of the indexer's Postgres connection pool has been
+            checked out for 10 minutes. Only the API's pool
+            (TridentAPIDBPoolSaturated, above) was alerted before this —
+            the indexer's own pool had trident_indexer_db_pool_size and
+            trident_indexer_db_pool_idle_connections emitted but nothing
+            watching them.
+          runbook_url: "docs/runbooks/alerts.md#tridentindexerdbpoolsaturated"
 
