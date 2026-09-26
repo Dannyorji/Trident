@@ -372,11 +372,59 @@ func TestTierCache_Invalidate_AppliesNewTierWithoutTTL(t *testing.T) {
 		t.Fatalf("before invalidation: cached tier should still apply (10), got %d", capturedLimit)
 	}
 
-	// Invalidate the entry (as UpdateAPIKey does) — the new tier applies now.
-	cache.Invalidate(hashKey(key))
+	// Invalidate the entry (as UpdateAPIKey does, passing the api_keys.key_hash
+	// column value — plain SHA-256, not hashKey's HMAC) — the new tier applies now.
+	cache.Invalidate(sha256KeyHash(key))
 	mw.ServeHTTP(httptest.NewRecorder(), apiKeyReq(key))
 	if capturedLimit != 100 {
 		t.Fatalf("after invalidation: want new tier limit 100 (pro), got %d", capturedLimit)
+	}
+}
+
+// spyTierDB records the hash argument passed to its lookup query so tests can
+// assert TierCache.resolve queries by the same hash api_keys.key_hash actually
+// stores (plain SHA-256), not some other digest.
+type spyTierDB struct {
+	tier       string
+	gotHash    string
+	queryCount int
+}
+
+func (m *spyTierDB) QueryRow(_ context.Context, _ string, args ...any) pgx.Row {
+	m.queryCount++
+	if len(args) > 0 {
+		if h, ok := args[0].(string); ok {
+			m.gotHash = h
+		}
+	}
+	return &mockTierRow{tier: m.tier}
+}
+
+// TestTierCache_Resolve_QueriesBySHA256NotHMAC is the regression test for
+// issue #608: TieredRateLimit.resolve previously hashed the incoming API key
+// with hashKey (HMAC-SHA256 + API_KEY_SALT) before querying
+// "... WHERE key_hash = $1", but api_keys.key_hash is populated with plain
+// SHA-256 (handlers.sha256hex, mirrored here by sha256KeyHash). Every
+// DB-issued key's tier lookup therefore matched zero rows and silently fell
+// back to "free", regardless of its real rate_limit_tier. This asserts the
+// lookup uses the same hash the DB column and UpdateAPIKey's InvalidateTier
+// call both use.
+func TestTierCache_Resolve_QueriesBySHA256NotHMAC(t *testing.T) {
+	db := &spyTierDB{tier: "pro"}
+	cache := NewTierCache()
+	const key = "sha-vs-hmac-key"
+
+	tier := cache.resolve(context.Background(), key, db)
+
+	if tier != "pro" {
+		t.Fatalf("resolve: want tier %q from DB, got %q (silently fell back to free?)", "pro", tier)
+	}
+	want := sha256KeyHash(key)
+	if db.gotHash != want {
+		t.Fatalf("resolve queried key_hash = %q, want %q (sha256KeyHash, matching handlers.sha256hex and InvalidateTier's argument); got HMAC %q instead", db.gotHash, want, hashKey(key))
+	}
+	if db.gotHash == hashKey(key) {
+		t.Fatal("resolve queried by hashKey's HMAC digest — this can never match a real api_keys.key_hash row")
 	}
 }
 

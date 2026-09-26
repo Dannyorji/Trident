@@ -163,6 +163,16 @@ var (
 		Name: "trident_db_pool_max_lifetime_destroy_count",
 		Help: "Cumulative number of connections destroyed for exceeding MaxConnLifetime.",
 	})
+
+	// RetentionRowsDeletedTotal makes the periodic retention job's effect
+	// observable (issue #604): without it, a disk-growth alert has no
+	// corresponding "and here is what the remediation actually did" signal,
+	// so an operator cannot tell a healthy pruning job from a silently
+	// broken one just by watching disk usage trend flat.
+	RetentionRowsDeletedTotal = promauto.With(Registry).NewCounterVec(prometheus.CounterOpts{
+		Name: "trident_retention_rows_deleted_total",
+		Help: "Rows deleted by the periodic retention job, by table.",
+	}, []string{"table"})
 )
 
 // PollDBPool periodically snapshots pool.Stat() into the DB pool gauges

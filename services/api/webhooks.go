@@ -751,7 +751,20 @@ func deleteWebhookHandler(db *sql.DB) http.HandlerFunc {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "database unavailable")
 			return
 		}
-		result, err := db.ExecContext(r.Context(), `DELETE FROM webhook_subscriptions WHERE id = $1`, id)
+		// Deletion must be scoped to the caller's API key (#607): without
+		// this, any authenticated tenant could delete another tenant's
+		// webhook subscription by id alone.
+		apiKeyID, err := resolveAPIKeyID(r.Context())
+		if errors.Is(err, errAPIKeyNotResolvable) {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, err.Error())
+			return
+		}
+		if err != nil {
+			slog.Error("webhook handler error", "err", err)
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "internal error")
+			return
+		}
+		result, err := db.ExecContext(r.Context(), `DELETE FROM webhook_subscriptions WHERE id = $1 AND api_key_id = $2`, id, apiKeyID)
 		if err != nil {
 			slog.Error("webhook handler error", "err", err)
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "internal error")
@@ -759,6 +772,8 @@ func deleteWebhookHandler(db *sql.DB) http.HandlerFunc {
 		}
 		affected, _ := result.RowsAffected()
 		if affected == 0 {
+			// A subscription owned by another key looks identical to a
+			// missing one - the id must not be enumerable via 403 vs 404.
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusNotFound, httputil.NOT_FOUND, "webhook not found")
 			return
 		}
@@ -777,9 +792,30 @@ func pauseWebhookHandler(db *sql.DB) http.HandlerFunc {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "database unavailable")
 			return
 		}
-		if _, err := db.ExecContext(r.Context(), `UPDATE webhook_subscriptions SET paused_at = NOW() WHERE id = $1`, id); err != nil {
+		// Pausing must be scoped to the caller's API key (#607): without
+		// this, any authenticated tenant could pause another tenant's
+		// webhook subscription by id alone.
+		apiKeyID, err := resolveAPIKeyID(r.Context())
+		if errors.Is(err, errAPIKeyNotResolvable) {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, err.Error())
+			return
+		}
+		if err != nil {
 			slog.Error("webhook handler error", "err", err)
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "internal error")
+			return
+		}
+		result, err := db.ExecContext(r.Context(), `UPDATE webhook_subscriptions SET paused_at = NOW() WHERE id = $1 AND api_key_id = $2`, id, apiKeyID)
+		if err != nil {
+			slog.Error("webhook handler error", "err", err)
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "internal error")
+			return
+		}
+		affected, _ := result.RowsAffected()
+		if affected == 0 {
+			// A subscription owned by another key looks identical to a
+			// missing one - the id must not be enumerable via 403 vs 404.
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusNotFound, httputil.NOT_FOUND, "webhook not found")
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "paused"})
@@ -797,9 +833,30 @@ func resumeWebhookHandler(db *sql.DB) http.HandlerFunc {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "database unavailable")
 			return
 		}
-		if _, err := db.ExecContext(r.Context(), `UPDATE webhook_subscriptions SET paused_at = NULL WHERE id = $1`, id); err != nil {
+		// Resuming must be scoped to the caller's API key (#607): without
+		// this, any authenticated tenant could resume another tenant's
+		// webhook subscription by id alone.
+		apiKeyID, err := resolveAPIKeyID(r.Context())
+		if errors.Is(err, errAPIKeyNotResolvable) {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, err.Error())
+			return
+		}
+		if err != nil {
 			slog.Error("webhook handler error", "err", err)
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "internal error")
+			return
+		}
+		result, err := db.ExecContext(r.Context(), `UPDATE webhook_subscriptions SET paused_at = NULL WHERE id = $1 AND api_key_id = $2`, id, apiKeyID)
+		if err != nil {
+			slog.Error("webhook handler error", "err", err)
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "internal error")
+			return
+		}
+		affected, _ := result.RowsAffected()
+		if affected == 0 {
+			// A subscription owned by another key looks identical to a
+			// missing one - the id must not be enumerable via 403 vs 404.
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusNotFound, httputil.NOT_FOUND, "webhook not found")
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "resumed"})
@@ -815,6 +872,36 @@ func deliveriesWebhookHandler(db *sql.DB) http.HandlerFunc {
 		}
 		if db == nil {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "database unavailable")
+			return
+		}
+		// Listing deliveries must be scoped to the caller's API key (#607):
+		// without this, any authenticated tenant could enumerate another
+		// tenant's delivery history, including response_body, by subscription
+		// id alone. webhook_deliveries carries no api_key_id of its own, so
+		// the scope check joins through webhook_subscriptions.
+		apiKeyID, err := resolveAPIKeyID(r.Context())
+		if errors.Is(err, errAPIKeyNotResolvable) {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, err.Error())
+			return
+		}
+		if err != nil {
+			slog.Error("webhook handler error", "err", err)
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "internal error")
+			return
+		}
+		var subExists bool
+		if err := db.QueryRowContext(r.Context(),
+			`SELECT EXISTS(SELECT 1 FROM webhook_subscriptions WHERE id = $1 AND api_key_id = $2)`,
+			id, apiKeyID,
+		).Scan(&subExists); err != nil {
+			slog.Error("webhook handler error", "err", err)
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "internal error")
+			return
+		}
+		if !subExists {
+			// A subscription owned by another key must look identical to a
+			// missing one - the id must not be enumerable via 403 vs 404.
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusNotFound, httputil.NOT_FOUND, "webhook not found")
 			return
 		}
 		rows, err := db.QueryContext(r.Context(), `
@@ -861,6 +948,32 @@ func deadLettersWebhookHandler(db *sql.DB) http.HandlerFunc {
 		}
 		if db == nil {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "database unavailable")
+			return
+		}
+		// Listing dead-lettered deliveries must be scoped to the caller's API
+		// key (#607): without this, any authenticated tenant could enumerate
+		// another tenant's dead-letter queue by subscription id alone.
+		apiKeyID, err := resolveAPIKeyID(r.Context())
+		if errors.Is(err, errAPIKeyNotResolvable) {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, err.Error())
+			return
+		}
+		if err != nil {
+			slog.Error("webhook handler error", "err", err)
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "internal error")
+			return
+		}
+		var subExists bool
+		if err := db.QueryRowContext(r.Context(),
+			`SELECT EXISTS(SELECT 1 FROM webhook_subscriptions WHERE id = $1 AND api_key_id = $2)`,
+			id, apiKeyID,
+		).Scan(&subExists); err != nil {
+			slog.Error("webhook handler error", "err", err)
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "internal error")
+			return
+		}
+		if !subExists {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusNotFound, httputil.NOT_FOUND, "webhook not found")
 			return
 		}
 		rows, err := db.QueryContext(r.Context(), `
@@ -914,10 +1027,24 @@ func replayDeadLetterHandler(db *sql.DB) http.HandlerFunc {
 			return
 		}
 
+		// Replaying must be scoped to the caller's API key (#607): without
+		// this, any authenticated tenant could force a replay of another
+		// tenant's dead-lettered delivery by id alone.
+		apiKeyID, err := resolveAPIKeyID(r.Context())
+		if errors.Is(err, errAPIKeyNotResolvable) {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, err.Error())
+			return
+		}
+		if err != nil {
+			slog.Error("webhook handler error", "err", err)
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "internal error")
+			return
+		}
+
 		// Load the dead-lettered delivery.
 		var eventID string
 		var prevAttempts int
-		err := db.QueryRowContext(r.Context(), `
+		err = db.QueryRowContext(r.Context(), `
 			SELECT event_id, attempts FROM webhook_deliveries
 			WHERE id = $1 AND subscription_id = $2 AND status = 'dead_lettered'
 		`, deliveryIDStr, subID).Scan(&eventID, &prevAttempts)
@@ -954,6 +1081,12 @@ func replayDeadLetterHandler(db *sql.DB) http.HandlerFunc {
 		}
 		if secondarySecret.Valid {
 			sub.SecondarySecret = &secondarySecret.String
+		}
+		if sub.APIKeyID != apiKeyID {
+			// A subscription owned by another key must look identical to a
+			// missing one - the id must not be enumerable via 403 vs 404.
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusNotFound, httputil.NOT_FOUND, "webhook subscription not found")
+			return
 		}
 
 		// Load the original event.
