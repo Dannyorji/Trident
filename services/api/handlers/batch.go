@@ -100,6 +100,12 @@ func BatchGetEvents(w http.ResponseWriter, r *http.Request) {
 		found bool
 	}
 
+	// Network enforced from authenticated API key context, matching the
+	// single-event lookup (events.go) — otherwise a single id batched
+	// through this route bypasses the network scope GET /v1/events/{id}
+	// enforces (issue #613).
+	network := middleware.NetworkFromContext(r.Context())
+
 	ctx, cancel := context.WithTimeout(r.Context(), grpcCallTimeout)
 	defer cancel()
 
@@ -110,7 +116,7 @@ func BatchGetEvents(w http.ResponseWriter, r *http.Request) {
 		go func(i int, id string) {
 			defer wg.Done()
 			event, err := grpcclient.CallWithRetry(ctx, 1, func(ctx context.Context) (*gen.Event, error) {
-				return eventsClient.GetEvent(ctx, &gen.GetEventRequest{Id: id})
+				return eventsClient.GetEvent(ctx, &gen.GetEventRequest{Id: id, Network: network})
 			})
 			if err != nil {
 				results[i] = result{id: id, found: false}
