@@ -328,7 +328,6 @@ func main() {
 		sorobanCaller:    sorobanCaller,
 		webhookDB:        webhookDB,
 		hub:              hub,
-		keyValidator:     middleware.Validator(middleware.ParseKeyHashes(os.Getenv("API_KEY_HASHES"))),
 	})
 
 	_ = usageTrack // passed to middleware in future; declared for shutdown ordering
@@ -359,10 +358,15 @@ func main() {
 	// Redis calls, logging — is spent on a request that's going to be
 	// rejected anyway.
 	handler = middleware.NewGlobalConcurrencyLimitFromEnv()(handler)
-	// Metrics middleware is the absolute outermost wrap (issue #58): it must
-	// see every response, including ones shed by GlobalConcurrencyLimit, to
-	// report accurate per-endpoint counts/latency.
+	// Metrics middleware wraps everything up to this point (issue #58): it
+	// must see every response, including ones shed by GlobalConcurrencyLimit,
+	// to report accurate per-endpoint counts/latency.
 	handler = middleware.NewMetrics(mux)(handler)
+	// Recover is the true outermost wrap (issue #610): it must sit ahead of
+	// every other middleware, including Metrics, so a panic anywhere in the
+	// chain — not just in a leaf handler — is caught, logged, counted, and
+	// answered with a 500 instead of dropping the connection uncontained.
+	handler = middleware.Recover(handler)
 	// Opt-in, internal-only pprof server (off unless PPROF_ENABLED=true). It is
 	// never mounted on the public mux above (#299).
 	pprofSrv := profiling.Start()

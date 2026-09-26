@@ -97,6 +97,15 @@ var (
 		Help: "Total requests allowed because a rate-limit backend check failed, by limiter.",
 	}, []string{"limiter"}) // limiter: per_key
 
+	// PanicsRecoveredTotal counts handler-chain panics caught by
+	// middleware.Recover (issue #610) — otherwise an invisible failure mode:
+	// the client sees a dropped connection, nothing is logged, nothing is
+	// counted.
+	PanicsRecoveredTotal = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "trident_panics_recovered_total",
+		Help: "Total handler-chain panics caught by the recovery middleware.",
+	})
+
 	// DB pool saturation metrics (issue #238), sourced from pgxpool.Pool.Stat()
 	// by PollDBPool. All exposed as Gauges — Stat() itself only returns
 	// point-in-time cumulative totals (not deltas), which Set() reflects
