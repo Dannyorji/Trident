@@ -518,7 +518,7 @@ export interface paths {
         };
         /**
          * List webhook subscriptions
-         * @description Webhook subscriptions owned by the calling API key. Includes each subscription's signing secret. Returns JSON null (not an empty array) when the key owns no subscriptions.
+         * @description Keyset-paginated webhook subscriptions owned by the calling API key (issue #220), newest first (createdAt DESC, id DESC as tiebreaker). Includes each subscription's signing secret. Returns JSON null (not an empty array) when the key owns no subscriptions.
          */
         get: operations["listWebhooks"];
         put?: never;
@@ -1162,6 +1162,13 @@ export interface components {
              */
             pausedAt?: string | null;
             network: string;
+        };
+        ListWebhooksResponse: {
+            webhooks: components["schemas"]["WebhookSubscription"][];
+            /** @description Whether another page is available. */
+            has_more: boolean;
+            /** @description Opaque cursor for the next page (null if has_more is false). */
+            next_cursor: string | null;
         };
         WebhookCreateRequest: {
             contractId: string;
@@ -2354,20 +2361,33 @@ export interface operations {
     };
     listWebhooks: {
         parameters: {
-            query?: never;
+            query?: {
+                limit?: number;
+                /** @description Opaque pagination cursor from a previous response's next_cursor. */
+                cursor?: string;
+            };
             header?: never;
             path?: never;
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description Subscriptions owned by the calling key (null when none) */
+            /** @description Page of subscriptions owned by the calling key */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["WebhookSubscription"][] | null;
+                    "application/json": components["schemas"]["ListWebhooksResponse"];
+                };
+            };
+            /** @description Invalid limit or cursor (plain-text body) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
                 };
             };
             401: components["responses"]["Unauthorized"];

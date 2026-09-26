@@ -43,6 +43,7 @@ type OpenAPIModels struct {
 	IndexerStatsResponse           *IndexerStatsResponse           `json:"IndexerStatsResponse,omitempty"`
 	ListAPIKeysResponse            *ListAPIKeysResponse            `json:"ListAPIKeysResponse,omitempty"`
 	ListContractsResponse          *ListContractsResponse          `json:"ListContractsResponse,omitempty"`
+	ListWebhooksResponse           *ListWebhooksResponse           `json:"ListWebhooksResponse,omitempty"`
 	LivenessResponse               *LivenessResponse               `json:"LivenessResponse,omitempty"`
 	ReadyChecks                    *ReadyChecks                    `json:"ReadyChecks,omitempty"`
 	ReadyResponse                  *ReadyResponse                  `json:"ReadyResponse,omitempty"`
@@ -338,6 +339,30 @@ type ListContractsResponse struct {
 	NextCursor                                                     string             `json:"next_cursor"`
 }
 
+type ListWebhooksResponse struct {
+	// Whether another page is available.                                                
+	HasMore                                                        bool                  `json:"has_more"`
+	// Opaque cursor for the next page (null if has_more is false).                      
+	NextCursor                                                     string                `json:"next_cursor"`
+	Webhooks                                                       []WebhookSubscription `json:"webhooks"`
+}
+
+type WebhookSubscription struct {
+	// Omitted when empty                                               
+	APIKeyID                                                 *string    `json:"apiKeyId,omitempty"`
+	ContractID                                               string     `json:"contractId"`
+	CreatedAt                                                time.Time  `json:"createdAt"`
+	ID                                                       string     `json:"id"`
+	Network                                                  string     `json:"network"`
+	// Present while deliveries are paused                              
+	PausedAt                                                 *time.Time `json:"pausedAt,omitempty"`
+	// HMAC signing secret for deliveries; omitted when empty           
+	Secret                                                   *string    `json:"secret,omitempty"`
+	TargetURL                                                string     `json:"targetUrl"`
+	// Topic filter; omitted when unfiltered                            
+	Topic0                                                   *string    `json:"topic0,omitempty"`
+}
+
 type LivenessResponse struct {
 	// Always "ok" while the process is up — no dependency checks.                       
 	Status                                                        LivenessResponseStatus `json:"status"`
@@ -467,22 +492,6 @@ type WebhookRotateSecretResponse struct {
 
 type WebhookStatusResponse struct {
 	Status WebhookStatusResponseStatus `json:"status"`
-}
-
-type WebhookSubscription struct {
-	// Omitted when empty                                               
-	APIKeyID                                                 *string    `json:"apiKeyId,omitempty"`
-	ContractID                                               string     `json:"contractId"`
-	CreatedAt                                                time.Time  `json:"createdAt"`
-	ID                                                       string     `json:"id"`
-	Network                                                  string     `json:"network"`
-	// Present while deliveries are paused                              
-	PausedAt                                                 *time.Time `json:"pausedAt,omitempty"`
-	// HMAC signing secret for deliveries; omitted when empty           
-	Secret                                                   *string    `json:"secret,omitempty"`
-	TargetURL                                                string     `json:"targetUrl"`
-	// Topic filter; omitted when unfiltered                            
-	Topic0                                                   *string    `json:"topic0,omitempty"`
 }
 
 // Network queried
