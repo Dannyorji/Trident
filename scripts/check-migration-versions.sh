@@ -11,6 +11,11 @@
 #
 # CI's integration job applies migrations with a `for f in *.sql` psql loop
 # rather than the migrator, so it does NOT catch this. Hence the explicit check.
+#
+# `.down.sql` rollback files (issue #602) intentionally share a version prefix
+# with their forward migration (e.g. 0002_x.sql / 0002_x.down.sql) — that pairing
+# is the point of the naming convention, not a collision. They are excluded from
+# every check and count below.
 
 set -euo pipefail
 
@@ -22,7 +27,7 @@ if [ ! -d "$MIGRATIONS_DIR" ]; then
 fi
 
 duplicates=$(
-    find "$MIGRATIONS_DIR" -maxdepth 1 -name '*.sql' -printf '%f\n' \
+    find "$MIGRATIONS_DIR" -maxdepth 1 -name '*.sql' ! -name '*.down.sql' -printf '%f\n' \
         | sed -n 's/^\([0-9]\{1,\}\)_.*/\1/p' \
         | sort \
         | uniq -d
@@ -34,7 +39,7 @@ if [ -n "$duplicates" ]; then
     while IFS= read -r version; do
         [ -z "$version" ] && continue
         echo "  version $version is used by:"
-        find "$MIGRATIONS_DIR" -maxdepth 1 -name "${version}_*.sql" -printf '    %f\n' | sort
+        find "$MIGRATIONS_DIR" -maxdepth 1 -name "${version}_*.sql" ! -name '*.down.sql' -printf '    %f\n' | sort
     done <<< "$duplicates"
     echo
     echo "sqlx keys _sqlx_migrations by this prefix, so these collide on the"
@@ -46,5 +51,5 @@ if [ -n "$duplicates" ]; then
     exit 1
 fi
 
-count=$(find "$MIGRATIONS_DIR" -maxdepth 1 -name '*.sql' | wc -l)
+count=$(find "$MIGRATIONS_DIR" -maxdepth 1 -name '*.sql' ! -name '*.down.sql' | wc -l)
 echo "OK: $count migrations, no duplicate versions."

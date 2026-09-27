@@ -112,7 +112,15 @@ psql -d "$DB_URL" -X -q -v ON_ERROR_STOP=1 \
     -c "DROP SCHEMA IF EXISTS drift_migrations CASCADE; CREATE SCHEMA drift_migrations;" \
     >/dev/null
 
+# `.down.sql` rollback files (issue #602) are reverse migrations, not part of
+# the forward chain this check builds a schema from — applying one here would
+# run a DROP/reverse statement against a table that file's own forward half
+# just created, which is not what "the migration chain" means for drift
+# comparison purposes.
 for f in "$MIGRATIONS_DIR"/*.sql; do
+    case "$f" in
+        *.down.sql) continue ;;
+    esac
     if ! PGOPTIONS="--search_path=drift_migrations,public" \
         psql -d "$DB_URL" -X -q -v ON_ERROR_STOP=1 -f "$f" >"$workdir/mig.log" 2>&1; then
         echo "error: migration $(basename "$f") failed to apply:" >&2

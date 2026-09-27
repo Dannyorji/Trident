@@ -13,6 +13,17 @@
 --   CREATE INDEX CONCURRENTLY cannot run inside a transaction block. The
 --   partitioned table is empty when these indexes are built, so the lock is
 --   held over no rows.
+-- lint:allow-no-rollback Step 8 (`DROP TABLE soroban_events_legacy`, line 171)
+--   destroys the only copy of the pre-partitioning table layout; a reverse
+--   migration would need to recreate soroban_events as a plain (non-partitioned)
+--   table and copy every row back out of the partitioned parent, but the
+--   generated columns, indexes, and the webhook_deliveries/token_events FK
+--   trade-offs made in steps 6-7 are also one-way (the FKs were dropped, not
+--   just altered, and nothing recorded which rows they used to constrain).
+--   The migration's own header already documents a narrower, manual rollback
+--   window ("Reversible: to roll back before step 7...") for someone who
+--   catches a problem mid-migration, before COMMIT; that is an operational
+--   procedure, not a `.down.sql` that can run unattended after the fact.
 --
 -- 0017: Convert soroban_events to RANGE-partitioned table (#244).
 --

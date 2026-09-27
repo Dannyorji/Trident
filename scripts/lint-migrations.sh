@@ -26,12 +26,30 @@
 #      `ALTER TABLE ... ADD COLUMN ... NOT NULL` without a DEFAULT rewrites the
 #      table. Both require a waiver comment naming why it is safe here.
 #
+#   5. Missing rollback (issue #602). Every forward migration
+#      (`<version>_<name>.sql`) must have a matching `<version>_<name>.down.sql`
+#      or a file-wide `-- lint:allow-no-rollback <reason>` waiver explaining why
+#      it genuinely cannot be reversed (e.g. a step that already dropped the
+#      data a reverse migration would need to restore). This is a file-wide
+#      rule only — a rollback either exists for the whole migration or it does
+#      not, so there is no meaningful per-line waiver the way there is for
+#      rules 2-4.
+#
+#      sqlx's migrator classifies each file independently by filename suffix
+#      (`.sql` = forward/"simple", `.down.sql` = reverse) and simply skips
+#      `.down.sql` files during `sqlx migrate run` / `Migrator::run` — they only
+#      run via `sqlx migrate revert` / `Migrator::undo`. Adding `.down.sql`
+#      files next to the existing plain-`.sql` migrations does not require
+#      renaming anything to `.up.sql`; sqlx does not require a directory-wide
+#      naming convention, only a per-file one.
+#
 # Usage:
 #   scripts/lint-migrations.sh [migrations-dir]
 #
 # Waivers: put `-- lint:allow-<rule> <reason>` on the line immediately above
-# the statement, or anywhere in the file for a file-wide waiver. Rules are
-# `destructive`, `no-guard`, and `long-lock`.
+# the statement (rules 2-4), or anywhere in the file for a file-wide waiver
+# (all rules, and the only form rule 5 accepts). Rules are `destructive`,
+# `no-guard`, `long-lock`, and `no-rollback`.
 
 set -euo pipefail
 
@@ -53,7 +71,7 @@ fail() {
 echo "==> Checking migration numbering"
 
 versions=$(
-    find "$MIGRATIONS_DIR" -maxdepth 1 -name '*.sql' -printf '%f\n' \
+    find "$MIGRATIONS_DIR" -maxdepth 1 -name '*.sql' ! -name '*.down.sql' -printf '%f\n' \
         | sed -n 's/^\([0-9]\{1,\}\)_.*/\1/p' \
         | sort -n
 )
@@ -68,7 +86,7 @@ if [ -n "$duplicates" ]; then
     while IFS= read -r v; do
         [ -z "$v" ] && continue
         fail "duplicate version $v:"
-        find "$MIGRATIONS_DIR" -maxdepth 1 -name "${v}_*.sql" -printf '    %f\n' | sort
+        find "$MIGRATIONS_DIR" -maxdepth 1 -name "${v}_*.sql" ! -name '*.down.sql' -printf '    %f\n' | sort
     done <<< "$duplicates"
 fi
 
@@ -109,7 +127,7 @@ strip_noise() {
     sed -e "s/--.*$//" -e "s/'[^']*'/''/g" "$1"
 }
 
-for file in $(find "$MIGRATIONS_DIR" -maxdepth 1 -name '*.sql' | sort); do
+for file in $(find "$MIGRATIONS_DIR" -maxdepth 1 -name '*.sql' ! -name '*.down.sql' | sort); do
     name=$(basename "$file")
     stripped=$(strip_noise "$file")
 
@@ -192,6 +210,14 @@ for file in $(find "$MIGRATIONS_DIR" -maxdepth 1 -name '*.sql' | sort); do
             fail "    $(echo "$text" | sed 's/^[[:space:]]*//' | cut -c1-90)"
         fi
     done <<< "$(echo "$stripped" | grep -inE '\bADD[[:space:]]+COLUMN\b' || true)"
+
+    # Rule 5: missing rollback. File-wide only — see the header comment for why
+    # this rule has no per-line waiver form.
+    down_file="${file%.sql}.down.sql"
+    if [ ! -f "$down_file" ] \
+        && ! grep -qiE -- '--[[:space:]]*lint:allow-no-rollback\b' "$file"; then
+        fail "$name has no $(basename "$down_file") and no -- lint:allow-no-rollback waiver"
+    fi
 done
 
 echo
@@ -205,7 +231,11 @@ put a comment on the line above the statement naming the rule and the reason:
   -- lint:allow-destructive the legacy table is empty by this point (see step 4)
   DROP TABLE soroban_events_legacy;
 
-Rules: destructive, no-guard, long-lock.
+A missing rollback needs a file-wide waiver instead (no line to attach it to):
+
+  -- lint:allow-no-rollback data already deleted in step 8; nothing to restore
+
+Rules: destructive, no-guard, long-lock, no-rollback.
 EOF
     exit 1
 fi

@@ -1,6 +1,20 @@
 -- Migration 0031: DB: store network as a typed enum/constraint and validate on write (issue #252)
 -- Enforces network scoping across all relevant tables: mainnet, testnet, futurenet, sandbox.
 --
+-- lint:allow-no-rollback Step 1's UPDATEs overwrite any 'pubnet' row to
+--   'mainnet' and any 'standalone'/'local' row to 'sandbox' across 14 tables,
+--   with no column recording which rows were touched or what their original
+--   value was. Dropping the CHECK constraints added below would undo the
+--   *enforcement* but cannot undo that normalisation: a row that entered this
+--   migration as 'pubnet' is indistinguishable, after it runs, from a row
+--   that was always 'mainnet'. This codebase is not known to have ever
+--   written 'pubnet' or 'standalone' (see the migration's own note: only the
+--   indexer config mentions 'pubnet', as an accepted alias), so in most real
+--   environments step 1 is a no-op, but the waiver is written against what
+--   the migration can do to a database that does carry those values (e.g.
+--   one seeded by hand, per the same header note), not against the common
+--   case.
+--
 -- The original version of this migration also renamed the vocabulary
 -- (mainnet -> pubnet, standalone -> local) across every table. That rename is
 -- deliberately dropped: 16 files in services/ and crates/ write 'mainnet', and
