@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/Depo-dev/trident/services/api/internal/contracttest"
+	"github.com/Depo-dev/trident/services/api/internal/httputil"
 	"github.com/getkin/kin-openapi/openapi3"
 )
 
@@ -152,4 +153,101 @@ func refOf(s *openapi3.SchemaRef) string {
 		return "<none>"
 	}
 	return s.Ref
+}
+
+// TestUsageEndpointsAreRouted guards against issue #615: KeyUsage and
+// AdminKeyUsageRollup were fully implemented, documented in their own doc
+// comments as live endpoints, and had their backing table (usage_rollup)
+// actively maintained by RunUsageRollupLoop, but neither was ever registered
+// in routeInventory() (routes.go) — a client hitting either documented path
+// got a 404 from the mux, not from the handler.
+func TestUsageEndpointsAreRouted(t *testing.T) {
+	routes := routeInventory()
+
+	want := []string{
+		opKey("GET", "/v1/usage"),
+		opKey("GET", "/v1/admin/keys/{id}/usage-rollup"),
+	}
+
+	for _, w := range want {
+		found := false
+		for _, r := range routes {
+			if opKey(r.Method, r.Path) == w {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("%s: not present in routeInventory() — implemented but never routed", w)
+		}
+	}
+}
+
+// TestErrorCodeEnumMatchesHttputil is the other half of issue #232's
+// acceptance criteria beyond route parity: the spec's ErrorResponse.error.code
+// enum must list exactly the same set of values as httputil.ErrorCode, in
+// both directions — a code the spec omits is one an SDK's generated enum
+// type can't represent, and a code the spec lists that Go never actually
+// returns is a documentation lie an integrator could code a branch against
+// that never fires.
+func TestErrorCodeEnumMatchesHttputil(t *testing.T) {
+	doc := contracttest.LoadSpec(t)
+
+	schema := doc.Components.Schemas["ErrorResponse"]
+	if schema == nil || schema.Value == nil {
+		t.Fatal("api/openapi.yaml has no ErrorResponse schema")
+	}
+	codeProp, ok := schema.Value.Properties["error"]
+	if !ok || codeProp.Value == nil {
+		t.Fatal("ErrorResponse schema has no 'error' property")
+	}
+	codeSchema, ok := codeProp.Value.Properties["code"]
+	if !ok || codeSchema.Value == nil {
+		t.Fatal("ErrorResponse.error schema has no 'code' property")
+	}
+
+	specCodes := make(map[string]bool, len(codeSchema.Value.Enum))
+	for _, v := range codeSchema.Value.Enum {
+		s, ok := v.(string)
+		if !ok {
+			t.Fatalf("ErrorResponse.error.code enum contains a non-string value: %#v", v)
+		}
+		specCodes[s] = true
+	}
+	if len(specCodes) == 0 {
+		t.Fatal("ErrorResponse.error.code has no enum constraint — a bare 'type: string' lets an SDK generate an untyped field and lets any typo pass validation")
+	}
+
+	goCodes := map[string]bool{
+		string(httputil.NOT_FOUND):         true,
+		string(httputil.UNAUTHORIZED):      true,
+		string(httputil.RATE_LIMITED):      true,
+		string(httputil.INVALID_ARGUMENT):  true,
+		string(httputil.UNAVAILABLE):       true,
+		string(httputil.INTERNAL):          true,
+		string(httputil.PAYLOAD_TOO_LARGE): true,
+		string(httputil.FORBIDDEN):         true,
+		string(httputil.CONFLICT):          true,
+	}
+
+	var missingFromSpec, missingFromGo []string
+	for code := range goCodes {
+		if !specCodes[code] {
+			missingFromSpec = append(missingFromSpec, code)
+		}
+	}
+	for code := range specCodes {
+		if !goCodes[code] {
+			missingFromGo = append(missingFromGo, code)
+		}
+	}
+	sort.Strings(missingFromSpec)
+	sort.Strings(missingFromGo)
+
+	for _, code := range missingFromSpec {
+		t.Errorf("httputil.ErrorCode %q is not in the spec's ErrorResponse.error.code enum", code)
+	}
+	for _, code := range missingFromGo {
+		t.Errorf("spec's ErrorResponse.error.code enum lists %q, which is not a httputil.ErrorCode constant", code)
+	}
 }

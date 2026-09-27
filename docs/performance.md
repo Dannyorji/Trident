@@ -477,6 +477,23 @@ The first two use `predict_linear` rather than a static percentage, because a
 provision and migrate. Alerting on projected exhaustion buys the lead time that
 a level threshold cannot.
 
+### Other unbounded tables (issue #604)
+
+Every table below either has an automated retention policy or a documented
+reason it does not, so a disk-growth alert always has a corresponding
+remediation to point to:
+
+| Table | Policy | Rationale |
+|---|---|---|
+| `event_outbox` | `RETENTION_EVENT_OUTBOX_DAYS` (default 7), `startRetentionJob` in `services/api/main.go` | Rows are only ever flipped `published = TRUE`, never deleted, and each carries a full JSONB copy of the event — the fastest-growing table relative to the relay's own publish latency. Deletion is scoped to `published = TRUE AND published_at < ...`: an unpublished row is never eligible regardless of age. |
+| `audit_log` | `RETENTION_AUDIT_LOG_DAYS` (default 90) | Same job as above (issue #245). |
+| `parse_errors` | `RETENTION_PARSE_ERRORS_DAYS` (default 30) | Same job as above. |
+| `webhook_deliveries` | `RETENTION_WEBHOOK_DELIVERIES_DAYS` (default 30) | Same job as above. |
+| `soroban_events` | Manual partition drop (see Retention above) | Deliberately manual: an automated drop is irreversible chain data loss, not a routine cleanup. |
+| `contract_storage_snapshots` | None — append-only by design | One row per balance change per holder; the history itself is the product (balance-over-time queries), not incidental log data. No safe cutoff exists without breaking that use case. |
+| `contract_invocation_metrics` | None yet — documented gap | Grows with chain activity like `soroban_events` (one row per contract invocation), but is not partitioned. Not covered by this issue's outbox-first scope; needs its own pass to confirm downstream analytics consumers (contract stats rollups) tolerate pruning before adding a job. |
+| `ledger_metadata` | None — should not be pruned | Keyed by `ledger_sequence`; the periodic gap-detection scan (issue #216, `docs/runbooks/gap-detection-backfill-drill.md`) reads across the full historical range to find missing ledgers. Pruning old rows would make gap detection blind to gaps in the pruned range, defeating the backfill safety net it exists to provide. |
+
 `TridentDiskSpaceLow` is the backstop for what a 6-hour trend cannot see: a step
 change from a backfill, or WAL pinned by a stalled replication slot. Runbooks
 for all three are in

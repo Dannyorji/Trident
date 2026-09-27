@@ -175,7 +175,7 @@ func TestValidateNetwork(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, verr := ValidateNetwork("network", tt.value, DefaultNetwork)
+			got, verr := ValidateNetwork("network", tt.value, "testnet")
 			if (verr != nil) != tt.wantErr {
 				t.Fatalf("got err %v, wantErr=%v", verr, tt.wantErr)
 			}

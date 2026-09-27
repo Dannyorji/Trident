@@ -29,7 +29,6 @@ type routeDeps struct {
 	sorobanCaller    handlers.SorobanRPCCaller
 	webhookDB        *sql.DB
 	hub              *ws.Hub
-	keyValidator     func(string) bool
 	rlCfg            middleware.RateLimitConfig
 	authDB           middleware.DBAuthConfig
 }
@@ -119,6 +118,12 @@ func routeBindings() []routeBinding {
 		}),
 		documented("GET", "/v1/admin/keys/{id}/usage", func(d routeDeps) http.Handler {
 			return handlers.AdminKeyUsage(d.adminCfg)
+		}),
+		documented("GET", "/v1/admin/keys/{id}/usage-rollup", func(d routeDeps) http.Handler {
+			return handlers.AdminKeyUsageRollup(d.adminCfg)
+		}),
+		documented("GET", "/v1/usage", func(d routeDeps) http.Handler {
+			return handlers.KeyUsage(handlers.UsageConfig{DB: d.pool})
 		}),
 		// Admin contract registration CRUD (issue #230)
 		documented("POST", "/v1/admin/contracts", func(d routeDeps) http.Handler {

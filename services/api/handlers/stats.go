@@ -498,8 +498,16 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 		}
 
 		q := r.URL.Query()
+		// network is intentionally excluded from the allowed set: it is
+		// derived from the authenticated key's context below, exactly as
+		// every other data endpoint (ListEvents, ContractStorageLatest,
+		// etc.) enforces it. A client-supplied ?network is rejected outright
+		// rather than silently ignored, consistent with RejectUnknownParams'
+		// existing "unrecognised param is a client bug" convention (issue
+		// #612) — otherwise a testnet-scoped key could read mainnet
+		// aggregates by passing ?network=mainnet.
 		if verr := validation.RejectUnknownParams(
-			q, "from_ledger", "to_ledger", "network", "limit", "cursor",
+			q, "from_ledger", "to_ledger", "limit", "cursor",
 		); verr != nil {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 			return
@@ -509,13 +517,13 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 		params, verr := validation.ValidateQueryStats(
 			q.Get("from_ledger"),
 			q.Get("to_ledger"),
-			q.Get("network"),
 			q.Get("limit"),
 		)
 		if verr != nil {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 			return
 		}
+		params.Network = middleware.NetworkFromContext(r.Context())
 
 		pagingToken, verr := validation.ValidateCursor("cursor", q.Get("cursor"))
 		if verr != nil {

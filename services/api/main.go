@@ -313,6 +313,7 @@ func main() {
 		authDB.DB = pool
 	}
 	authDB.Redis = redisClient
+	authDB.UsageTrack = usageTrack
 
 	registerRoutes(mux, routeDeps{
 		rlCfg:            rlCfg,
@@ -328,17 +329,20 @@ func main() {
 		sorobanCaller:    sorobanCaller,
 		webhookDB:        webhookDB,
 		hub:              hub,
-		keyValidator:     middleware.Validator(middleware.ParseKeyHashes(os.Getenv("API_KEY_HASHES"))),
 	})
-
-	_ = usageTrack // passed to middleware in future; declared for shutdown ordering
 
 	handler := middleware.NewBodySizeLimitFromEnv()(mux)
 	handler = middleware.TieredRateLimit(rlCfg)(handler)
+	handler = middleware.NewDBAuth(authDB)(handler)
+	// AuditMiddleware wraps NewDBAuth (issue #609), not the other way around:
+	// it must run on every request regardless of auth outcome, so a rejected
+	// 401 is still written to audit_log. With AuditMiddleware inside NewDBAuth,
+	// NewDBAuth's early return on a missing/invalid key never reached
+	// next.ServeHTTP, so AuditMiddleware's write never ran and failed auth
+	// attempts left no audit trail at all.
 	if auditWriter != nil {
 		handler = middleware.AuditMiddleware(auditWriter)(handler)
 	}
-	handler = middleware.NewDBAuth(authDB)(handler)
 	handler = middleware.NewCompression()(handler)
 	// Per-IP rate limit runs BEFORE auth (issue #318): it wraps the handler
 	// chain built so far, so it executes ahead of NewDBAuth for every
@@ -359,10 +363,15 @@ func main() {
 	// Redis calls, logging — is spent on a request that's going to be
 	// rejected anyway.
 	handler = middleware.NewGlobalConcurrencyLimitFromEnv()(handler)
-	// Metrics middleware is the absolute outermost wrap (issue #58): it must
-	// see every response, including ones shed by GlobalConcurrencyLimit, to
-	// report accurate per-endpoint counts/latency.
+	// Metrics middleware wraps everything up to this point (issue #58): it
+	// must see every response, including ones shed by GlobalConcurrencyLimit,
+	// to report accurate per-endpoint counts/latency.
 	handler = middleware.NewMetrics(mux)(handler)
+	// Recover is the true outermost wrap (issue #610): it must sit ahead of
+	// every other middleware, including Metrics, so a panic anywhere in the
+	// chain — not just in a leaf handler — is caught, logged, counted, and
+	// answered with a 500 instead of dropping the connection uncontained.
+	handler = middleware.Recover(handler)
 	// Opt-in, internal-only pprof server (off unless PPROF_ENABLED=true). It is
 	// never mounted on the public mux above (#299).
 	pprofSrv := profiling.Start()
@@ -573,6 +582,7 @@ type retentionConfig struct {
 	ParseErrorsDays       int
 	WebhookDeliveriesDays int
 	SorobanEventsDays     int
+	EventOutboxDays       int
 }
 
 func loadRetentionConfig() retentionConfig {
@@ -581,6 +591,13 @@ func loadRetentionConfig() retentionConfig {
 		ParseErrorsDays:       envInt("RETENTION_PARSE_ERRORS_DAYS", 30),
 		WebhookDeliveriesDays: envInt("RETENTION_WEBHOOK_DELIVERIES_DAYS", 30),
 		SorobanEventsDays:     envInt("RETENTION_SOROBAN_EVENTS_DAYS", 0), // 0 = disabled
+		// event_outbox is the fastest-growing unbounded table (issue #604):
+		// rows are only ever flipped published = TRUE, never deleted, and
+		// each carries a full JSONB copy of the event. 7 days is generous
+		// relative to the relay's normal publish latency (seconds), while
+		// still giving an operator a window to notice and recover a stuck
+		// relay before its backlog is pruned out from under it.
+		EventOutboxDays: envInt("RETENTION_EVENT_OUTBOX_DAYS", 7),
 	}
 }
 
@@ -628,6 +645,13 @@ func startRetentionJob(ctx context.Context, pool *pgxpool.Pool) {
 					`DELETE FROM soroban_events WHERE created_at < NOW() - ($1 || ' days')::INTERVAL AND ctid IN (
 						SELECT ctid FROM soroban_events WHERE created_at < NOW() - ($1 || ' days')::INTERVAL LIMIT 1000
 					)`},
+				// event_outbox additionally requires published = TRUE: an
+				// unpublished row must never be deleted regardless of age,
+				// since the relay has not yet delivered it (issue #604).
+				{"event_outbox", cfg.EventOutboxDays,
+					`DELETE FROM event_outbox WHERE published = TRUE AND published_at < NOW() - ($1 || ' days')::INTERVAL AND ctid IN (
+						SELECT ctid FROM event_outbox WHERE published = TRUE AND published_at < NOW() - ($1 || ' days')::INTERVAL LIMIT 1000
+					)`},
 			}
 
 			for _, t := range tables {
@@ -639,6 +663,9 @@ func startRetentionJob(ctx context.Context, pool *pgxpool.Pool) {
 					if err != nil {
 						slog.Warn("retention: cleanup failed", "table", t.name, "err", err)
 						break
+					}
+					if tag.RowsAffected() > 0 {
+						metrics.RetentionRowsDeletedTotal.WithLabelValues(t.name).Add(float64(tag.RowsAffected()))
 					}
 					if tag.RowsAffected() == 0 {
 						break

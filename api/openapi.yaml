@@ -1066,6 +1066,111 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
+  /v1/admin/keys/{id}/usage-rollup:
+    get:
+      summary: API key usage rollup (admin)
+      description: >-
+        Same shape as GET /v1/usage but for any key id, gated by
+        X-Admin-Key. Backed by the maintained usage_rollup table rather
+        than a live audit_log scan, so it stays cheap regardless of how
+        far back `from` reaches.
+      operationId: getAdminKeyUsageRollup
+      tags:
+        - Admin
+      security:
+        - AdminKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: API key ID
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: Window start (RFC 3339); defaults to 30 days before `to`
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: Window end (RFC 3339); defaults to now
+      responses:
+        "200":
+          description: Usage rollup for the key over the window
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UsageResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsIPOnly"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /v1/usage:
+    get:
+      summary: Self-serve API key usage rollup
+      description: >-
+        The authenticated caller's own usage rollup for an optional
+        [from, to) window; defaults to the last 30 days. Requires a
+        DB-backed API key — legacy env-hash auth has no key id to key the
+        rollup on.
+      operationId: getKeyUsage
+      tags:
+        - Usage
+      parameters:
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: Window start (RFC 3339); defaults to 30 days before `to`
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: Window end (RFC 3339); defaults to now
+      responses:
+        "200":
+          description: Usage rollup for the calling key over the window
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UsageResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "501":
+          description: >-
+            The authenticated key is not DB-backed (legacy env-hash auth
+            carries no key id to key the rollup on)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
   /v1/admin/contracts:
     post:
       summary: Register a contract for indexing
@@ -1256,40 +1361,49 @@ paths:
     get:
       summary: List webhook subscriptions
       description: >-
-        Webhook subscriptions owned by the calling API key. Includes each
-        subscription's signing secret. Returns JSON null (not an empty
-        array) when the key owns no subscriptions. Webhook endpoints are not
-        yet part of the frozen v1 surface; some of their error responses are
-        plain text rather than the canonical error envelope.
+        Keyset-paginated webhook subscriptions owned by the calling API key
+        (issue #220), newest first (createdAt DESC, id DESC as tiebreaker).
+        Includes each subscription's signing secret. Returns JSON null (not
+        an empty array) when the key owns no subscriptions.
       operationId: listWebhooks
       tags:
         - Webhooks
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - name: cursor
+          in: query
+          required: false
+          description: Opaque pagination cursor from a previous response's next_cursor.
+          schema:
+            type: string
       responses:
         "200":
-          description: Subscriptions owned by the calling key (null when none)
+          description: Page of subscriptions owned by the calling key
           content:
             application/json:
               schema:
-                type: array
-                nullable: true
-                items:
-                  $ref: "#/components/schemas/WebhookSubscription"
+                $ref: "#/components/schemas/ListWebhooksResponse"
+        "400":
+          description: Invalid limit or cursor (plain-text body)
+          content:
+            text/plain:
+              schema:
+                type: string
         "401":
           $ref: "#/components/responses/Unauthorized"
         "429":
           $ref: "#/components/responses/RateLimitExceeded"
         "500":
-          description: Listing failed (plain-text body)
-          content:
-            text/plain:
-              schema:
-                type: string
+          $ref: "#/components/responses/InternalError"
         "503":
-          description: Database unavailable (plain-text body)
-          content:
-            text/plain:
-              schema:
-                type: string
+          $ref: "#/components/responses/ServiceUnavailable"
     post:
       summary: Create a webhook subscription
       description: >-
@@ -1316,11 +1430,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/WebhookCreateResponse"
         "400":
-          description: Invalid body or target URL (plain-text body)
-          content:
-            text/plain:
-              schema:
-                type: string
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "413":
@@ -1332,17 +1442,9 @@ paths:
         "429":
           $ref: "#/components/responses/RateLimitExceeded"
         "500":
-          description: Creation failed (plain-text body)
-          content:
-            text/plain:
-              schema:
-                type: string
+          $ref: "#/components/responses/InternalError"
         "503":
-          description: Database unavailable (plain-text body)
-          content:
-            text/plain:
-              schema:
-                type: string
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /v1/webhooks/{id}:
     delete:
@@ -1368,19 +1470,11 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
-          description: Subscription not found (plain-text body)
-          content:
-            text/plain:
-              schema:
-                type: string
+          $ref: "#/components/responses/NotFound"
         "429":
           $ref: "#/components/responses/RateLimitExceeded"
         "500":
-          description: Delete failed (plain-text body)
-          content:
-            text/plain:
-              schema:
-                type: string
+          $ref: "#/components/responses/InternalError"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -1417,21 +1511,15 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
-          description: >-
-            No subscription with this ID belongs to the caller's API key
-            (plain-text body)
+          description: No subscription with this ID belongs to the caller's API key
           content:
-            text/plain:
+            application/json:
               schema:
-                type: string
+                $ref: "#/components/schemas/ErrorResponse"
         "429":
           $ref: "#/components/responses/RateLimitExceeded"
         "500":
-          description: Rotation failed (plain-text body)
-          content:
-            text/plain:
-              schema:
-                type: string
+          $ref: "#/components/responses/InternalError"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -1466,11 +1554,7 @@ paths:
         "429":
           $ref: "#/components/responses/RateLimitExceeded"
         "500":
-          description: Update failed (plain-text body)
-          content:
-            text/plain:
-              schema:
-                type: string
+          $ref: "#/components/responses/InternalError"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -1506,11 +1590,7 @@ paths:
         "429":
           $ref: "#/components/responses/RateLimitExceeded"
         "500":
-          description: Update failed (plain-text body)
-          content:
-            text/plain:
-              schema:
-                type: string
+          $ref: "#/components/responses/InternalError"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -1548,11 +1628,7 @@ paths:
         "429":
           $ref: "#/components/responses/RateLimitExceeded"
         "500":
-          description: Listing failed (plain-text body)
-          content:
-            text/plain:
-              schema:
-                type: string
+          $ref: "#/components/responses/InternalError"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -1582,27 +1658,15 @@ paths:
                 items:
                   $ref: "#/components/schemas/WebhookDelivery"
         "400":
-          description: Missing webhook ID (plain-text body)
-          content:
-            text/plain:
-              schema:
-                type: string
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "429":
           $ref: "#/components/responses/RateLimitExceeded"
         "500":
-          description: Listing failed (plain-text body)
-          content:
-            text/plain:
-              schema:
-                type: string
+          $ref: "#/components/responses/InternalError"
         "503":
-          description: Database unavailable (plain-text body)
-          content:
-            text/plain:
-              schema:
-                type: string
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /v1/webhooks/{id}/dead-letters/{deliveryId}/replay:
     post:
@@ -1636,33 +1700,17 @@ paths:
               schema:
                 $ref: "#/components/schemas/WebhookReplayResponse"
         "400":
-          description: Missing webhook or delivery ID (plain-text body)
-          content:
-            text/plain:
-              schema:
-                type: string
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
-          description: No matching dead-lettered delivery (plain-text body)
-          content:
-            text/plain:
-              schema:
-                type: string
+          $ref: "#/components/responses/NotFound"
         "429":
           $ref: "#/components/responses/RateLimitExceeded"
         "500":
-          description: Replay failed to record (plain-text body)
-          content:
-            text/plain:
-              schema:
-                type: string
+          $ref: "#/components/responses/InternalError"
         "503":
-          description: Database unavailable (plain-text body)
-          content:
-            text/plain:
-              schema:
-                type: string
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /metrics:
     get:
@@ -2367,6 +2415,63 @@ components:
           format: int64
         avg_duration_ms:
           type: number
+    UsageResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - api_key_id
+        - from
+        - to
+        - total_requests
+        - total_errors
+        - days
+      properties:
+        api_key_id:
+          type: string
+          format: uuid
+        from:
+          type: string
+          format: date-time
+        to:
+          type: string
+          format: date-time
+        total_requests:
+          type: integer
+          format: int64
+        total_errors:
+          type: integer
+          format: int64
+        days:
+          type: array
+          description: >-
+            Daily buckets from the maintained usage_rollup table, oldest
+            first; empty when the window has no rollup rows.
+          items:
+            $ref: "#/components/schemas/UsageRollupRow"
+    UsageRollupRow:
+      type: object
+      additionalProperties: false
+      required:
+        - period_start
+        - period_end
+        - request_count
+        - error_count
+        - avg_duration_ms
+      properties:
+        period_start:
+          type: string
+          format: date-time
+        period_end:
+          type: string
+          format: date-time
+        request_count:
+          type: integer
+          format: int64
+        error_count:
+          type: integer
+          format: int64
+        avg_duration_ms:
+          type: number
     ContractRegistrationRequest:
       type: object
       additionalProperties: false
@@ -2487,6 +2592,25 @@ components:
           description: Present while deliveries are paused
         network:
           type: string
+    ListWebhooksResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - webhooks
+        - has_more
+        - next_cursor
+      properties:
+        webhooks:
+          type: array
+          items:
+            $ref: "#/components/schemas/WebhookSubscription"
+        has_more:
+          type: boolean
+          description: Whether another page is available.
+        next_cursor:
+          type: string
+          nullable: true
+          description: Opaque cursor for the next page (null if has_more is false).
     WebhookCreateRequest:
       type: object
       additionalProperties: false
@@ -2639,7 +2763,17 @@ components:
           properties:
             code:
               type: string
-              description: Error code (e.g., INVALID_ARGUMENT, INTERNAL, UNAVAILABLE, CONFLICT)
+              description: Machine-readable error code. Matches httputil.ErrorCode exactly (services/api/internal/httputil/errors.go).
+              enum:
+                - NOT_FOUND
+                - UNAUTHORIZED
+                - RATE_LIMITED
+                - INVALID_ARGUMENT
+                - UNAVAILABLE
+                - INTERNAL
+                - PAYLOAD_TOO_LARGE
+                - FORBIDDEN
+                - CONFLICT
             message:
               type: string
               description: Human-readable error message
@@ -2729,6 +2863,13 @@ components:
 
     NotFound:
       description: Requested resource was not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+    InternalError:
+      description: An unexpected server-side error occurred (error.code INTERNAL)
       content:
         application/json:
           schema:
@@ -2839,3 +2980,5 @@ tags:
     description: Contract schema, spec, storage, and simulation endpoints
   - name: Webhooks
     description: Webhook subscriptions and delivery management (not yet part of the frozen v1 surface)
+  - name: Usage
+    description: Self-serve API key usage reporting

@@ -152,7 +152,7 @@ func ListContracts(cfg ContractConfig) http.HandlerFunc {
 		if raw := r.URL.Query().Get("cursor"); raw != "" {
 			decoded, err := cursor.Decode(raw)
 			if err != nil {
-				writeJSON(w, http.StatusBadRequest, errorBody("cursor is not a valid pagination cursor"))
+				httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "cursor is not a valid pagination cursor")
 				return
 			}
 			cursorID = &decoded

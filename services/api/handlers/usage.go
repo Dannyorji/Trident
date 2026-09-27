@@ -5,7 +5,9 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Depo-dev/trident/services/api/internal/httputil"
 	"github.com/Depo-dev/trident/services/api/middleware"
+	"github.com/Depo-dev/trident/services/api/validation"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -48,16 +50,6 @@ type UsageResponse struct {
 // (which fills in as the day progresses) and catches any audit_log rows that
 // arrived late relative to the previous run, since the audit writer batches
 // asynchronously.
-
-// errorBody builds the legacy {"error":{"message":...}} envelope. Only the
-// (currently unmounted) usage handlers in this file still use it — the
-// mounted admin-contract handlers moved to the canonical httputil envelope
-// when they were documented in the OpenAPI spec (issue #513). If these
-// handlers are ever mounted, migrate them to httputil.WriteErrorCtx and
-// delete this.
-func errorBody(message string) map[string]any {
-	return map[string]any{"error": map[string]any{"message": message}}
-}
 
 func RollupUsage(ctx context.Context, db *pgxpool.Pool, since time.Time) error {
 	_, err := db.Exec(ctx, `
@@ -184,24 +176,29 @@ func parseUsageWindow(r *http.Request) (from, to time.Time, err error) {
 func KeyUsage(cfg UsageConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if cfg.DB == nil {
-			writeJSON(w, http.StatusServiceUnavailable, errorBody("usage endpoint is not configured"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "usage endpoint is not configured")
+			return
+		}
+
+		if verr := validation.RejectUnknownParams(r.URL.Query(), "from", "to"); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 			return
 		}
 
 		idStr := middleware.APIKeyIDFromContext(r.Context())
 		if idStr == "" {
-			writeJSON(w, http.StatusNotImplemented, errorBody("usage metering requires a DB-backed API key"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusNotImplemented, httputil.UNAVAILABLE, "usage metering requires a DB-backed API key")
 			return
 		}
 		keyID, err := uuid.Parse(idStr)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, errorBody("invalid authenticated key id"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "invalid authenticated key id")
 			return
 		}
 
 		from, to, err := parseUsageWindow(r)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, errorBody("invalid from/to timestamp, use RFC3339"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "invalid from/to timestamp, use RFC3339")
 			return
 		}
 
@@ -210,7 +207,7 @@ func KeyUsage(cfg UsageConfig) http.HandlerFunc {
 
 		resp, err := queryUsageRollup(ctx, cfg.DB, keyID, from, to)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, errorBody("failed to query usage"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to query usage")
 			return
 		}
 
@@ -226,24 +223,29 @@ func KeyUsage(cfg UsageConfig) http.HandlerFunc {
 func AdminKeyUsageRollup(cfg AdminConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if cfg.AdminKey == "" || cfg.DB == nil {
-			writeJSON(w, http.StatusServiceUnavailable, errorBody("admin usage endpoint is not configured"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "admin usage endpoint is not configured")
 			return
 		}
 		if !validAdminKey(cfg.AdminKey, r.Header.Get("X-Admin-Key")) {
-			writeJSON(w, http.StatusUnauthorized, errorBody("invalid or missing admin key"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "invalid or missing admin key")
+			return
+		}
+
+		if verr := validation.RejectUnknownParams(r.URL.Query(), "from", "to"); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 			return
 		}
 
 		keyIDStr := r.PathValue("id")
 		keyID, err := uuid.Parse(keyIDStr)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, errorBody("invalid api key id"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "invalid api key id")
 			return
 		}
 
 		from, to, err := parseUsageWindow(r)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, errorBody("invalid from/to timestamp, use RFC3339"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "invalid from/to timestamp, use RFC3339")
 			return
 		}
 
@@ -252,7 +254,7 @@ func AdminKeyUsageRollup(cfg AdminConfig) http.HandlerFunc {
 
 		resp, err := queryUsageRollup(ctx, cfg.DB, keyID, from, to)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, errorBody("failed to query usage"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to query usage")
 			return
 		}
 

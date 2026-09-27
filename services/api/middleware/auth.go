@@ -26,6 +26,27 @@ type DBAuthConfig struct {
 	}
 	// Redis is used for caching successful lookups (5 min TTL). Optional.
 	Redis *redis.Client
+	// UsageTrack receives the authenticated key's id on every successful
+	// DB-backed or cached auth (issue #615), feeding
+	// handlers.NewAPIKeyUsageTracker's batched request_count/last_used_at
+	// flush. Optional: nil disables tracking (matches main.go's existing
+	// "only start the tracker when pool != nil" behavior).
+	UsageTrack chan<- string
+}
+
+// trackUsage sends idStr on track without blocking the request: the channel
+// is large (4096) and drained every few seconds, but a request must never
+// wait on it, and a full channel must never be treated as an error, usage
+// tracking is explicitly non-critical (NewAPIKeyUsageTracker's own doc
+// comment).
+func trackUsage(track chan<- string, idStr string) {
+	if track == nil {
+		return
+	}
+	select {
+	case track <- idStr:
+	default:
+	}
 }
 
 const authCacheTTL = 5 * time.Minute
@@ -154,6 +175,7 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 					if len(parts) == 2 {
 						network = parts[1]
 					}
+					trackUsage(cfg.UsageTrack, parts[0])
 					ctx := withAuthenticatedKey(r.Context(), parts[0], network)
 					next.ServeHTTP(w, r.WithContext(ctx))
 					return
@@ -176,6 +198,7 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 						cfg.Redis.Set(r.Context(), authRedisCacheKey(dbHash),
 							id+":"+network, authCacheTTL)
 					}
+					trackUsage(cfg.UsageTrack, id)
 					ctx := withAuthenticatedKey(r.Context(), id, network)
 					next.ServeHTTP(w, r.WithContext(ctx))
 					return
@@ -193,15 +216,6 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "Unauthorized")
 		})
-	}
-}
-
-// Validator returns a func(string) bool that checks whether the HMAC-SHA256
-// of the provided key is in the given valid hashes set in constant time. Used
-// by the GraphQL WebSocket handler which needs a standalone key-check function.
-func Validator(hashes map[string]struct{}) func(string) bool {
-	return func(key string) bool {
-		return ConstantTimeContains(hashes, hmacKeyHash(key))
 	}
 }
 

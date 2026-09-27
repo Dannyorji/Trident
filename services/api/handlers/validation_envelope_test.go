@@ -9,7 +9,11 @@ import (
 	"testing"
 
 	"github.com/Depo-dev/trident/services/api/handlers"
+	"github.com/Depo-dev/trident/services/api/middleware"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/redis/go-redis/v9"
 )
 
 // stubDBPool satisfies handlers.DBPool. Validation runs before any query, so
@@ -151,5 +155,83 @@ func TestContractsStatsBadInputReturnsCanonicalEnvelope(t *testing.T) {
 
 			assertInvalidArgument(t, rec, tt.wantField)
 		})
+	}
+}
+
+// TestContractsStatsRejectsClientSuppliedNetwork_EvenWhenSyntacticallyValid
+// guards against the network isolation bypass in issue #612: unlike
+// TestContractsStatsBadInputReturnsCanonicalEnvelope's "unknown network" case
+// (?network=futurenet, rejected because "futurenet" isn't a valid network
+// value), this asserts that ?network=mainnet — a syntactically *valid*
+// network — is rejected too, because network is not a query parameter at all
+// on this route. Network is derived exclusively from the authenticated key's
+// context (middleware.NetworkFromContext); a testnet-scoped key could
+// otherwise read mainnet contract aggregates simply by passing
+// ?network=mainnet on the query string.
+func TestContractsStatsRejectsClientSuppliedNetwork_EvenWhenSyntacticallyValid(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/v1/stats/contracts?network=mainnet", nil)
+	rec := httptest.NewRecorder()
+
+	handlers.ContractsStats(stubDBPool{}, nil)(rec, req)
+
+	assertInvalidArgument(t, rec, "network")
+}
+
+// noRowsDBPool is a zero-row handlers.DBPool stand-in, local to this file
+// (handlers_test can't reach contract_xcache_test.go's package-internal
+// xcacheMissDB), used only to let ContractsStats reach its response-encoding
+// step without a real database.
+type noRowsDBPool struct{}
+
+func (noRowsDBPool) Ping(context.Context) error { return nil }
+func (noRowsDBPool) QueryRow(context.Context, string, ...any) pgx.Row {
+	return nil
+}
+func (noRowsDBPool) Query(context.Context, string, ...any) (pgx.Rows, error) {
+	return &noRowsRows{}, nil
+}
+
+type noRowsRows struct{}
+
+func (noRowsRows) Close()                                       {}
+func (noRowsRows) Err() error                                   { return nil }
+func (noRowsRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
+func (noRowsRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
+func (noRowsRows) Next() bool                                   { return false }
+func (noRowsRows) Scan(...any) error                            { return nil }
+func (noRowsRows) Values() ([]any, error)                       { return nil, nil }
+func (noRowsRows) RawValues() [][]byte                          { return nil }
+func (noRowsRows) Conn() *pgx.Conn                              { return nil }
+
+// TestContractsStatsUsesNetworkFromContext_NotQueryString proves the positive
+// half of issue #612's fix: a request authenticated on testnet gets testnet
+// aggregates regardless of what (if anything) a client puts in the query
+// string, because ContractsStats never reads r.URL.Query().Get("network").
+func TestContractsStatsUsesNetworkFromContext_NotQueryString(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("start miniredis: %v", err)
+	}
+	t.Cleanup(mr.Close)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/stats/contracts?from_ledger=0&to_ledger=1000000&limit=10", nil)
+	req = req.WithContext(middleware.WithNetwork(req.Context(), "testnet"))
+	rec := httptest.NewRecorder()
+
+	handlers.ContractsStats(noRowsDBPool{}, rdb)(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var body struct {
+		Network string `json:"network"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.Network != "testnet" {
+		t.Fatalf("response network: got %q, want %q (derived from context, not the query string)", body.Network, "testnet")
 	}
 }

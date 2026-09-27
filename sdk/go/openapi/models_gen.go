@@ -43,11 +43,14 @@ type OpenAPIModels struct {
 	IndexerStatsResponse           *IndexerStatsResponse           `json:"IndexerStatsResponse,omitempty"`
 	ListAPIKeysResponse            *ListAPIKeysResponse            `json:"ListAPIKeysResponse,omitempty"`
 	ListContractsResponse          *ListContractsResponse          `json:"ListContractsResponse,omitempty"`
+	ListWebhooksResponse           *ListWebhooksResponse           `json:"ListWebhooksResponse,omitempty"`
 	LivenessResponse               *LivenessResponse               `json:"LivenessResponse,omitempty"`
 	ReadyChecks                    *ReadyChecks                    `json:"ReadyChecks,omitempty"`
 	ReadyResponse                  *ReadyResponse                  `json:"ReadyResponse,omitempty"`
 	SorobanEvent                   *SorobanEvent                   `json:"SorobanEvent,omitempty"`
 	TokenMetadataResponse          *TokenMetadataResponse          `json:"TokenMetadataResponse,omitempty"`
+	UsageResponse                  *UsageResponse                  `json:"UsageResponse,omitempty"`
+	UsageRollupRow                 *UsageRollupRow                 `json:"UsageRollupRow,omitempty"`
 	VersionResponse                *VersionResponse                `json:"VersionResponse,omitempty"`
 	WebhookCreateRequest           *WebhookCreateRequest           `json:"WebhookCreateRequest,omitempty"`
 	WebhookCreateResponse          *WebhookCreateResponse          `json:"WebhookCreateResponse,omitempty"`
@@ -253,12 +256,13 @@ type ErrorResponse struct {
 }
 
 type Error struct {
-	// Error code (e.g., INVALID_ARGUMENT, INTERNAL, UNAVAILABLE, CONFLICT)        
-	Code                                                                   string  `json:"code"`
-	// Human-readable error message                                                
-	Message                                                                string  `json:"message"`
-	// Request ID for debugging                                                    
-	RequestID                                                              *string `json:"request_id,omitempty"`
+	// Machine-readable error code. Matches httputil.ErrorCode exactly        
+	// (services/api/internal/httputil/errors.go).                            
+	Code                                                              Code    `json:"code"`
+	// Human-readable error message                                           
+	Message                                                           string  `json:"message"`
+	// Request ID for debugging                                               
+	RequestID                                                         *string `json:"request_id,omitempty"`
 }
 
 type EventListResponse struct {
@@ -335,6 +339,30 @@ type ListContractsResponse struct {
 	NextCursor                                                     string             `json:"next_cursor"`
 }
 
+type ListWebhooksResponse struct {
+	// Whether another page is available.                                                
+	HasMore                                                        bool                  `json:"has_more"`
+	// Opaque cursor for the next page (null if has_more is false).                      
+	NextCursor                                                     string                `json:"next_cursor"`
+	Webhooks                                                       []WebhookSubscription `json:"webhooks"`
+}
+
+type WebhookSubscription struct {
+	// Omitted when empty                                               
+	APIKeyID                                                 *string    `json:"apiKeyId,omitempty"`
+	ContractID                                               string     `json:"contractId"`
+	CreatedAt                                                time.Time  `json:"createdAt"`
+	ID                                                       string     `json:"id"`
+	Network                                                  string     `json:"network"`
+	// Present while deliveries are paused                              
+	PausedAt                                                 *time.Time `json:"pausedAt,omitempty"`
+	// HMAC signing secret for deliveries; omitted when empty           
+	Secret                                                   *string    `json:"secret,omitempty"`
+	TargetURL                                                string     `json:"targetUrl"`
+	// Topic filter; omitted when unfiltered                            
+	Topic0                                                   *string    `json:"topic0,omitempty"`
+}
+
 type LivenessResponse struct {
 	// Always "ok" while the process is up — no dependency checks.                       
 	Status                                                        LivenessResponseStatus `json:"status"`
@@ -374,6 +402,25 @@ type TokenMetadataResponse struct {
 	ResolvedAt                                                                                *time.Time `json:"resolved_at,omitempty"`
 	// Token symbol, from symbol(). Null unless is_token is true.                                        
 	Symbol                                                                                    *string    `json:"symbol,omitempty"`
+}
+
+type UsageResponse struct {
+	APIKeyID                                                                                    string           `json:"api_key_id"`
+	// Daily buckets from the maintained usage_rollup table, oldest first; empty when the window                 
+	// has no rollup rows.                                                                                       
+	Days                                                                                        []UsageRollupRow `json:"days"`
+	From                                                                                        time.Time        `json:"from"`
+	To                                                                                          time.Time        `json:"to"`
+	TotalErrors                                                                                 int64            `json:"total_errors"`
+	TotalRequests                                                                               int64            `json:"total_requests"`
+}
+
+type UsageRollupRow struct {
+	AvgDurationMS float64   `json:"avg_duration_ms"`
+	ErrorCount    int64     `json:"error_count"`
+	PeriodEnd     time.Time `json:"period_end"`
+	PeriodStart   time.Time `json:"period_start"`
+	RequestCount  int64     `json:"request_count"`
 }
 
 type VersionResponse struct {
@@ -447,28 +494,28 @@ type WebhookStatusResponse struct {
 	Status WebhookStatusResponseStatus `json:"status"`
 }
 
-type WebhookSubscription struct {
-	// Omitted when empty                                               
-	APIKeyID                                                 *string    `json:"apiKeyId,omitempty"`
-	ContractID                                               string     `json:"contractId"`
-	CreatedAt                                                time.Time  `json:"createdAt"`
-	ID                                                       string     `json:"id"`
-	Network                                                  string     `json:"network"`
-	// Present while deliveries are paused                              
-	PausedAt                                                 *time.Time `json:"pausedAt,omitempty"`
-	// HMAC signing secret for deliveries; omitted when empty           
-	Secret                                                   *string    `json:"secret,omitempty"`
-	TargetURL                                                string     `json:"targetUrl"`
-	// Topic filter; omitted when unfiltered                            
-	Topic0                                                   *string    `json:"topic0,omitempty"`
-}
-
 // Network queried
 type Network string
 
 const (
 	Mainnet Network = "mainnet"
 	Testnet Network = "testnet"
+)
+
+// Machine-readable error code. Matches httputil.ErrorCode exactly
+// (services/api/internal/httputil/errors.go).
+type Code string
+
+const (
+	Conflict        Code = "CONFLICT"
+	Forbidden       Code = "FORBIDDEN"
+	Internal        Code = "INTERNAL"
+	InvalidArgument Code = "INVALID_ARGUMENT"
+	NotFound        Code = "NOT_FOUND"
+	PayloadTooLarge Code = "PAYLOAD_TOO_LARGE"
+	RateLimited     Code = "RATE_LIMITED"
+	Unauthorized    Code = "UNAUTHORIZED"
+	Unavailable     Code = "UNAVAILABLE"
 )
 
 // Type of event

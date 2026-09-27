@@ -653,11 +653,27 @@ class ContractStorageResponse:
         return result
 
 
+class Code(Enum):
+    """Machine-readable error code. Matches httputil.ErrorCode exactly
+    (services/api/internal/httputil/errors.go).
+    """
+    CONFLICT = "CONFLICT"
+    FORBIDDEN = "FORBIDDEN"
+    INTERNAL = "INTERNAL"
+    INVALID_ARGUMENT = "INVALID_ARGUMENT"
+    NOT_FOUND = "NOT_FOUND"
+    PAYLOAD_TOO_LARGE = "PAYLOAD_TOO_LARGE"
+    RATE_LIMITED = "RATE_LIMITED"
+    UNAUTHORIZED = "UNAUTHORIZED"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
 @dataclass
 class Error:
-    code: str
-    """Error code (e.g., INVALID_ARGUMENT, INTERNAL, UNAVAILABLE, CONFLICT)"""
-
+    code: Code
+    """Machine-readable error code. Matches httputil.ErrorCode exactly
+    (services/api/internal/httputil/errors.go).
+    """
     message: str
     """Human-readable error message"""
 
@@ -667,14 +683,14 @@ class Error:
     @staticmethod
     def from_dict(obj: Any) -> 'Error':
         assert isinstance(obj, dict)
-        code = from_str(obj.get("code"))
+        code = Code(obj.get("code"))
         message = from_str(obj.get("message"))
         request_id = from_union([from_str, from_none], obj.get("request_id"))
         return Error(code, message, request_id)
 
     def to_dict(self) -> dict:
         result: dict = {}
-        result["code"] = from_str(self.code)
+        result["code"] = to_enum(Code, self.code)
         result["message"] = from_str(self.message)
         if self.request_id is not None:
             result["request_id"] = from_union([from_str, from_none], self.request_id)
@@ -917,6 +933,83 @@ class ListContractsResponse:
         return result
 
 
+@dataclass
+class WebhookSubscription:
+    contract_id: str
+    created_at: str
+    id: UUID
+    network: str
+    target_url: str
+    api_key_id: str | None = None
+    """Omitted when empty"""
+
+    paused_at: str | None = None
+    """Present while deliveries are paused"""
+
+    secret: str | None = None
+    """HMAC signing secret for deliveries; omitted when empty"""
+
+    topic0: str | None = None
+    """Topic filter; omitted when unfiltered"""
+
+    @staticmethod
+    def from_dict(obj: Any) -> 'WebhookSubscription':
+        assert isinstance(obj, dict)
+        contract_id = from_str(obj.get("contractId"))
+        created_at = from_str(obj.get("createdAt"))
+        id = UUID(obj.get("id"))
+        network = from_str(obj.get("network"))
+        target_url = from_str(obj.get("targetUrl"))
+        api_key_id = from_union([from_str, from_none], obj.get("apiKeyId"))
+        paused_at = from_union([from_str, from_none], obj.get("pausedAt"))
+        secret = from_union([from_str, from_none], obj.get("secret"))
+        topic0 = from_union([from_str, from_none], obj.get("topic0"))
+        return WebhookSubscription(contract_id, created_at, id, network, target_url, api_key_id, paused_at, secret, topic0)
+
+    def to_dict(self) -> dict:
+        result: dict = {}
+        result["contractId"] = from_str(self.contract_id)
+        result["createdAt"] = from_str(self.created_at)
+        result["id"] = str(self.id)
+        result["network"] = from_str(self.network)
+        result["targetUrl"] = from_str(self.target_url)
+        if self.api_key_id is not None:
+            result["apiKeyId"] = from_union([from_str, from_none], self.api_key_id)
+        if self.paused_at is not None:
+            result["pausedAt"] = from_union([from_str, from_none], self.paused_at)
+        if self.secret is not None:
+            result["secret"] = from_union([from_str, from_none], self.secret)
+        if self.topic0 is not None:
+            result["topic0"] = from_union([from_str, from_none], self.topic0)
+        return result
+
+
+@dataclass
+class ListWebhooksResponse:
+    has_more: bool
+    """Whether another page is available."""
+
+    next_cursor: str
+    """Opaque cursor for the next page (null if has_more is false)."""
+
+    webhooks: list[WebhookSubscription]
+
+    @staticmethod
+    def from_dict(obj: Any) -> 'ListWebhooksResponse':
+        assert isinstance(obj, dict)
+        has_more = from_bool(obj.get("has_more"))
+        next_cursor = from_str(obj.get("next_cursor"))
+        webhooks = from_list(WebhookSubscription.from_dict, obj.get("webhooks"))
+        return ListWebhooksResponse(has_more, next_cursor, webhooks)
+
+    def to_dict(self) -> dict:
+        result: dict = {}
+        result["has_more"] = from_bool(self.has_more)
+        result["next_cursor"] = from_str(self.next_cursor)
+        result["webhooks"] = from_list(lambda x: to_class(WebhookSubscription, x), self.webhooks)
+        return result
+
+
 class LivenessResponseStatus(Enum):
     """Always "ok" while the process is up — no dependency checks."""
 
@@ -1049,6 +1142,68 @@ class TokenMetadataResponse:
             result["resolved_at"] = from_union([from_str, from_none], self.resolved_at)
         if self.symbol is not None:
             result["symbol"] = from_union([from_str, from_none], self.symbol)
+        return result
+
+
+@dataclass
+class UsageRollupRow:
+    avg_duration_ms: float
+    error_count: int
+    period_end: str
+    period_start: str
+    request_count: int
+
+    @staticmethod
+    def from_dict(obj: Any) -> 'UsageRollupRow':
+        assert isinstance(obj, dict)
+        avg_duration_ms = from_float(obj.get("avg_duration_ms"))
+        error_count = from_int(obj.get("error_count"))
+        period_end = from_str(obj.get("period_end"))
+        period_start = from_str(obj.get("period_start"))
+        request_count = from_int(obj.get("request_count"))
+        return UsageRollupRow(avg_duration_ms, error_count, period_end, period_start, request_count)
+
+    def to_dict(self) -> dict:
+        result: dict = {}
+        result["avg_duration_ms"] = to_float(self.avg_duration_ms)
+        result["error_count"] = from_int(self.error_count)
+        result["period_end"] = from_str(self.period_end)
+        result["period_start"] = from_str(self.period_start)
+        result["request_count"] = from_int(self.request_count)
+        return result
+
+
+@dataclass
+class UsageResponse:
+    api_key_id: UUID
+    days: list[UsageRollupRow]
+    """Daily buckets from the maintained usage_rollup table, oldest first; empty when the window
+    has no rollup rows.
+    """
+    usage_response_from: str
+    to: str
+    total_errors: int
+    total_requests: int
+
+    @staticmethod
+    def from_dict(obj: Any) -> 'UsageResponse':
+        assert isinstance(obj, dict)
+        api_key_id = UUID(obj.get("api_key_id"))
+        days = from_list(UsageRollupRow.from_dict, obj.get("days"))
+        usage_response_from = from_str(obj.get("from"))
+        to = from_str(obj.get("to"))
+        total_errors = from_int(obj.get("total_errors"))
+        total_requests = from_int(obj.get("total_requests"))
+        return UsageResponse(api_key_id, days, usage_response_from, to, total_errors, total_requests)
+
+    def to_dict(self) -> dict:
+        result: dict = {}
+        result["api_key_id"] = str(self.api_key_id)
+        result["days"] = from_list(lambda x: to_class(UsageRollupRow, x), self.days)
+        result["from"] = from_str(self.usage_response_from)
+        result["to"] = from_str(self.to)
+        result["total_errors"] = from_int(self.total_errors)
+        result["total_requests"] = from_int(self.total_requests)
         return result
 
 
@@ -1282,57 +1437,6 @@ class WebhookStatusResponse:
 
 
 @dataclass
-class WebhookSubscription:
-    contract_id: str
-    created_at: str
-    id: UUID
-    network: str
-    target_url: str
-    api_key_id: str | None = None
-    """Omitted when empty"""
-
-    paused_at: str | None = None
-    """Present while deliveries are paused"""
-
-    secret: str | None = None
-    """HMAC signing secret for deliveries; omitted when empty"""
-
-    topic0: str | None = None
-    """Topic filter; omitted when unfiltered"""
-
-    @staticmethod
-    def from_dict(obj: Any) -> 'WebhookSubscription':
-        assert isinstance(obj, dict)
-        contract_id = from_str(obj.get("contractId"))
-        created_at = from_str(obj.get("createdAt"))
-        id = UUID(obj.get("id"))
-        network = from_str(obj.get("network"))
-        target_url = from_str(obj.get("targetUrl"))
-        api_key_id = from_union([from_str, from_none], obj.get("apiKeyId"))
-        paused_at = from_union([from_str, from_none], obj.get("pausedAt"))
-        secret = from_union([from_str, from_none], obj.get("secret"))
-        topic0 = from_union([from_str, from_none], obj.get("topic0"))
-        return WebhookSubscription(contract_id, created_at, id, network, target_url, api_key_id, paused_at, secret, topic0)
-
-    def to_dict(self) -> dict:
-        result: dict = {}
-        result["contractId"] = from_str(self.contract_id)
-        result["createdAt"] = from_str(self.created_at)
-        result["id"] = str(self.id)
-        result["network"] = from_str(self.network)
-        result["targetUrl"] = from_str(self.target_url)
-        if self.api_key_id is not None:
-            result["apiKeyId"] = from_union([from_str, from_none], self.api_key_id)
-        if self.paused_at is not None:
-            result["pausedAt"] = from_union([from_str, from_none], self.paused_at)
-        if self.secret is not None:
-            result["secret"] = from_union([from_str, from_none], self.secret)
-        if self.topic0 is not None:
-            result["topic0"] = from_union([from_str, from_none], self.topic0)
-        return result
-
-
-@dataclass
 class OpenAPIModels:
     admin_key_usage_response: AdminKeyUsageResponse | None = None
     api_key_response: APIKeyResponse | None = None
@@ -1356,11 +1460,14 @@ class OpenAPIModels:
     indexer_stats_response: IndexerStatsResponse | None = None
     list_api_keys_response: ListAPIKeysResponse | None = None
     list_contracts_response: ListContractsResponse | None = None
+    list_webhooks_response: ListWebhooksResponse | None = None
     liveness_response: LivenessResponse | None = None
     ready_checks: ReadyChecks | None = None
     ready_response: ReadyResponse | None = None
     soroban_event: SorobanEvent | None = None
     token_metadata_response: TokenMetadataResponse | None = None
+    usage_response: UsageResponse | None = None
+    usage_rollup_row: UsageRollupRow | None = None
     version_response: VersionResponse | None = None
     webhook_create_request: WebhookCreateRequest | None = None
     webhook_create_response: WebhookCreateResponse | None = None
@@ -1395,11 +1502,14 @@ class OpenAPIModels:
         indexer_stats_response = from_union([IndexerStatsResponse.from_dict, from_none], obj.get("IndexerStatsResponse"))
         list_api_keys_response = from_union([ListAPIKeysResponse.from_dict, from_none], obj.get("ListAPIKeysResponse"))
         list_contracts_response = from_union([ListContractsResponse.from_dict, from_none], obj.get("ListContractsResponse"))
+        list_webhooks_response = from_union([ListWebhooksResponse.from_dict, from_none], obj.get("ListWebhooksResponse"))
         liveness_response = from_union([LivenessResponse.from_dict, from_none], obj.get("LivenessResponse"))
         ready_checks = from_union([ReadyChecks.from_dict, from_none], obj.get("ReadyChecks"))
         ready_response = from_union([ReadyResponse.from_dict, from_none], obj.get("ReadyResponse"))
         soroban_event = from_union([SorobanEvent.from_dict, from_none], obj.get("SorobanEvent"))
         token_metadata_response = from_union([TokenMetadataResponse.from_dict, from_none], obj.get("TokenMetadataResponse"))
+        usage_response = from_union([UsageResponse.from_dict, from_none], obj.get("UsageResponse"))
+        usage_rollup_row = from_union([UsageRollupRow.from_dict, from_none], obj.get("UsageRollupRow"))
         version_response = from_union([VersionResponse.from_dict, from_none], obj.get("VersionResponse"))
         webhook_create_request = from_union([WebhookCreateRequest.from_dict, from_none], obj.get("WebhookCreateRequest"))
         webhook_create_response = from_union([WebhookCreateResponse.from_dict, from_none], obj.get("WebhookCreateResponse"))
@@ -1408,7 +1518,7 @@ class OpenAPIModels:
         webhook_rotate_secret_response = from_union([WebhookRotateSecretResponse.from_dict, from_none], obj.get("WebhookRotateSecretResponse"))
         webhook_status_response = from_union([WebhookStatusResponse.from_dict, from_none], obj.get("WebhookStatusResponse"))
         webhook_subscription = from_union([WebhookSubscription.from_dict, from_none], obj.get("WebhookSubscription"))
-        return OpenAPIModels(admin_key_usage_response, api_key_response, contract_call_request, contract_call_response, contract_event_field_schema, contract_event_schema, contract_event_schema_response, contract_registration_request, contract_response, contract_spec_function, contract_spec_response, contract_stats, contract_stats_response, contract_storage_history_response, contract_storage_response, contract_storage_value, endpoint_usage, error_response, event_list_response, indexer_stats_response, list_api_keys_response, list_contracts_response, liveness_response, ready_checks, ready_response, soroban_event, token_metadata_response, version_response, webhook_create_request, webhook_create_response, webhook_delivery, webhook_replay_response, webhook_rotate_secret_response, webhook_status_response, webhook_subscription)
+        return OpenAPIModels(admin_key_usage_response, api_key_response, contract_call_request, contract_call_response, contract_event_field_schema, contract_event_schema, contract_event_schema_response, contract_registration_request, contract_response, contract_spec_function, contract_spec_response, contract_stats, contract_stats_response, contract_storage_history_response, contract_storage_response, contract_storage_value, endpoint_usage, error_response, event_list_response, indexer_stats_response, list_api_keys_response, list_contracts_response, list_webhooks_response, liveness_response, ready_checks, ready_response, soroban_event, token_metadata_response, usage_response, usage_rollup_row, version_response, webhook_create_request, webhook_create_response, webhook_delivery, webhook_replay_response, webhook_rotate_secret_response, webhook_status_response, webhook_subscription)
 
     def to_dict(self) -> dict:
         result: dict = {}
@@ -1456,6 +1566,8 @@ class OpenAPIModels:
             result["ListAPIKeysResponse"] = from_union([lambda x: to_class(ListAPIKeysResponse, x), from_none], self.list_api_keys_response)
         if self.list_contracts_response is not None:
             result["ListContractsResponse"] = from_union([lambda x: to_class(ListContractsResponse, x), from_none], self.list_contracts_response)
+        if self.list_webhooks_response is not None:
+            result["ListWebhooksResponse"] = from_union([lambda x: to_class(ListWebhooksResponse, x), from_none], self.list_webhooks_response)
         if self.liveness_response is not None:
             result["LivenessResponse"] = from_union([lambda x: to_class(LivenessResponse, x), from_none], self.liveness_response)
         if self.ready_checks is not None:
@@ -1466,6 +1578,10 @@ class OpenAPIModels:
             result["SorobanEvent"] = from_union([lambda x: to_class(SorobanEvent, x), from_none], self.soroban_event)
         if self.token_metadata_response is not None:
             result["TokenMetadataResponse"] = from_union([lambda x: to_class(TokenMetadataResponse, x), from_none], self.token_metadata_response)
+        if self.usage_response is not None:
+            result["UsageResponse"] = from_union([lambda x: to_class(UsageResponse, x), from_none], self.usage_response)
+        if self.usage_rollup_row is not None:
+            result["UsageRollupRow"] = from_union([lambda x: to_class(UsageRollupRow, x), from_none], self.usage_rollup_row)
         if self.version_response is not None:
             result["VersionResponse"] = from_union([lambda x: to_class(VersionResponse, x), from_none], self.version_response)
         if self.webhook_create_request is not None:
