@@ -538,7 +538,11 @@ fn redact_url(url: &str) -> String {
 /// than only when a DB write later trips the CHECK constraint — surfaces a
 /// typo like `tesnet` at startup instead of after it has already been used
 /// to derive a passphrase, filter contracts, and tag every indexed row.
-fn normalize_network(network: &str) -> Result<String, String> {
+///
+/// `pub(crate)` so the `replay` CLI subcommand (`main::run_replay`) can
+/// validate/normalise the same `NETWORK` env var the daemon does, rather than
+/// duplicating the allowed-values list (issue #595).
+pub(crate) fn normalize_network(network: &str) -> Result<String, String> {
     match network {
         "mainnet" | "pubnet" => Ok("mainnet".to_string()),
         "testnet" => Ok("testnet".to_string()),
