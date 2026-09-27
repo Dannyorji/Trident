@@ -1,0 +1,116 @@
+Cursor pagination partition targeting: EXPLAIN evidence for issue #603
+================================================================================
+
+Environment
+-----------
+PostgreSQL 15.15 (Homebrew, local scratch instance), default configuration.
+Schema built from the full database/migrations/ chain (0001..0033).
+
+Seed: 25 soroban_events rows, contract_id 'CTEST', network 'mainnet',
+ledger_sequence spread across all five mainnet-range partitions created by
+migration 0017 (soroban_events_p50000000_51999999 through
+soroban_events_p58000000_59999999, 5 rows each). This mirrors the real
+partition layout: 0017 pre-creates named ranges plus a DEFAULT catch-all, and
+rows accumulate across many of them as the indexer's ledger cursor advances.
+
+Query measured (before this fix)
+---------------------------------
+crates/api/src/services/events.rs, list_events cursor resolution, before #603:
+
+    SELECT ledger_sequence, event_index FROM soroban_events WHERE id = $1
+
+Plan (id taken from a row in the last-seeded partition):
+
+    Append (actual time=0.044..0.046 rows=1 loops=1)
+      Buffers: shared hit=14
+      ->  Index Scan using soroban_events_p0_1999999_id_idx ...           rows=0
+      ->  Index Scan using soroban_events_p2000000_3999999_id_idx ...     rows=0
+      ->  Index Scan using soroban_events_p4000000_5999999_id_idx ...     rows=0
+      ->  Index Scan using soroban_events_p50000000_51999999_id_idx ...   rows=0
+      ->  Index Scan using soroban_events_p52000000_53999999_id_idx ...   rows=0
+      ->  Index Scan using soroban_events_p54000000_55999999_id_idx ...   rows=0
+      ->  Index Scan using soroban_events_p56000000_57999999_id_idx ...   rows=0
+      ->  Index Scan using soroban_events_p58000000_59999999_id_idx ...   rows=1  <- the actual match
+      ->  Index Scan using soroban_events_default_id_idx ...              rows=0
+    Planning: Buffers: shared hit=1630
+    Planning Time: 4.369 ms
+    Execution Time: 0.077 ms
+
+This is the issue's core complaint made concrete: every one of the 9
+partitions is probed via idx_soroban_events_id_desc / each partition's own
+id index, because `id` alone is not a prefix of the partitioned primary key
+(ledger_sequence, id) and Postgres cannot know which partition an arbitrary
+id belongs to without checking. The cost here (9 tiny partitions, sub-ms) is
+invisible at this scale — the issue's point is that it scales with partition
+count, and mainnet accumulates a new partition roughly every 115 days
+(2,000,000 ledgers at ~17,280 ledgers/day) forever.
+
+Query measured (after this fix)
+---------------------------------
+The fix removes this query entirely. decode_events_cursor (events.rs) parses
+the cursor's encoded "<ledger_sequence>_<event_index>" payload with no
+database access at all — there is no EXPLAIN for a function call. What
+replaces the round trip is the same range-scoped SELECT list_events already
+issued for every page (WHERE ... AND (ledger_sequence, event_index) > ($7,
+$8) ORDER BY ledger_sequence ASC, event_index ASC LIMIT $9), now fed
+$7/$8 directly from the decoded cursor instead of from a prior lookup's
+result.
+
+To show what knowing ledger_sequence up front actually buys, when it is
+combined with the id in a single predicate (the shape a targeted point
+lookup would take, if one were still needed for some other purpose):
+
+    EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+    SELECT ledger_sequence, event_index FROM soroban_events
+    WHERE ledger_sequence = 59600000 AND id = '<uuid>';
+
+    Index Scan using soroban_events_p58000000_59999999_id_idx
+        on soroban_events_p58000000_59999999 soroban_events
+        (actual time=0.006..0.006 rows=1 loops=1)
+      Index Cond: (id = '<uuid>'::uuid)
+      Filter: (ledger_sequence = 59600000)
+      Buffers: shared hit=2
+    Planning: Buffers: shared hit=317
+    Planning Time: 0.774 ms
+    Execution Time: 0.019 ms
+
+A single Index Scan against exactly one partition
+(soroban_events_p58000000_59999999), not an Append over all 9 — this is the
+partition-pruning effect issue #603 describes gaining access to once
+ledger_sequence is known. Buffers touched drops from 14 (Append case, one
+buffer read per partition) to 2, and planning-time buffer traffic drops
+from 1630 to 317, because the planner only has to consider indexes on the
+one partition Postgres's constraint exclusion can prove is the only
+possible match for ledger_sequence = 59600000.
+
+Note on the main paginated query's own plan
+--------------------------------------------
+The main list_events SELECT (the `(ledger_sequence, event_index) > ($7, $8)
+ORDER BY ... LIMIT $9` query, not the removed lookup) still plans as a
+Merge Append across every partition at or above the cursor position, both
+before and after this fix — this is expected, not a regression: it is an
+open-ended forward range scan ("everything after this point"), which can
+legitimately span multiple partitions, unlike an equality lookup which can
+only ever match one. Postgres does not prune partitions for a `>` bound the
+way it does for `=`, since it cannot rule out matches in any partition whose
+range extends above the bound. This query's cost is governed by `LIMIT`
+(via the Merge Append's incremental sort short-circuiting once enough rows
+are found), which is unaffected by this change: it never held the id-based
+lookup issue #603 is about in the first place.
+
+How to reproduce
+-----------------
+    createdb trident_explain_603
+    for f in database/migrations/*.sql; do
+      case "$f" in *.down.sql) continue;; esac
+      psql -d trident_explain_603 -v ON_ERROR_STOP=1 -f "$f"
+    done
+    psql -d trident_explain_603 -c "
+      INSERT INTO soroban_events
+          (contract_id, network, ledger_sequence, ledger_timestamp,
+           transaction_hash, event_index, event_type, topics, data)
+      SELECT 'CTEST', 'mainnet', 50000000 + (n * 400000), NOW(),
+             'txhash_' || n, 0, 'contract', '[\"transfer\"]', '{}'
+      FROM generate_series(0, 24) AS n;"
+    -- then run the two EXPLAIN queries above against a real id/ledger_sequence
+    -- pair from the seeded rows.
