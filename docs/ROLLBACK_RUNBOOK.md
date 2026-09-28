@@ -1,11 +1,38 @@
 # Rollback runbook
 
-**Status: template — not yet rehearsed.** Issue #460 asks for this
-procedure to be executed end-to-end on staging, with wall-clock time
-measured, before launch. That rehearsal needs actual staging access and
-hasn't been performed in this pass. What follows is the documented
-procedure and — critically — a real finding about migration
-reversibility that should inform the rehearsal.
+**Status: automated, not yet rehearsed end-to-end on staging.** Issue #460
+asks for this procedure to be executed end-to-end on staging, with
+wall-clock time measured, before launch. That rehearsal needs actual
+staging access and still hasn't been performed, since this repo does not
+have a live staging environment as of this pass (see issue #623). What
+follows is the documented procedure, the automation now wired around it
+(issue #621), and a real finding about migration reversibility that should
+inform the eventual rehearsal.
+
+## What is now automated (issue #621)
+
+`.github/workflows/staging-deploy.yml` now runs a `rollback-staging` job
+automatically whenever `deploy-staging` or `smoke-test-staging` fails. It
+runs `helm rollback trident-staging 0` (roll back to the immediately
+previous revision) in the staging namespace, then waits for the three app
+deployments to report ready. If there is no previous revision to roll back
+to (a release's first-ever install), it logs a warning and stops rather
+than performing a no-op rollback that would mask the failure.
+
+This closes the "no automated rollback exists" half of issue #621. It does
+**not** by itself satisfy the "rehearsed" half: the job has never actually
+run, because it only triggers on a real deploy/smoke-test failure against a
+real staging cluster, and no staging cluster is configured yet. The measured
+wall-clock time below is still a placeholder, not a real observation, until
+someone deliberately breaks a staging deploy (or runs the steps by hand)
+after staging exists and records what actually happened.
+
+Automatic rollback also only covers the "schema change is backward
+compatible" path described below: rolling back the Helm release to its
+previous image tags and values. It has no opinion on whether the schema
+left behind by the failed release is safe for the older app version. That
+judgment, and any migration-boundary rollback, is still manual per the
+sections below.
 
 ## Finding: migrations here are forward-only
 

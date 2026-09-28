@@ -318,24 +318,101 @@ jobs:
           echo "::notice::✓ All smoke tests passed - staging deployment is healthy"
 
   # ---------------------------------------------------------------------------
+  # Automatic rollback on a failed staging deploy or smoke test (issue #621).
+  #
+  # Previously the only reaction to a failed deploy/smoke test was
+  # alert-on-failure posting a webhook, leaving the release in a failed or
+  # unhealthy state until someone manually ran the documented procedure in
+  # docs/ROLLBACK_RUNBOOK.md. This wires that same `helm rollback` procedure
+  # into the workflow so it runs automatically instead of waiting on a human
+  # to notice the alert and act on it.
+  #
+  # This only rolls back the Helm release (previous known-good image tags and
+  # chart values) to the prior revision. Per docs/ROLLBACK_RUNBOOK.md, this is
+  # the "migration is backward-compatible" path: it is safe when the schema
+  # change (if any) in the failed release is additive, and it is NOT a
+  # substitute for a reviewed reverse migration script when it isn't. That
+  # judgment still needs a human; this job does not attempt it.
+  #
+  # Gated on configured == 'true' the same way deploy-staging is, so this
+  # never runs against a cluster we were never able to reach in the first
+  # place (e.g. check-staging-config itself failing).
+  # ---------------------------------------------------------------------------
+  rollback-staging:
+    name: Roll back staging deploy
+    runs-on: ubuntu-latest
+    needs: [check-staging-config, deploy-staging, smoke-test-staging]
+    if: failure() && needs.check-staging-config.outputs.configured == 'true'
+    environment: staging
+    steps:
+      - name: Set up Helm
+        uses: azure/setup-helm@fe7b79cd5ee1e45176fcad797de68ecaf3ca4814 # v4.2.0
+        with:
+          version: "3.14.0"
+
+      - name: Configure kubeconfig
+        env:
+          STAGING_KUBECONFIG: ${{ secrets.STAGING_KUBECONFIG }}
+        run: |
+          mkdir -p "$HOME/.kube"
+          printf '%s' "$STAGING_KUBECONFIG" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Roll back to previous release
+        id: rollback
+        run: |
+          namespace="${{ vars.STAGING_NAMESPACE || 'trident-staging' }}"
+
+          # Nothing to roll back to on a release's first-ever install: helm
+          # history has only one revision, and "rolling back" to it is a
+          # no-op that would still report success and mask the real failure.
+          revision_count=$(helm history trident-staging -n "$namespace" -o json | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')
+          if [ "$revision_count" -lt 2 ]; then
+            echo "::warning::Only $revision_count Helm revision(s) exist for trident-staging; nothing to roll back to. Manual intervention required, see docs/ROLLBACK_RUNBOOK.md."
+            echo "rolled_back=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          start_time=$(date +%s)
+          helm rollback trident-staging 0 -n "$namespace" --wait --timeout 5m
+          end_time=$(date +%s)
+          echo "rolled_back=true" >> "$GITHUB_OUTPUT"
+          echo "duration_seconds=$((end_time - start_time))" >> "$GITHUB_OUTPUT"
+          echo "Automatic rollback completed in $((end_time - start_time))s" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify rolled-back deployment is serving
+        if: steps.rollback.outputs.rolled_back == 'true'
+        run: |
+          namespace="${{ vars.STAGING_NAMESPACE || 'trident-staging' }}"
+          kubectl rollout status deployment/go-api -n "$namespace" --timeout=120s
+          kubectl rollout status deployment/grpc-api -n "$namespace" --timeout=120s
+          kubectl rollout status deployment/indexer -n "$namespace" --timeout=120s
+
+  # ---------------------------------------------------------------------------
   # Alert on a failed staging deploy/smoke test. Reuses ALERT_WEBHOOK_URL
   # (already read by the indexer for lag alerts) as a generic ops webhook.
   # ---------------------------------------------------------------------------
   alert-on-failure:
     name: Alert on staging failure
     runs-on: ubuntu-latest
-    needs: [deploy-staging, smoke-test-staging]
+    needs: [deploy-staging, smoke-test-staging, rollback-staging]
     if: failure()
     steps:
       - name: POST failure notification
         env:
           STAGING_ALERT_WEBHOOK_URL: ${{ secrets.STAGING_ALERT_WEBHOOK_URL }}
+          ROLLED_BACK: ${{ needs.rollback-staging.result == 'success' }}
         run: |
           if [ -z "$STAGING_ALERT_WEBHOOK_URL" ]; then
             echo "STAGING_ALERT_WEBHOOK_URL is not configured; skipping notification"
             exit 0
           fi
+          if [ "$ROLLED_BACK" = "true" ]; then
+            text="Trident staging deploy/smoke test failed for ${{ github.sha }}; automatic rollback ran, promotion to main blocked."
+          else
+            text="Trident staging deploy/smoke test failed for ${{ github.sha }}, promotion to main blocked."
+          fi
           curl --silent --fail --max-time 10 -X POST \
             -H "Content-Type: application/json" \
-            -d "{\"text\":\"Trident staging deploy/smoke test failed for ${{ github.sha }} — promotion to main blocked.\"}" \
+            -d "{\"text\":\"$text\"}" \
             "$STAGING_ALERT_WEBHOOK_URL"
