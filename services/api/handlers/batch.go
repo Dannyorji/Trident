@@ -9,7 +9,6 @@ import (
 	"sync"
 
 	"github.com/Depo-dev/trident/services/api/gen"
-	"github.com/Depo-dev/trident/services/api/grpcclient"
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
 	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/Depo-dev/trident/services/api/validation"
@@ -115,9 +114,7 @@ func BatchGetEvents(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
 		go func(i int, id string) {
 			defer wg.Done()
-			event, err := grpcclient.CallWithRetry(ctx, 1, func(ctx context.Context) (*gen.Event, error) {
-				return eventsClient.GetEvent(ctx, &gen.GetEventRequest{Id: id, Network: network})
-			})
+			event, err := eventsClient.GetEvent(ctx, &gen.GetEventRequest{Id: id, Network: network})
 			if err != nil {
 				results[i] = result{id: id, found: false}
 				return
