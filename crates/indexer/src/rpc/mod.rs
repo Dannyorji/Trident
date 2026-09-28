@@ -437,6 +437,8 @@ impl RpcClient {
         let error_str = error.to_string();
         if error_str.contains("timed out") {
             self.record_timeout(url);
+        } else if error_str.contains("rate limited") {
+            self.record_rate_limited(url);
         } else if error_str.contains("HTTP 4") || error_str.contains("HTTP 5") {
             self.record_non_200(url);
         } else if error_str.contains("RPC error") {
@@ -449,6 +451,11 @@ impl RpcClient {
     /// Record a connection refused error from the given endpoint.
     fn record_connection_refused(&self, url: &str) {
         self.scorer.record_connection_refused(url);
+    }
+
+    /// Record a rate-limit (HTTP 429) response from the given endpoint.
+    fn record_rate_limited(&self, url: &str) {
+        self.scorer.record_rate_limited(url);
     }
 
     async fn execute<P, R>(
@@ -474,8 +481,13 @@ impl RpcClient {
         if !resp.status().is_success() {
             let status = resp.status();
             metrics::record_rpc_error(context, classify_http_status(status));
+            let kind = if status.as_u16() == 429 {
+                "rate limited"
+            } else {
+                "non-200"
+            };
             return Err(TridentError::rpc(anyhow::anyhow!(
-                "{context}: endpoint {url} returned HTTP {}",
+                "{context}: endpoint {url} returned HTTP {} ({kind})",
                 status
             )));
         }
@@ -851,6 +863,36 @@ mod tests {
 
         assert!(err.to_string().contains("429"), "got: {err}");
         assert_eq!(err.severity(), Severity::Retryable);
+    }
+
+    /// A 429 must be scored as a rate limit (-5), not a generic non-200
+    /// (-15), and a lone 429 must not be enough to trigger failover to a
+    /// backup that could just as easily be rate-limited itself (issue #656).
+    #[tokio::test]
+    async fn rate_limit_response_scores_less_severely_than_a_hard_failure() {
+        let primary = MockServer::start().await;
+        let secondary = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&primary)
+            .await;
+        mount_healthy(&secondary).await;
+
+        let client = RpcClient::with_endpoints(
+            vec![primary.uri(), secondary.uri()],
+            &fast_timeout_settings(),
+        )
+        .unwrap();
+
+        assert!(client.get_events(Some(1), None, 10, &[]).await.is_err());
+
+        assert_eq!(client.health_scorer().get_score(&primary.uri()), 95);
+        assert_eq!(
+            client.health_scorer().select_best_endpoint(),
+            primary.uri(),
+            "a single 429 must not fail over to a backup that could be rate-limited too"
+        );
     }
 
     /// Requests are served by the primary while it is healthy.
