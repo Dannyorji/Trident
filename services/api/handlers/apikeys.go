@@ -508,17 +508,22 @@ func NewAPIKeyUsageTracker(db *pgxpool.Pool, flushInterval time.Duration) (track
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
+			ids := make([]string, 0, len(pending))
+			counts := make([]int64, 0, len(pending))
 			for id, count := range pending {
-				if _, err := db.Exec(ctx,
-					`UPDATE api_keys
-					 SET request_count = request_count + $1,
-					     last_used_at  = NOW()
-					 WHERE id = $2`,
-					count, id,
-				); err != nil {
-					// Log but don't crash — usage tracking is non-critical.
-					_ = err
-				}
+				ids = append(ids, id)
+				counts = append(counts, count)
+			}
+			if _, err := db.Exec(ctx,
+				`UPDATE api_keys AS k
+				 SET request_count = k.request_count + u.count,
+				     last_used_at  = NOW()
+				 FROM (SELECT unnest($1::uuid[]) AS id, unnest($2::bigint[]) AS count) AS u
+				 WHERE k.id = u.id`,
+				ids, counts,
+			); err != nil {
+				// Log but don't crash — usage tracking is non-critical.
+				_ = err
 			}
 			pending = map[string]int64{}
 		}

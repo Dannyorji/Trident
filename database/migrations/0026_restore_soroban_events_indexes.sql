@@ -39,6 +39,15 @@
 -- the legacy table that held them was dropped in the same transaction 0017
 -- ran in, so in every environment where 0017 applied successfully, these
 -- names are guaranteed free.
+--
+-- lint:allow-long-lock  sqlx wraps each migration in a transaction, and
+--   CREATE INDEX CONCURRENTLY cannot run inside a transaction block (#642,
+--   same constraint documented in 0009/0029). soroban_events is the
+--   highest-volume, partitioned table, so these six non-concurrent builds do
+--   take a write-blocking lock across every partition for their duration;
+--   run this migration in a maintenance window, or build the indexes by hand
+--   with CONCURRENTLY outside the migration chain first, in which case the
+--   IF NOT EXISTS guards below make this migration a no-op.
 
 CREATE INDEX IF NOT EXISTS idx_soroban_events_network
     ON soroban_events (network);

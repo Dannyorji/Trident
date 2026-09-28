@@ -54,6 +54,8 @@ pub struct Config {
     pub rpc_pool_max_idle_per_host: usize,
     /// TCP keep-alive probe interval for pooled RPC sockets (issue #214).
     pub rpc_tcp_keepalive: Duration,
+    /// Self-imposed maximum outbound RPC calls per second (issue #661).
+    pub rpc_max_calls_per_sec: u32,
     /// How often the outbox relay scans for unpublished events (issue #200).
     pub outbox_poll_interval: Duration,
     /// Maximum events published per relay pass (issue #200).
@@ -218,6 +220,12 @@ impl Config {
             parse_bounded_u64("RPC_POOL_MAX_IDLE_PER_HOST", 8, 1, 1_024);
         let rpc_tcp_keepalive_ms =
             parse_bounded_u64("RPC_TCP_KEEPALIVE_MS", 60_000, 1_000, 600_000);
+        // Self-imposed outbound rate limit (issue #661), tunable independently
+        // of POLL_INTERVAL_MS: without it a catch-up cycle can burst hundreds
+        // of getEvents pages, or one getTransaction/getLedgerEntries call per
+        // transaction/contract touched in a page, back-to-back with zero
+        // delay, since poll_interval only sleeps between cycles.
+        let rpc_max_calls_per_sec = parse_bounded_u64("RPC_MAX_CALLS_PER_SEC", 50, 1, 10_000);
         let rpc_failover_threshold = parse_bounded_u64("RPC_FAILOVER_THRESHOLD", 3, 1, 100);
         let rpc_endpoint_cooldown_ms =
             parse_bounded_u64("RPC_ENDPOINT_COOLDOWN_MS", 30_000, 1_000, 3_600_000);
@@ -288,6 +296,7 @@ impl Config {
                 rpc_pool_max_idle_per_host.as_ref(),
             ),
             ("RPC_TCP_KEEPALIVE_MS", rpc_tcp_keepalive_ms.as_ref()),
+            ("RPC_MAX_CALLS_PER_SEC", rpc_max_calls_per_sec.as_ref()),
             ("RPC_FAILOVER_THRESHOLD", rpc_failover_threshold.as_ref()),
             (
                 "RPC_ENDPOINT_COOLDOWN_MS",
@@ -400,6 +409,7 @@ impl Config {
         let rpc_pool_idle_timeout_ms = rpc_pool_idle_timeout_ms.unwrap();
         let rpc_pool_max_idle_per_host = rpc_pool_max_idle_per_host.unwrap() as usize;
         let rpc_tcp_keepalive_ms = rpc_tcp_keepalive_ms.unwrap();
+        let rpc_max_calls_per_sec = rpc_max_calls_per_sec.unwrap() as u32;
         let rpc_failover_threshold = rpc_failover_threshold.unwrap() as u32;
         let rpc_endpoint_cooldown_ms = rpc_endpoint_cooldown_ms.unwrap();
         let rpc_breaker_failure_threshold = rpc_breaker_failure_threshold.unwrap() as u32;
@@ -440,6 +450,7 @@ impl Config {
             rpc_pool_idle_timeout: Duration::from_millis(rpc_pool_idle_timeout_ms),
             rpc_pool_max_idle_per_host,
             rpc_tcp_keepalive: Duration::from_millis(rpc_tcp_keepalive_ms),
+            rpc_max_calls_per_sec,
             outbox_poll_interval: Duration::from_millis(outbox_poll_interval_ms),
             outbox_batch_size,
             outbox_backlog_alert_threshold,
@@ -503,6 +514,7 @@ impl Config {
             idle_in_transaction_timeout_ms = self.idle_in_transaction_timeout_ms,
             rpc_breaker_failure_threshold = self.rpc_breaker_failure_threshold,
             rpc_breaker_cooldown_ms = self.rpc_breaker_cooldown.as_millis() as u64,
+            rpc_max_calls_per_sec = self.rpc_max_calls_per_sec,
             "Effective configuration"
         );
     }

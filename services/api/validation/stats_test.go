@@ -1,6 +1,7 @@
 package validation
 
 import (
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -92,4 +93,37 @@ func TestValidateQueryStats_LimitBoundary_Max(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	assert.Equal(t, int64(100), params.Limit)
+}
+
+func TestValidateQueryStats_OneSidedRange_FromOnly_Rejected(t *testing.T) {
+	_, err := ValidateQueryStats("1000", "", "")
+	if assert.Error(t, err) {
+		assert.Equal(t, "from_ledger", err.Field)
+	}
+}
+
+func TestValidateQueryStats_OneSidedRange_ToOnly_Rejected(t *testing.T) {
+	_, err := ValidateQueryStats("", "5000", "")
+	if assert.Error(t, err) {
+		assert.Equal(t, "from_ledger", err.Field)
+	}
+}
+
+func TestValidateQueryStats_RangeAtCap_Accepted(t *testing.T) {
+	from := int64(1000)
+	to := from + StatsMaxLedgerRange
+	params, err := ValidateQueryStats("1000", strconv.FormatInt(to, 10), "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assert.Equal(t, to, params.ToLedger)
+}
+
+func TestValidateQueryStats_RangeOverCap_Rejected(t *testing.T) {
+	from := int64(1000)
+	to := from + StatsMaxLedgerRange + 1
+	_, err := ValidateQueryStats("1000", strconv.FormatInt(to, 10), "")
+	if assert.Error(t, err) {
+		assert.Equal(t, "to_ledger", err.Field)
+	}
 }

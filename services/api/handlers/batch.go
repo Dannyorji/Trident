@@ -16,6 +16,19 @@ import (
 
 const batchEventsMaxIDs = 100
 
+// batchPerRequestConcurrency bounds how many gRPC GetEvent calls a single
+// BatchGetEvents request runs at once. Without it, one request already fans
+// out up to batchEventsMaxIDs unbounded goroutines/gRPC calls (issue #646);
+// this matches the concurrency the webhook delivery path already bounds
+// itself to (globalDeliverySem in webhooks.go, issue #454).
+const batchPerRequestConcurrency = 20
+
+// batchGlobalSem bounds total concurrent gRPC calls across every in-flight
+// BatchGetEvents request in the process, so many concurrent batch requests
+// each fanning out batchPerRequestConcurrency calls still can't collectively
+// spike gRPC connection/stream pressure without limit (issue #646).
+var batchGlobalSem = make(chan struct{}, 100)
+
 type batchRequest struct {
 	IDs []string `json:"ids"`
 }
@@ -109,12 +122,20 @@ func BatchGetEvents(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	results := make([]result, len(ids))
+	localSem := make(chan struct{}, batchPerRequestConcurrency)
 	var wg sync.WaitGroup
 	for i, id := range ids {
 		wg.Add(1)
+		localSem <- struct{}{}
+		batchGlobalSem <- struct{}{}
 		go func(i int, id string) {
 			defer wg.Done()
 			event, err := eventsClient.GetEvent(ctx, &gen.GetEventRequest{Id: id, Network: network})
+			defer func() { <-localSem }()
+			defer func() { <-batchGlobalSem }()
+			event, err := grpcclient.CallWithRetry(ctx, 1, func(ctx context.Context) (*gen.Event, error) {
+				return eventsClient.GetEvent(ctx, &gen.GetEventRequest{Id: id, Network: network})
+			})
 			if err != nil {
 				results[i] = result{id: id, found: false}
 				return

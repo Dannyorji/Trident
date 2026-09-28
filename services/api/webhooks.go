@@ -27,7 +27,9 @@ import (
 	"github.com/Depo-dev/trident/services/api/internal/metrics"
 	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/Depo-dev/trident/services/api/validation"
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -172,15 +174,61 @@ func verifyWebhookSignature(timestamp int64, body string, signature string, secr
 	return matched
 }
 
+// Default webhook pool size relative to the main pgxpool (defaultDBPoolSize
+// in main.go): the webhook pool serves CRUD, delivery recording, and the
+// worker rather than request-path reads, so it is sized smaller than the
+// primary pool rather than left unbounded (issue #644).
+const defaultWebhookDBPoolSize = 3
+const defaultWebhookDBPoolMaxIdleConns = 1
+const defaultWebhookDBPoolMaxConnLifetimeMS = 1_800_000 // 30 min, matches GO_API_DB_POOL_MAX_CONN_LIFETIME_MS default
+
 func newDB() (*sql.DB, error) {
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
 		return nil, errors.New("DATABASE_URL is not set")
 	}
-	db, err := sql.Open("pgx", dsn)
+
+	connConfig, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse DATABASE_URL: %w", err)
+	}
+
+	// Match the main pgxpool's statement_timeout/idle_in_transaction_session_timeout
+	// discipline (issue #238) so a stuck webhook query can't hold a connection
+	// indefinitely (issue #644). database/sql has no pool-level AfterConnect
+	// hook, but stdlib.RegisterConnConfig lets a driver name carry a
+	// pgx.ConnConfig with one, run once per new physical connection.
+	stmtTimeoutMS := envIntBounded("DB_STATEMENT_TIMEOUT_MS", defaultStatementTimeoutMS, statementTimeoutMinMS, statementTimeoutMaxMS)
+	idleTimeoutMS := envIntBounded("DB_IDLE_IN_TRANSACTION_TIMEOUT_MS", defaultIdleInTransactionTimeoutMS, statementTimeoutMinMS, statementTimeoutMaxMS)
+	connConfig.AfterConnect = func(ctx context.Context, conn *pgconn.PgConn) error {
+		if _, err := conn.Exec(ctx, fmt.Sprintf("SET statement_timeout = '%dms'", stmtTimeoutMS)).ReadAll(); err != nil {
+			return fmt.Errorf("set statement_timeout: %w", err)
+		}
+		if _, err := conn.Exec(ctx, fmt.Sprintf("SET idle_in_transaction_session_timeout = '%dms'", idleTimeoutMS)).ReadAll(); err != nil {
+			return fmt.Errorf("set idle_in_transaction_session_timeout: %w", err)
+		}
+		return nil
+	}
+
+	driverName := stdlib.RegisterConnConfig(connConfig)
+	db, err := sql.Open(driverName, "")
 	if err != nil {
 		return nil, err
 	}
+
+	// database/sql defaults to unlimited open connections and no idle/lifetime
+	// bound. Unlike main.go's pgxpool, this pool had never had explicit
+	// limits, so it could grow without bound under load and starve Postgres
+	// max_connections independently of the main pool's tuning (issue #644).
+	// Sized smaller than the main pool by default: this pool serves CRUD,
+	// delivery recording, and the worker, not request-path reads.
+	maxOpen := int(envInt32("WEBHOOK_DB_POOL_MAX_OPEN_CONNS", defaultWebhookDBPoolSize))
+	maxIdle := int(envInt32("WEBHOOK_DB_POOL_MAX_IDLE_CONNS", defaultWebhookDBPoolMaxIdleConns))
+	maxLifetime := envDurationMS("WEBHOOK_DB_POOL_MAX_CONN_LIFETIME_MS", defaultWebhookDBPoolMaxConnLifetimeMS)
+	db.SetMaxOpenConns(maxOpen)
+	db.SetMaxIdleConns(maxIdle)
+	db.SetConnMaxLifetime(maxLifetime)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
@@ -260,7 +308,7 @@ func startWebhookWorker(ctx context.Context, db *sql.DB, redisClient *redis.Clie
 						}
 						continue
 					}
-					if err := processWebhookEvent(ctx, db, event); err != nil {
+					if err := processWebhookEvent(ctx, db, redisClient, event); err != nil {
 						slog.Error("webhook delivery failed", "err", err)
 					}
 					if _, err := redisClient.XAck(ctx, streamKey, groupName, message.ID).Result(); err != nil {
@@ -353,7 +401,7 @@ func parseWebhookEvent(raw any) (webhookEvent, error) {
 	}
 }
 
-func processWebhookEvent(ctx context.Context, db *sql.DB, event webhookEvent) error {
+func processWebhookEvent(ctx context.Context, db *sql.DB, redisClient *redis.Client, event webhookEvent) error {
 	if db == nil {
 		return nil
 	}
@@ -400,7 +448,7 @@ func processWebhookEvent(ctx context.Context, db *sql.DB, event webhookEvent) er
 	// subscriber matching the same event.
 	var wg sync.WaitGroup
 	for _, sub := range subs {
-		if !tryAcquireSubscriptionSlot(sub.ID) {
+		if !tryAcquireSubscriptionSlot(ctx, redisClient, sub.ID) {
 			slog.Warn("skipping delivery: previous delivery for this subscription still in flight", "subscription_id", sub.ID)
 			metrics.WebhookDeliveriesTotal.WithLabelValues("skipped_in_flight").Inc()
 			continue
@@ -410,7 +458,7 @@ func processWebhookEvent(ctx context.Context, db *sql.DB, event webhookEvent) er
 		go func(sub webhookSubscription) {
 			defer wg.Done()
 			defer func() { <-globalDeliverySem }()
-			defer releaseSubscriptionSlot(sub.ID)
+			defer releaseSubscriptionSlot(context.Background(), redisClient, sub.ID)
 			// Counted around the delivery itself so the gauge reflects work
 			// actually in flight, not queue admission.
 			metrics.WebhookDeliveriesInFlight.Inc()
@@ -1220,18 +1268,49 @@ func replayDeadLetterHandler(db *sql.DB) http.HandlerFunc {
 			return
 		}
 
-		// Load the dead-lettered delivery.
+		// Load the dead-lettered delivery under a row lock (#648): FOR UPDATE
+		// blocks a concurrent replay of the same delivery until this
+		// transaction commits, so two concurrent requests can't both read the
+		// same prevAttempts and both proceed to deliver + insert. Bumping
+		// attempts here, inside the lock, is what makes the second waiter
+		// see the updated count once it acquires the row.
+		tx, err := db.BeginTx(r.Context(), nil)
+		if err != nil {
+			slog.Error("webhook handler error", "err", err)
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "internal error")
+			return
+		}
+		defer func() { _ = tx.Rollback() }()
+
 		var eventID string
 		var prevAttempts int
-		err = db.QueryRowContext(r.Context(), `
+		err = tx.QueryRowContext(r.Context(), `
 			SELECT event_id, attempts FROM webhook_deliveries
 			WHERE id = $1 AND subscription_id = $2 AND status = 'dead_lettered'
+			FOR UPDATE
 		`, deliveryIDStr, subID).Scan(&eventID, &prevAttempts)
 		if errors.Is(err, sql.ErrNoRows) {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusNotFound, httputil.NOT_FOUND, "dead-lettered delivery not found")
 			return
 		}
 		if err != nil {
+			slog.Error("webhook handler error", "err", err)
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "internal error")
+			return
+		}
+		replayAttempt := prevAttempts + 1
+		// Claim this attempt number and flip status away from dead_lettered
+		// so a concurrent replay that was blocked on the row lock, once it
+		// proceeds, sees status = 'failed' and 404s (not dead_lettered) —
+		// only one caller ever gets to deliver for this dead-lettered row.
+		if _, err := tx.ExecContext(r.Context(), `
+			UPDATE webhook_deliveries SET attempts = $2, status = 'failed' WHERE id = $1
+		`, deliveryIDStr, replayAttempt); err != nil {
+			slog.Error("webhook handler error", "err", err)
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "internal error")
+			return
+		}
+		if err := tx.Commit(); err != nil {
 			slog.Error("webhook handler error", "err", err)
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "internal error")
 			return
@@ -1291,6 +1370,7 @@ func replayDeadLetterHandler(db *sql.DB) http.HandlerFunc {
 		}
 		replayAttempt := prevAttempts + 1
 		if err := recordWebhookDelivery(r.Context(), db, subID, eventID, replayAttempt, status, result, nil); err != nil {
+		if err := recordWebhookDelivery(r.Context(), db, subID, eventID, replayAttempt, status, result); err != nil {
 			slog.Warn("failed to record replay delivery", "err", err)
 		}
 

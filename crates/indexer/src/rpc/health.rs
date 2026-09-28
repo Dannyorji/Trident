@@ -12,6 +12,9 @@
 //! - Stale ledger (tip not advanced in 30s vs other endpoints): -10
 //! - JSON-RPC error response: -10
 //! - Connection refused: -30
+//! - Rate limited (HTTP 429): -5, a shorter penalty than a generic non-200,
+//!   since a busy endpoint recovers on its own and shouldn't be scored like a
+//!   genuinely broken one (issue #656).
 //!
 //! **Recovery:**
 //! - Successful response: +5 (capped at 100)
@@ -54,6 +57,7 @@ const DEDUCT_NON_200: u8 = 15;
 const DEDUCT_STALE_LEDGER: u8 = 10;
 const DEDUCT_RPC_ERROR: u8 = 10;
 const DEDUCT_CONNECTION_REFUSED: u8 = 30;
+const DEDUCT_RATE_LIMIT: u8 = 5;
 
 /// Score recovery amount on success.
 const RECOVER_SUCCESS: u8 = 5;
@@ -190,6 +194,16 @@ impl RpcHealthScorer {
     /// Deducts 30 points from the endpoint's score.
     pub fn record_connection_refused(&self, url: &str) {
         self.apply_deduction(url, DEDUCT_CONNECTION_REFUSED);
+    }
+
+    /// Record a rate-limit (HTTP 429) response from the given endpoint.
+    ///
+    /// Deducts only 5 points — a busy endpoint is not a broken one, and a
+    /// full non-200 deduction would fail traffic over to a backup equally
+    /// likely to be rate-limited too, causing correlated thrashing (issue
+    /// #656).
+    pub fn record_rate_limited(&self, url: &str) {
+        self.apply_deduction(url, DEDUCT_RATE_LIMIT);
     }
 
     /// Check if the given endpoint has a stale ledger compared to others.
@@ -386,6 +400,41 @@ mod tests {
         let s = scorer();
         s.record_connection_refused("https://primary.example");
         assert_eq!(s.get_score("https://primary.example"), 70);
+    }
+
+    #[test]
+    fn rate_limited_deducts_5() {
+        let s = scorer();
+        s.record_rate_limited("https://primary.example");
+        assert_eq!(s.get_score("https://primary.example"), 95);
+    }
+
+    #[test]
+    fn rate_limit_penalty_is_smaller_than_a_hard_failure() {
+        let rate_limited = scorer();
+        rate_limited.record_rate_limited("https://primary.example");
+
+        let hard_failure = scorer();
+        hard_failure.record_non_200("https://primary.example");
+
+        assert!(
+            rate_limited.get_score("https://primary.example")
+                > hard_failure.get_score("https://primary.example"),
+            "a 429 must not be scored as severely as a generic 5xx"
+        );
+    }
+
+    #[test]
+    fn rate_limiting_does_not_induce_cross_endpoint_failover() {
+        // A single rate-limited response must not be enough to push traffic
+        // to a backup that could just as easily be rate-limited itself.
+        let s = scorer();
+        s.record_rate_limited("https://primary.example");
+        assert_eq!(
+            s.select_best_endpoint(),
+            "https://primary.example",
+            "one 429 should not trigger failover"
+        );
     }
 
     #[test]

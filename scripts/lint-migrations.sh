@@ -140,15 +140,47 @@ for file in $(find "$MIGRATIONS_DIR" -maxdepth 1 -name '*.sql' | sort); do
     # small lookup table finishes instantly and does not need the ceremony
     # (CONCURRENTLY cannot run inside a transaction, so demanding it
     # everywhere would be actively worse).
-    while IFS=: read -r lineno text; do
+    #
+    # This repo's own style writes the table name on the line after
+    # `CREATE INDEX ... ON`, not on the same line (see any migration in
+    # database/migrations). Matching the whole statement up to its `;`
+    # instead of a single line means this rule fires on that style too
+    # (#642) — a same-line-only match never matched a real migration here.
+    #
+    # Migrations 0001-0025 predate this script (added in c263d4e, after they
+    # were already applied to real databases) and were never checked against
+    # this corrected match. Editing their SQL to add a waiver comment would
+    # change the file bytes sqlx checksums against `_sqlx_migrations`, which
+    # breaks `migrate run` on any database where they are already applied —
+    # a worse outcome than the lock these builds already took once, long ago.
+    # Grandfathered here; the rule is fully enforced from 0026 forward, which
+    # is the exact migration #642 exists to catch.
+    version=$(echo "$name" | sed -n 's/^\([0-9]\{1,\}\)_.*/\1/p')
+    grandfathered=false
+    if [ -n "$version" ] && [ "$((10#$version))" -le 25 ]; then
+        grandfathered=true
+    fi
+    while IFS=$'\x01' read -r lineno text; do
         [ -z "$lineno" ] && continue
-        if echo "$text" | grep -qiE '\b(soroban_events|token_events|audit_log|event_outbox|contract_invocation_metrics)\b' \
+        if [ "$grandfathered" = false ] \
+            && echo "$text" | grep -qiE '\b(soroban_events|token_events|audit_log|event_outbox|contract_invocation_metrics)\b' \
             && ! echo "$text" | grep -qiE '\bCONCURRENTLY\b' \
             && ! has_waiver "$file" "long-lock" "$lineno"; then
             fail "$name:$lineno index build on a large table without CONCURRENTLY or a waiver:"
             fail "    $(echo "$text" | sed 's/^[[:space:]]*//' | cut -c1-90)"
         fi
-    done <<< "$(echo "$stripped" | grep -inE '\bCREATE[[:space:]]+(UNIQUE[[:space:]]+)?INDEX\b' || true)"
+    done <<< "$(awk '
+        BEGIN { stmt = ""; startline = 0 }
+        /CREATE[ \t]+(UNIQUE[ \t]+)?INDEX/ && startline == 0 { startline = NR }
+        startline > 0 {
+            stmt = stmt " " $0
+            if ($0 ~ /;/) {
+                print startline "\x01" stmt
+                stmt = ""
+                startline = 0
+            }
+        }
+    ' <<< "$stripped")"
 
     # Rule 4b: ADD COLUMN NOT NULL without DEFAULT rewrites the whole table.
     while IFS=: read -r lineno text; do
