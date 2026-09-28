@@ -29,7 +29,7 @@ spec:
       {{- end }}
       containers:
         - name: go-api
-          image: "{{ .Values.goApi.image.repository }}:{{ .Values.goApi.image.tag }}"
+          image: "{{ .Values.goApi.image.repository }}:{{ .Values.goApi.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           securityContext:
             {{- include "trident.containerSecurityContext" . | nindent 12 }}

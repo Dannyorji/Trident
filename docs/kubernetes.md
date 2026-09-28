@@ -47,11 +47,15 @@ kubectl create secret generic trident-secrets \
 ```bash
 helm install trident ./helm/trident \
   --namespace trident \
-  --create-namespace \
-  --set goApi.image.tag=v0.1.0 \
-  --set indexer.image.tag=v0.1.0 \
-  --set grpcApi.image.tag=v0.1.0
+  --create-namespace
 ```
+
+With no `--set`/`-f` overrides, every workload image defaults to
+`Chart.yaml`'s `appVersion` (issue #622) — the version this chart release
+ships with, not a floating `latest` tag. Add `-f helm/trident/values-prod.yaml`
+for a production install (see [Production configuration](#production)
+below), or override an individual service's tag directly, e.g.
+`--set goApi.image.tag=v1.0.1` to run a specific hotfix.
 
 This first runs a migration Job to bring the schema up to date, then rolls
 out the app Deployments only once it succeeds — see
@@ -155,6 +159,38 @@ When disabled, the migration Job template renders nothing — no other
 chart behavior changes.
 
 ## Configuration
+
+### Production configuration {#production}
+
+`helm/trident/values-prod.yaml` (issue #622) is a starting overlay for a
+production install, applied on top of the chart defaults:
+
+```bash
+helm upgrade --install trident helm/trident \
+  -f helm/trident/values.yaml \
+  -f helm/trident/values-prod.yaml \
+  --namespace trident-prod \
+  --create-namespace
+```
+
+It strengthens the bundled Nginx's `PodDisruptionBudget` and documents the
+Ingress-based alternative (commented out — flip `nginx.enabled: false` and
+`ingress.enabled: true` to use it instead), and otherwise runs at
+`values.yaml`'s own defaults: `goApi` at 2 replicas with an HPA up to 10,
+`indexer`/`grpcApi` at 1 replica each. It deliberately does not override any
+`image.tag` — a production install should run the version-pinned image
+`Chart.yaml`'s `appVersion` resolves to, the same one this chart release
+was tested against, not a floating tag or a per-commit SHA (that per-commit
+SHA pattern is what `values-staging.yaml` and `staging-deploy.yml` use
+instead, appropriately for a CI-driven staging environment that redeploys on
+every commit to `dev`).
+
+Review `values-prod.yaml`'s own header comment before using it as-is: the
+TLS host and resource sizing in it are reasonable starting defaults, not
+your actual infrastructure, which only you can supply — replace
+`ingress.host` and the cert-manager annotation if you use the Ingress
+alternative, and size `resources.requests`/`resources.limits` per service
+against your real traffic before launch.
 
 ### Using an Ingress controller instead of Nginx
 
