@@ -18,9 +18,7 @@
 
 mod circuit_breaker;
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sqlx::PgPool;
@@ -35,7 +33,7 @@ use crate::{
     db, metrics,
     parser::Parser,
     poll::{AdaptivePoll, AdaptivePollConfig},
-    rpc::{filters::build_event_filters, FilterPlan, RpcClient, RpcHttpSettings},
+    rpc::{filters::build_event_filters, retry_strategy, FilterPlan, RpcClient, RpcHttpSettings},
     token_metadata,
 };
 pub use circuit_breaker::{BreakerState, CircuitBreaker, CircuitBreakerConfig, Outcome};
@@ -44,53 +42,6 @@ pub use circuit_breaker::{BreakerState, CircuitBreaker, CircuitBreakerConfig, Ou
 /// At the default 5 s poll interval this is ≈ 60 s — matches the env-var default.
 const FILTER_REFRESH_EVERY_N_POLLS: u32 = 12;
 
-/// Applies full jitter to a backoff duration (issue #197): without it,
-/// multiple indexer replicas (or a restart storm) computing the same
-/// `ExponentialBackoff` schedule retry in lockstep against the same RPC
-/// endpoint, turning a transient blip into a synchronised thundering herd.
-///
-/// Deliberately dependency-free rather than pulling in `rand`: seeds a small
-/// xorshift generator from process-local sources that vary call to call
-/// (the current instant relative to an epoch fixed at first use, a memory
-/// address, and the duration being jittered), which is enough entropy to
-/// decorrelate concurrent processes without adding a crate whose only other
-/// use in this binary would be here. Scales the input duration by a factor
-/// drawn uniformly from [0.5, 1.0] — "full jitter" per the AWS
-/// backoff-jitter algorithms writeup, which caps the added randomness at the
-/// base delay itself rather than compounding it past `max_delay`.
-fn jitter(duration: Duration) -> Duration {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::OnceLock;
-    static EPOCH: OnceLock<Instant> = OnceLock::new();
-    static CALL_COUNTER: AtomicU64 = AtomicU64::new(0);
-    let epoch = *EPOCH.get_or_init(Instant::now);
-
-    let mut hasher = DefaultHasher::new();
-    Instant::now().duration_since(epoch).hash(&mut hasher);
-    // A monotonic per-process counter guarantees the seed changes even if two
-    // calls land on the same clock tick (coarse timer resolution on some
-    // platforms) or the same stack address (tail-call/inlining).
-    CALL_COUNTER
-        .fetch_add(1, Ordering::Relaxed)
-        .hash(&mut hasher);
-    // A stack address is effectively unpredictable ASLR noise and differs
-    // across concurrent tasks/processes even when called at the same instant.
-    let stack_marker = &hasher as *const _ as usize;
-    stack_marker.hash(&mut hasher);
-    duration.hash(&mut hasher);
-    let seed = hasher.finish();
-
-    // xorshift64* — fast, deterministic given a seed, good enough dispersion
-    // for jitter (this is not security-sensitive).
-    let mut x = seed | 1; // must be non-zero
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    let unit = (x >> 11) as f64 / (1u64 << 53) as f64; // in [0, 1)
-
-    let factor = 0.5 + unit * 0.5; // in [0.5, 1.0)
-    duration.mul_f64(factor)
-}
 /// How often (in poll loop iterations) the gap scan runs (issue #216). Much
 /// less frequent than the filter refresh above: a gap scan reads the whole
 /// `ledger_metadata` table's sequence column via a window function, and a
@@ -162,6 +113,7 @@ impl Streamer {
                 pool_idle_timeout: config.rpc_pool_idle_timeout,
                 pool_max_idle_per_host: config.rpc_pool_max_idle_per_host,
                 tcp_keepalive: config.rpc_tcp_keepalive,
+                max_calls_per_sec: config.rpc_max_calls_per_sec,
             },
         )?;
         tracing::info!(
@@ -800,10 +752,7 @@ impl Streamer {
         // Full jitter (issue #197): without it, every indexer replica computes
         // the identical backoff schedule and retries in lockstep against the
         // same RPC endpoint on a shared outage.
-        let retry_strategy = ExponentialBackoff::from_millis(200)
-            .max_delay(Duration::from_secs(2))
-            .map(jitter)
-            .take(5);
+        let retry_strategy = retry_strategy();
 
         // The first page of a poll anchors by ledger (startLedger); every later
         // page in the same poll resumes via the RPC paging token. A fresh index
@@ -1614,6 +1563,7 @@ async fn commit_page_with_fallback(
 mod tests {
     use super::*;
     use crate::redis_stream::relay::{OutboxRelay, RelayConfig};
+    use crate::rpc::jitter;
     use base64::{engine::general_purpose::STANDARD, Engine};
     use stellar_xdr::curr::{Limited, Limits, ScSymbol, ScVal, WriteXdr};
     use wiremock::matchers::{body_partial_json, method, path};
@@ -1874,6 +1824,7 @@ mod tests {
             rpc_pool_idle_timeout: Duration::from_secs(90),
             rpc_pool_max_idle_per_host: 8,
             rpc_tcp_keepalive: Duration::from_secs(60),
+            rpc_max_calls_per_sec: 50,
             index_diagnostic: false,
             topic_filters: Vec::new(),
             max_events_per_poll: 200,
