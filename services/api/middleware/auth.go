@@ -151,7 +151,7 @@ func withAuthenticatedKey(ctx context.Context, idStr, network string) context.Co
 // violate that constraint or silently misattribute the request to an
 // unrelated real key. Instead this sets LegacyEnvKeyID, a sentinel that is
 // deliberately not a UUID, and records "legacy-env" as audit_log.auth_source
-// (added by migration 0034) as the attribution in api_key_id's place.
+// (added by migration 0035) as the attribution in api_key_id's place.
 func withLegacyAuthenticatedKey(ctx context.Context) context.Context {
 	ctx = WithAPIKeyID(ctx, LegacyEnvKeyID)
 	ctx = WithNetwork(ctx, LegacyEnvNetwork)

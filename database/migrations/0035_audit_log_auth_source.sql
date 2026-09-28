@@ -1,4 +1,4 @@
--- Migration 0034: audit_log gains auth_source (issue #616)
+-- Migration 0035: audit_log gains auth_source (issue #616)
 --
 -- A request authenticated through the legacy API_KEY_HASHES env-var path has
 -- no api_keys row, so api_key_id is legitimately NULL for it (the FK to
