@@ -198,8 +198,11 @@ pub struct PageCommit<'a> {
     /// Empty unless a tracked contract was detected as a SEP-41 token and one
     /// of its holders moved funds in this page.
     pub storage_snapshots: &'a [StorageSnapshotRow<'a>],
-    /// Network these storage snapshots belong to (empty string when
-    /// `storage_snapshots` is empty).
+    /// Network this indexer instance is running against (e.g. `"mainnet"` or
+    /// `"testnet"`). Stamped onto every `soroban_events`,
+    /// `contract_invocation_metrics`, and `contract_storage_snapshots` row in
+    /// this page (issue #595) — without it, rows silently fall back to the
+    /// columns' `DEFAULT 'testnet'` regardless of the indexer's actual network.
     pub network: &'a str,
     /// New cursor value, when the page advanced it.
     pub cursor: Option<u64>,
@@ -302,8 +305,15 @@ impl EventColumns {
 /// cannot write a duplicate row, it is simply dropped rather than raised. The
 /// natural-key constraint remains as the enforcement point, and 0025's
 /// pre-flight duplicate check still runs against existing data.
+///
+/// `network` must match the value used for `indexed_contracts`/cursor state in
+/// this deployment (e.g. `"mainnet"` or `"testnet"`) — every row in `events`
+/// is stamped with it. Previously this was left unbound and every row fell
+/// back to the column's `DEFAULT 'testnet'` regardless of the indexer's
+/// actual network, silently mislabeling mainnet data (issue #595).
 pub async fn insert_events_batch<'e, E>(
     executor: E,
+    network: &str,
     events: &[SorobanEvent],
 ) -> Result<(), TridentError>
 where
@@ -314,15 +324,18 @@ where
     }
 
     let cols = EventColumns::build(events)?;
+    let networks: Vec<String> = std::iter::repeat(network.to_string())
+        .take(events.len())
+        .collect();
 
     sqlx::query(
         r#"
         INSERT INTO soroban_events
             (id, contract_id, ledger_sequence, ledger_timestamp, transaction_hash,
-             event_index, event_type, topics, data)
+             event_index, event_type, topics, data, network)
         SELECT * FROM UNNEST(
             $1::uuid[], $2::text[], $3::bigint[], $4::timestamptz[], $5::text[],
-            $6::int[], $7::text[], $8::jsonb[], $9::jsonb[]
+            $6::int[], $7::text[], $8::jsonb[], $9::jsonb[], $10::text[]
         )
         ON CONFLICT DO NOTHING
         "#,
@@ -336,6 +349,7 @@ where
     .bind(&cols.event_types)
     .bind(&cols.topics)
     .bind(&cols.data)
+    .bind(&networks)
     .execute(executor)
     .await
     .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("insert_events_batch")))?;
@@ -445,8 +459,13 @@ where
 /// Keyed by `(contract_id, transaction_hash)`; a replayed page inserts
 /// nothing new via `ON CONFLICT DO NOTHING`, matching the idempotency of the
 /// other page-scoped inserts.
+///
+/// `network` must match the value used for the events in the same page —
+/// previously left unbound, so every row fell back to the column's
+/// `DEFAULT 'testnet'` regardless of the indexer's actual network (issue #595).
 pub async fn insert_invocation_metrics_batch<'e, E>(
     executor: E,
+    network: &str,
     rows: &[InvocationMetricRow<'_>],
 ) -> Result<(), TridentError>
 where
@@ -457,6 +476,7 @@ where
     }
 
     let mut contract_ids = Vec::with_capacity(rows.len());
+    let mut networks = Vec::with_capacity(rows.len());
     let mut transaction_hashes = Vec::with_capacity(rows.len());
     let mut ledger_sequences = Vec::with_capacity(rows.len());
     let mut ledger_timestamps = Vec::with_capacity(rows.len());
@@ -473,6 +493,7 @@ where
         })?;
 
         contract_ids.push(row.contract_id.to_string());
+        networks.push(network.to_string());
         transaction_hashes.push(row.transaction_hash.to_string());
         ledger_sequences.push(row.ledger_sequence as i64);
         ledger_timestamps.push(ledger_ts);
@@ -487,16 +508,17 @@ where
     sqlx::query(
         r#"
         INSERT INTO contract_invocation_metrics
-            (contract_id, transaction_hash, ledger_sequence, ledger_timestamp,
+            (contract_id, network, transaction_hash, ledger_sequence, ledger_timestamp,
              fee_charged, resource_fee, cpu_instructions, read_bytes, write_bytes, provenance)
         SELECT * FROM UNNEST(
-            $1::text[], $2::text[], $3::bigint[], $4::timestamptz[],
-            $5::bigint[], $6::bigint[], $7::bigint[], $8::bigint[], $9::bigint[], $10::text[]
+            $1::text[], $2::text[], $3::text[], $4::bigint[], $5::timestamptz[],
+            $6::bigint[], $7::bigint[], $8::bigint[], $9::bigint[], $10::bigint[], $11::text[]
         )
         ON CONFLICT (contract_id, transaction_hash) DO NOTHING
         "#,
     )
     .bind(&contract_ids)
+    .bind(&networks)
     .bind(&transaction_hashes)
     .bind(&ledger_sequences)
     .bind(&ledger_timestamps)
@@ -711,7 +733,7 @@ pub async fn commit_page(pool: &PgPool, commit: PageCommit<'_>) -> Result<(), Tr
         .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("commit_page begin")))?;
 
     for chunk in commit.events.chunks(batch_size) {
-        insert_events_batch(&mut *tx, chunk).await?;
+        insert_events_batch(&mut *tx, commit.network, chunk).await?;
         // Outbox rows ride the same transaction as the events they deliver
         // (issue #200): either both land or neither does, so a committed event
         // can never exist without a delivery record for the relay to pick up.
@@ -731,7 +753,7 @@ pub async fn commit_page(pool: &PgPool, commit: PageCommit<'_>) -> Result<(), Tr
     // Invocation metrics ride the same transaction as the page they were
     // derived from (issue #266), same idempotency contract as the rest.
     for chunk in commit.invocation_metrics.chunks(batch_size) {
-        insert_invocation_metrics_batch(&mut *tx, chunk).await?;
+        insert_invocation_metrics_batch(&mut *tx, commit.network, chunk).await?;
     }
 
     // Storage snapshot changes ride the same transaction as the page that
@@ -1461,7 +1483,16 @@ pub enum ReplayOutcome {
 /// `WHERE replayed_at IS NULL` guard on the UPDATE below makes the second
 /// replay a no-op on `failed_events` too — replaying twice cannot
 /// double-insert or double-count.
-pub async fn replay_failed_event(pool: &PgPool, id: Uuid) -> Result<ReplayOutcome, TridentError> {
+///
+/// `network` is the replayed row's network tag. `failed_events` has no
+/// network column of its own (the original event's network is not recorded
+/// at dead-letter time), so the caller must supply the deployment's actual
+/// network — see `main::run_replay` (issue #595).
+pub async fn replay_failed_event(
+    pool: &PgPool,
+    id: Uuid,
+    network: &str,
+) -> Result<ReplayOutcome, TridentError> {
     let row: Option<(serde_json::Value,)> = sqlx::query_as(
         "SELECT event_payload FROM failed_events WHERE id = $1 AND replayed_at IS NULL",
     )
@@ -1487,7 +1518,7 @@ pub async fn replay_failed_event(pool: &PgPool, id: Uuid) -> Result<ReplayOutcom
     })?;
 
     let events = std::slice::from_ref(&event);
-    insert_events_batch(&mut *tx, events).await?;
+    insert_events_batch(&mut *tx, network, events).await?;
     insert_outbox_batch(&mut *tx, events).await?;
 
     let updated = sqlx::query(
@@ -1816,10 +1847,10 @@ mod tests {
             .expect("cleanup failed");
 
         let events = [event.clone()];
-        insert_events_batch(&pool, &events)
+        insert_events_batch(&pool, "testnet", &events)
             .await
             .expect("first insert failed");
-        insert_events_batch(&pool, &events)
+        insert_events_batch(&pool, "testnet", &events)
             .await
             .expect("second insert must not error");
 
@@ -2082,9 +2113,180 @@ mod tests {
             }
         };
         let pool = PgPool::connect(&db_url).await.unwrap();
-        insert_events_batch(&pool, &[])
+        insert_events_batch(&pool, "testnet", &[])
             .await
             .expect("empty batch must succeed");
+    }
+
+    /// `insert_events_batch` must stamp every row with the caller's actual
+    /// network, not rely on the `soroban_events.network` column's
+    /// `DEFAULT 'testnet'` (issue #595) — a mainnet deployment silently wrote
+    /// every row as `'testnet'` before this was bound.
+    #[tokio::test]
+    async fn insert_events_batch_tags_rows_with_the_given_network() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let event = make_event("CNETTAG_MAINNET", 77, 0);
+        sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
+            .bind(&event.contract_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup failed");
+
+        insert_events_batch(&pool, "mainnet", &[event.clone()])
+            .await
+            .expect("insert failed");
+
+        let row: (String,) =
+            sqlx::query_as("SELECT network FROM soroban_events WHERE contract_id = $1")
+                .bind(&event.contract_id)
+                .fetch_one(&pool)
+                .await
+                .expect("select failed");
+        assert_eq!(row.0, "mainnet");
+
+        sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
+            .bind(&event.contract_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup failed");
+    }
+
+    /// The natural-key constraint (migration 0025) is network-scoped: the same
+    /// `(transaction_hash, event_index)` must be able to persist once per
+    /// network without one insert silently absorbing the other via the
+    /// untargeted `ON CONFLICT DO NOTHING` (issue #595).
+    #[tokio::test]
+    async fn insert_events_batch_persists_same_tx_index_on_different_networks() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        // Different contract_id so the two rows land under different
+        // deterministic ids (`event_uuid` hashes contract_id in) and never
+        // collide on the partitioned primary key; same transaction_hash and
+        // event_index is what actually exercises the network-scoped natural
+        // key below.
+        let mainnet_event = make_event("CNETDUAL_MAINNET", 88, 1);
+        let testnet_event = make_event("CNETDUAL_TESTNET", 88, 1);
+        assert_eq!(
+            mainnet_event.transaction_hash,
+            testnet_event.transaction_hash
+        );
+        assert_eq!(mainnet_event.event_index, testnet_event.event_index);
+
+        sqlx::query("DELETE FROM soroban_events WHERE contract_id = ANY($1)")
+            .bind(
+                &[
+                    mainnet_event.contract_id.clone(),
+                    testnet_event.contract_id.clone(),
+                ][..],
+            )
+            .execute(&pool)
+            .await
+            .expect("cleanup failed");
+
+        insert_events_batch(&pool, "mainnet", &[mainnet_event.clone()])
+            .await
+            .expect("mainnet insert failed");
+        insert_events_batch(&pool, "testnet", &[testnet_event.clone()])
+            .await
+            .expect("testnet insert failed");
+
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM soroban_events WHERE contract_id = ANY($1)")
+                .bind(
+                    &[
+                        mainnet_event.contract_id.clone(),
+                        testnet_event.contract_id.clone(),
+                    ][..],
+                )
+                .fetch_one(&pool)
+                .await
+                .expect("count query failed");
+        assert_eq!(
+            count.0, 2,
+            "the same (transaction_hash, event_index) must persist once per network"
+        );
+
+        sqlx::query("DELETE FROM soroban_events WHERE contract_id = ANY($1)")
+            .bind(&[mainnet_event.contract_id, testnet_event.contract_id][..])
+            .execute(&pool)
+            .await
+            .expect("cleanup failed");
+    }
+
+    /// `insert_invocation_metrics_batch` is the sibling omission called out in
+    /// issue #595: it must stamp its rows with the caller's actual network
+    /// too, not fall back to `contract_invocation_metrics.network`'s
+    /// `DEFAULT 'testnet'`.
+    #[tokio::test]
+    async fn insert_invocation_metrics_batch_tags_rows_with_the_given_network() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let contract_id = format!("CINVMETRICNET_{}", Uuid::new_v4());
+        let metrics = crate::parser::invocation_metrics::InvocationMetrics {
+            fee_charged: 100,
+            resource_fee: Some(50),
+            cpu_instructions: Some(1000),
+            read_bytes: Some(10),
+            write_bytes: Some(5),
+            provenance: "declared_resources",
+        };
+        let row = InvocationMetricRow {
+            contract_id: &contract_id,
+            transaction_hash: "txhash_invmetric",
+            ledger_sequence: 1,
+            ledger_timestamp: "2024-01-01T00:00:00Z",
+            metrics: &metrics,
+        };
+
+        insert_invocation_metrics_batch(&pool, "mainnet", &[row])
+            .await
+            .expect("insert failed");
+
+        let result: (String,) = sqlx::query_as(
+            "SELECT network FROM contract_invocation_metrics WHERE contract_id = $1",
+        )
+        .bind(&contract_id)
+        .fetch_one(&pool)
+        .await
+        .expect("select failed");
+        assert_eq!(result.0, "mainnet");
+
+        sqlx::query("DELETE FROM contract_invocation_metrics WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup failed");
     }
 
     /// A page larger than `batch_size` must still land in full — chunking splits
@@ -3079,7 +3281,7 @@ mod tests {
             "freshly dead-lettered row must be listed as pending"
         );
 
-        let outcome = replay_failed_event(&pool, id.0).await.unwrap();
+        let outcome = replay_failed_event(&pool, id.0, "testnet").await.unwrap();
         assert_eq!(outcome, ReplayOutcome::Replayed);
 
         let pending_after = list_pending_failed_events(&pool, 1000).await.unwrap();
@@ -3154,7 +3356,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            replay_failed_event(&pool, id.0).await.unwrap(),
+            replay_failed_event(&pool, id.0, "testnet").await.unwrap(),
             ReplayOutcome::Replayed
         );
 
@@ -3177,7 +3379,7 @@ mod tests {
         // Replaying again must be a no-op: AlreadyReplayedOrMissing, not a
         // second row in soroban_events.
         assert_eq!(
-            replay_failed_event(&pool, id.0).await.unwrap(),
+            replay_failed_event(&pool, id.0, "testnet").await.unwrap(),
             ReplayOutcome::AlreadyReplayedOrMissing
         );
         let persisted_again: (i64,) =
@@ -3219,7 +3421,9 @@ mod tests {
         };
         let pool = PgPool::connect(&db_url).await.unwrap();
 
-        let outcome = replay_failed_event(&pool, Uuid::new_v4()).await.unwrap();
+        let outcome = replay_failed_event(&pool, Uuid::new_v4(), "testnet")
+            .await
+            .unwrap();
         assert_eq!(outcome, ReplayOutcome::AlreadyReplayedOrMissing);
     }
 }

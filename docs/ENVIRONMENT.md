@@ -45,7 +45,7 @@ description is accurate. Keep this file honest by hand.
 | `STELLAR_RPC_URL` | Required unless `STELLAR_RPC_URLS` set | — | Single Soroban RPC endpoint. |
 | `STELLAR_RPC_URLS` | Optional | — | Prioritised, comma-separated RPC endpoints for failover; overrides `STELLAR_RPC_URL` (which stays valid as a single-value alias). |
 | `NETWORK` | Optional | `testnet` | One of `mainnet` \| `testnet` \| `futurenet`. |
-| `NETWORK_PASSPHRASE` | Required for non-standard networks | inferred for testnet/mainnet/pubnet | Stellar network passphrase, used to derive SAC contract ids for `TRACKED_SAC_ASSETS`. |
+| `NETWORK_PASSPHRASE` | Required for non-standard networks | inferred for testnet/mainnet/pubnet (see below) | Stellar network passphrase, used to derive SAC contract ids for `TRACKED_SAC_ASSETS`. |
 | `POLL_INTERVAL_MS` | Optional | `1000` (min `100`, max `60000`) | Ledger poll interval. |
 | `POLL_INTERVAL_FLOOR_MS` | Optional | `250` (min `50`, max `60000`) | Adaptive-poll floor (issue #198): fastest interval, used when lag is high. |
 | `POLL_INTERVAL_CEILING_MS` | Optional | `5000` (min `100`, max `600000`) | Adaptive-poll ceiling: slowest interval, used when caught up. |
@@ -66,6 +66,21 @@ description is accurate. Keep this file honest by hand.
 | `DB_STATEMENT_TIMEOUT_MS` | Optional | `30000` | Postgres per-statement timeout bound. |
 | `DB_IDLE_IN_TRANSACTION_TIMEOUT_MS` | Optional | `10000` | Postgres `idle_in_transaction_session_timeout` bound. |
 | `TOKEN_METADATA_REFRESH_INTERVAL_SECS` | Optional | `86400` | How often cached token metadata refreshes. |
+
+### Inferred network passphrases
+
+When `NETWORK_PASSPHRASE` is unset, the indexer infers it from `NETWORK`
+(`crates/indexer/src/config.rs`, `default_network_passphrase`) for the two
+well-known networks only:
+
+| `NETWORK` | Inferred `NETWORK_PASSPHRASE` |
+|---|---|
+| `testnet` | `Test SDF Network ; September 2015` |
+| `mainnet` \| `pubnet` | `Public Global Stellar Network ; September 2015` |
+
+`futurenet` (and any other value) has no inferred passphrase — startup fails
+config validation unless `NETWORK_PASSPHRASE` is set explicitly, since
+guessing would silently derive wrong SAC contract ids.
 
 ### RPC transport and failover
 
@@ -144,6 +159,7 @@ description is accurate. Keep this file honest by hand.
 | `RETENTION_PARSE_ERRORS_DAYS` | Optional | `30` | Days to retain parse-error rows. |
 | `RETENTION_WEBHOOK_DELIVERIES_DAYS` | Optional | `30` | Days to retain webhook delivery records. |
 | `RETENTION_SOROBAN_EVENTS_DAYS` | Optional | `0` (disabled) | Days to retain Soroban events; `0` disables pruning. |
+| `RETENTION_EVENT_OUTBOX_DAYS` | Optional | `7` | Days to retain *published* event_outbox rows (issue #604). An unpublished row (`published = FALSE`) is never eligible regardless of age. |
 | `PPROF_ENABLED` | Optional | `false` | Enables the internal-only pprof profiling server. Never exposed publicly — bind it to loopback/localhost only. |
 | `PPROF_ADDR` | Optional | `127.0.0.1:6060` | Bind address for the pprof server, when enabled. |
 | `GRPC_MTLS_ENABLED` / `GRPC_MTLS_CA_CERT` / `GRPC_MTLS_CLIENT_CERT` / `GRPC_MTLS_CLIENT_KEY` | Optional (see grpc-api section) | — | Client-side counterpart of the grpc-api mTLS flag (issue #320); `services/api/grpc/client.go`. |

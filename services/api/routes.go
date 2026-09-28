@@ -84,7 +84,19 @@ func routeBindings() []routeBinding {
 	return []routeBinding{
 		documented("GET", "/v1/health", func(d routeDeps) http.Handler { return handlers.Health() }),
 		documented("GET", "/v1/ready", func(d routeDeps) http.Handler {
-			return handlers.Ready(d.healthDB, d.redisClient, d.grpcClient)
+			// A nil *grpc.Client assigned into the EventsLister interface
+			// parameter is NOT an interface nil - client == nil inside
+			// checkGRPC would be false, and the health check would panic
+			// calling a method on a nil receiver instead of reporting
+			// errNoGRPCClient. Passing a genuine nil interface value when
+			// the concrete pointer is nil keeps Ready's own nil check
+			// meaningful for callers (like tests) that construct routeDeps
+			// without a real gRPC client.
+			var eventsLister handlers.EventsLister
+			if d.grpcClient != nil {
+				eventsLister = d.grpcClient
+			}
+			return handlers.Ready(d.healthDB, d.redisClient, eventsLister)
 		}),
 		documented("GET", "/v1/version", func(d routeDeps) http.Handler {
 			return handlers.VersionHandler(d.pool)

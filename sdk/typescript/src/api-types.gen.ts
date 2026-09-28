@@ -405,6 +405,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/admin/keys/{id}/usage-rollup": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * API key usage rollup (admin)
+         * @description Same shape as GET /v1/usage but for any key id, gated by X-Admin-Key. Backed by the maintained usage_rollup table rather than a live audit_log scan, so it stays cheap regardless of how far back `from` reaches.
+         */
+        get: operations["getAdminKeyUsageRollup"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/usage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Self-serve API key usage rollup
+         * @description The authenticated caller's own usage rollup for an optional [from, to) window; defaults to the last 30 days. Requires a DB-backed API key — legacy env-hash auth has no key id to key the rollup on.
+         */
+        get: operations["getKeyUsage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/admin/contracts": {
         parameters: {
             query?: never;
@@ -478,7 +518,7 @@ export interface paths {
         };
         /**
          * List webhook subscriptions
-         * @description Webhook subscriptions owned by the calling API key. Includes each subscription's signing secret. Returns JSON null (not an empty array) when the key owns no subscriptions. Webhook endpoints are not yet part of the frozen v1 surface; some of their error responses are plain text rather than the canonical error envelope.
+         * @description Keyset-paginated webhook subscriptions owned by the calling API key (issue #220), newest first (createdAt DESC, id DESC as tiebreaker). Includes each subscription's signing secret. Returns JSON null (not an empty array) when the key owns no subscriptions.
          */
         get: operations["listWebhooks"];
         put?: never;
@@ -1033,6 +1073,31 @@ export interface components {
             requests: number;
             avg_duration_ms: number;
         };
+        UsageResponse: {
+            /** Format: uuid */
+            api_key_id: string;
+            /** Format: date-time */
+            from: string;
+            /** Format: date-time */
+            to: string;
+            /** Format: int64 */
+            total_requests: number;
+            /** Format: int64 */
+            total_errors: number;
+            /** @description Daily buckets from the maintained usage_rollup table, oldest first; empty when the window has no rollup rows. */
+            days: components["schemas"]["UsageRollupRow"][];
+        };
+        UsageRollupRow: {
+            /** Format: date-time */
+            period_start: string;
+            /** Format: date-time */
+            period_end: string;
+            /** Format: int64 */
+            request_count: number;
+            /** Format: int64 */
+            error_count: number;
+            avg_duration_ms: number;
+        };
         ContractRegistrationRequest: {
             /** @description Contract address (C... strkey, 56 characters) */
             contract_id: string;
@@ -1098,6 +1163,13 @@ export interface components {
             pausedAt?: string | null;
             network: string;
         };
+        ListWebhooksResponse: {
+            webhooks: components["schemas"]["WebhookSubscription"][];
+            /** @description Whether another page is available. */
+            has_more: boolean;
+            /** @description Opaque cursor for the next page (null if has_more is false). */
+            next_cursor: string | null;
+        };
         WebhookCreateRequest: {
             contractId: string;
             /** @description Optional topic filter */
@@ -1157,8 +1229,11 @@ export interface components {
         };
         ErrorResponse: {
             error: {
-                /** @description Error code (e.g., INVALID_ARGUMENT, INTERNAL, UNAVAILABLE, CONFLICT) */
-                code: string;
+                /**
+                 * @description Machine-readable error code. Matches httputil.ErrorCode exactly (services/api/internal/httputil/errors.go).
+                 * @enum {string}
+                 */
+                code: "NOT_FOUND" | "UNAUTHORIZED" | "RATE_LIMITED" | "INVALID_ARGUMENT" | "UNAVAILABLE" | "INTERNAL" | "PAYLOAD_TOO_LARGE" | "FORBIDDEN" | "CONFLICT";
                 /** @description Human-readable error message */
                 message: string;
                 /** @description Request ID for debugging */
@@ -1187,6 +1262,15 @@ export interface components {
         };
         /** @description Requested resource was not found */
         NotFound: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ErrorResponse"];
+            };
+        };
+        /** @description An unexpected server-side error occurred (error.code INTERNAL) */
+        InternalError: {
             headers: {
                 [name: string]: unknown;
             };
@@ -2037,6 +2121,78 @@ export interface operations {
             503: components["responses"]["ServiceUnavailable"];
         };
     };
+    getAdminKeyUsageRollup: {
+        parameters: {
+            query?: {
+                /** @description Window start (RFC 3339); defaults to 30 days before `to` */
+                from?: string;
+                /** @description Window end (RFC 3339); defaults to now */
+                to?: string;
+            };
+            header?: never;
+            path: {
+                /** @description API key ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Usage rollup for the key over the window */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UsageResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            429: components["responses"]["TooManyRequestsIPOnly"];
+            500: components["responses"]["InternalError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getKeyUsage: {
+        parameters: {
+            query?: {
+                /** @description Window start (RFC 3339); defaults to 30 days before `to` */
+                from?: string;
+                /** @description Window end (RFC 3339); defaults to now */
+                to?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Usage rollup for the calling key over the window */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UsageResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            429: components["responses"]["RateLimitExceeded"];
+            500: components["responses"]["InternalError"];
+            /** @description The authenticated key is not DB-backed (legacy env-hash auth carries no key id to key the rollup on) */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
     listAdminContracts: {
         parameters: {
             query?: {
@@ -2205,42 +2361,39 @@ export interface operations {
     };
     listWebhooks: {
         parameters: {
-            query?: never;
+            query?: {
+                limit?: number;
+                /** @description Opaque pagination cursor from a previous response's next_cursor. */
+                cursor?: string;
+            };
             header?: never;
             path?: never;
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description Subscriptions owned by the calling key (null when none) */
+            /** @description Page of subscriptions owned by the calling key */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["WebhookSubscription"][] | null;
+                    "application/json": components["schemas"]["ListWebhooksResponse"];
+                };
+            };
+            /** @description Invalid limit or cursor (plain-text body) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
                 };
             };
             401: components["responses"]["Unauthorized"];
             429: components["responses"]["RateLimitExceeded"];
-            /** @description Listing failed (plain-text body) */
-            500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/plain": string;
-                };
-            };
-            /** @description Database unavailable (plain-text body) */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/plain": string;
-                };
-            };
+            500: components["responses"]["InternalError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     createWebhook: {
@@ -2265,15 +2418,7 @@ export interface operations {
                     "application/json": components["schemas"]["WebhookCreateResponse"];
                 };
             };
-            /** @description Invalid body or target URL (plain-text body) */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/plain": string;
-                };
-            };
+            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             /** @description Request body exceeds the 1 MiB limit */
             413: {
@@ -2285,24 +2430,8 @@ export interface operations {
                 };
             };
             429: components["responses"]["RateLimitExceeded"];
-            /** @description Creation failed (plain-text body) */
-            500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/plain": string;
-                };
-            };
-            /** @description Database unavailable (plain-text body) */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/plain": string;
-                };
-            };
+            500: components["responses"]["InternalError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     deleteWebhook: {
@@ -2326,25 +2455,9 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
-            /** @description Subscription not found (plain-text body) */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/plain": string;
-                };
-            };
+            404: components["responses"]["NotFound"];
             429: components["responses"]["RateLimitExceeded"];
-            /** @description Delete failed (plain-text body) */
-            500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/plain": string;
-                };
-            };
+            500: components["responses"]["InternalError"];
             503: components["responses"]["ServiceUnavailable"];
         };
     };
@@ -2371,25 +2484,17 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
-            /** @description No subscription with this ID belongs to the caller's API key (plain-text body) */
+            /** @description No subscription with this ID belongs to the caller's API key */
             404: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "text/plain": string;
+                    "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
             429: components["responses"]["RateLimitExceeded"];
-            /** @description Rotation failed (plain-text body) */
-            500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/plain": string;
-                };
-            };
+            500: components["responses"]["InternalError"];
             503: components["responses"]["ServiceUnavailable"];
         };
     };
@@ -2417,15 +2522,7 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             429: components["responses"]["RateLimitExceeded"];
-            /** @description Update failed (plain-text body) */
-            500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/plain": string;
-                };
-            };
+            500: components["responses"]["InternalError"];
             503: components["responses"]["ServiceUnavailable"];
         };
     };
@@ -2453,15 +2550,7 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             429: components["responses"]["RateLimitExceeded"];
-            /** @description Update failed (plain-text body) */
-            500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/plain": string;
-                };
-            };
+            500: components["responses"]["InternalError"];
             503: components["responses"]["ServiceUnavailable"];
         };
     };
@@ -2489,15 +2578,7 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             429: components["responses"]["RateLimitExceeded"];
-            /** @description Listing failed (plain-text body) */
-            500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/plain": string;
-                };
-            };
+            500: components["responses"]["InternalError"];
             503: components["responses"]["ServiceUnavailable"];
         };
     };
@@ -2522,35 +2603,11 @@ export interface operations {
                     "application/json": components["schemas"]["WebhookDelivery"][];
                 };
             };
-            /** @description Missing webhook ID (plain-text body) */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/plain": string;
-                };
-            };
+            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             429: components["responses"]["RateLimitExceeded"];
-            /** @description Listing failed (plain-text body) */
-            500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/plain": string;
-                };
-            };
-            /** @description Database unavailable (plain-text body) */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/plain": string;
-                };
-            };
+            500: components["responses"]["InternalError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     replayWebhookDeadLetter: {
@@ -2576,44 +2633,12 @@ export interface operations {
                     "application/json": components["schemas"]["WebhookReplayResponse"];
                 };
             };
-            /** @description Missing webhook or delivery ID (plain-text body) */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/plain": string;
-                };
-            };
+            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
-            /** @description No matching dead-lettered delivery (plain-text body) */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/plain": string;
-                };
-            };
+            404: components["responses"]["NotFound"];
             429: components["responses"]["RateLimitExceeded"];
-            /** @description Replay failed to record (plain-text body) */
-            500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/plain": string;
-                };
-            };
-            /** @description Database unavailable (plain-text body) */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/plain": string;
-                };
-            };
+            500: components["responses"]["InternalError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     getMetrics: {

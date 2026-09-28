@@ -62,6 +62,8 @@ pub struct OpenApiModels {
 
     pub list_contracts_response: Option<ListContractsResponse>,
 
+    pub list_webhooks_response: Option<ListWebhooksResponse>,
+
     pub liveness_response: Option<LivenessResponse>,
 
     pub ready_checks: Option<ReadyChecks>,
@@ -71,6 +73,10 @@ pub struct OpenApiModels {
     pub soroban_event: Option<SorobanEvent>,
 
     pub token_metadata_response: Option<TokenMetadataResponse>,
+
+    pub usage_response: Option<UsageResponse>,
+
+    pub usage_rollup_row: Option<UsageRollupRow>,
 
     pub version_response: Option<VersionResponse>,
 
@@ -379,14 +385,43 @@ pub struct ErrorResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Error {
-    /// Error code (e.g., INVALID_ARGUMENT, INTERNAL, UNAVAILABLE, CONFLICT)
-    pub code: String,
+    /// Machine-readable error code. Matches httputil.ErrorCode exactly
+    /// (services/api/internal/httputil/errors.go).
+    pub code: Code,
 
     /// Human-readable error message
     pub message: String,
 
     /// Request ID for debugging
     pub request_id: Option<String>,
+}
+
+/// Machine-readable error code. Matches httputil.ErrorCode exactly
+/// (services/api/internal/httputil/errors.go).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum Code {
+    Conflict,
+
+    Forbidden,
+
+    Internal,
+
+    #[serde(rename = "INVALID_ARGUMENT")]
+    InvalidArgument,
+
+    #[serde(rename = "NOT_FOUND")]
+    NotFound,
+
+    #[serde(rename = "PAYLOAD_TOO_LARGE")]
+    PayloadTooLarge,
+
+    #[serde(rename = "RATE_LIMITED")]
+    RateLimited,
+
+    Unauthorized,
+
+    Unavailable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -515,6 +550,43 @@ pub struct ListContractsResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListWebhooksResponse {
+    /// Whether another page is available.
+    pub has_more: bool,
+
+    /// Opaque cursor for the next page (null if has_more is false).
+    pub next_cursor: String,
+
+    pub webhooks: Vec<WebhookSubscription>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebhookSubscription {
+    /// Omitted when empty
+    pub api_key_id: Option<String>,
+
+    pub contract_id: String,
+
+    pub created_at: String,
+
+    pub id: String,
+
+    pub network: String,
+
+    /// Present while deliveries are paused
+    pub paused_at: Option<String>,
+
+    /// HMAC signing secret for deliveries; omitted when empty
+    pub secret: Option<String>,
+
+    pub target_url: String,
+
+    /// Topic filter; omitted when unfiltered
+    pub topic0: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LivenessResponse {
     /// Always "ok" while the process is up — no dependency checks.
     pub status: LivenessResponseStatus,
@@ -585,6 +657,36 @@ pub struct TokenMetadataResponse {
 
     /// Token symbol, from symbol(). Null unless is_token is true.
     pub symbol: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageResponse {
+    pub api_key_id: String,
+
+    /// Daily buckets from the maintained usage_rollup table, oldest first; empty when the window
+    /// has no rollup rows.
+    pub days: Vec<UsageRollupRow>,
+
+    pub from: String,
+
+    pub to: String,
+
+    pub total_errors: i64,
+
+    pub total_requests: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageRollupRow {
+    pub avg_duration_ms: f64,
+
+    pub error_count: i64,
+
+    pub period_end: String,
+
+    pub period_start: String,
+
+    pub request_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -708,30 +810,4 @@ pub enum WebhookStatusResponseStatus {
     Paused,
 
     Resumed,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WebhookSubscription {
-    /// Omitted when empty
-    pub api_key_id: Option<String>,
-
-    pub contract_id: String,
-
-    pub created_at: String,
-
-    pub id: String,
-
-    pub network: String,
-
-    /// Present while deliveries are paused
-    pub paused_at: Option<String>,
-
-    /// HMAC signing secret for deliveries; omitted when empty
-    pub secret: Option<String>,
-
-    pub target_url: String,
-
-    /// Topic filter; omitted when unfiltered
-    pub topic0: Option<String>,
 }

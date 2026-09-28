@@ -333,10 +333,16 @@ func main() {
 
 	handler := middleware.NewBodySizeLimitFromEnv()(mux)
 	handler = middleware.TieredRateLimit(rlCfg)(handler)
+	handler = middleware.NewDBAuth(authDB)(handler)
+	// AuditMiddleware wraps NewDBAuth (issue #609), not the other way around:
+	// it must run on every request regardless of auth outcome, so a rejected
+	// 401 is still written to audit_log. With AuditMiddleware inside NewDBAuth,
+	// NewDBAuth's early return on a missing/invalid key never reached
+	// next.ServeHTTP, so AuditMiddleware's write never ran and failed auth
+	// attempts left no audit trail at all.
 	if auditWriter != nil {
 		handler = middleware.AuditMiddleware(auditWriter)(handler)
 	}
-	handler = middleware.NewDBAuth(authDB)(handler)
 	handler = middleware.NewCompression()(handler)
 	// Per-IP rate limit runs BEFORE auth (issue #318): it wraps the handler
 	// chain built so far, so it executes ahead of NewDBAuth for every
@@ -576,6 +582,7 @@ type retentionConfig struct {
 	ParseErrorsDays       int
 	WebhookDeliveriesDays int
 	SorobanEventsDays     int
+	EventOutboxDays       int
 }
 
 func loadRetentionConfig() retentionConfig {
@@ -583,7 +590,18 @@ func loadRetentionConfig() retentionConfig {
 		AuditLogDays:          envInt("RETENTION_AUDIT_LOG_DAYS", 90),
 		ParseErrorsDays:       envInt("RETENTION_PARSE_ERRORS_DAYS", 30),
 		WebhookDeliveriesDays: envInt("RETENTION_WEBHOOK_DELIVERIES_DAYS", 30),
-		SorobanEventsDays:     envInt("RETENTION_SOROBAN_EVENTS_DAYS", 0), // 0 = disabled
+		// Highest-volume table; unlike audit_log/parse_errors/webhook_deliveries
+		// it previously defaulted to 0 (disabled), letting it grow unbounded
+		// with growing indexes/WAL/vacuum pressure unless an operator opted in
+		// explicitly (#645). 90 days matches the audit log's window.
+		SorobanEventsDays: envInt("RETENTION_SOROBAN_EVENTS_DAYS", 90),
+		// event_outbox is the fastest-growing unbounded table (issue #604):
+		// rows are only ever flipped published = TRUE, never deleted, and
+		// each carries a full JSONB copy of the event. 7 days is generous
+		// relative to the relay's normal publish latency (seconds), while
+		// still giving an operator a window to notice and recover a stuck
+		// relay before its backlog is pruned out from under it.
+		EventOutboxDays: envInt("RETENTION_EVENT_OUTBOX_DAYS", 7),
 	}
 }
 
@@ -631,6 +649,13 @@ func startRetentionJob(ctx context.Context, pool *pgxpool.Pool) {
 					`DELETE FROM soroban_events WHERE created_at < NOW() - ($1 || ' days')::INTERVAL AND ctid IN (
 						SELECT ctid FROM soroban_events WHERE created_at < NOW() - ($1 || ' days')::INTERVAL LIMIT 1000
 					)`},
+				// event_outbox additionally requires published = TRUE: an
+				// unpublished row must never be deleted regardless of age,
+				// since the relay has not yet delivered it (issue #604).
+				{"event_outbox", cfg.EventOutboxDays,
+					`DELETE FROM event_outbox WHERE published = TRUE AND published_at < NOW() - ($1 || ' days')::INTERVAL AND ctid IN (
+						SELECT ctid FROM event_outbox WHERE published = TRUE AND published_at < NOW() - ($1 || ' days')::INTERVAL LIMIT 1000
+					)`},
 			}
 
 			for _, t := range tables {
@@ -642,6 +667,9 @@ func startRetentionJob(ctx context.Context, pool *pgxpool.Pool) {
 					if err != nil {
 						slog.Warn("retention: cleanup failed", "table", t.name, "err", err)
 						break
+					}
+					if tag.RowsAffected() > 0 {
+						metrics.RetentionRowsDeletedTotal.WithLabelValues(t.name).Add(float64(tag.RowsAffected()))
 					}
 					if tag.RowsAffected() == 0 {
 						break

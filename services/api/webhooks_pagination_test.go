@@ -10,6 +10,8 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"github.com/Depo-dev/trident/services/api/middleware"
 )
 
 // connectWebhookTestDB mirrors handlers_test.connectRealTestDB (this is
@@ -37,8 +39,10 @@ func TestListWebhooksHandler_Pagination(t *testing.T) {
 	db := connectWebhookTestDB(t)
 	ctx := context.Background()
 
-	// resolveAPIKeyID trusts X-API-Key as a literal api_keys.id — create a
-	// real row so every request in this test resolves to the same key.
+	// resolveAPIKeyID reads api_key_id from context (populated by the real
+	// NewDBAuth middleware, which calling a handler's ServeHTTP directly
+	// bypasses) — see asTenant below. Create a real row so every request in
+	// this test resolves to the same key.
 	var apiKeyID string
 	if err := db.QueryRowContext(ctx,
 		`INSERT INTO api_keys (key_hash, key_prefix, label) VALUES ($1, $2, $3) RETURNING id`,
@@ -83,7 +87,7 @@ func TestListWebhooksHandler_Pagination(t *testing.T) {
 			url += "&cursor=" + cursorParam
 		}
 		req := httptest.NewRequest(http.MethodGet, url, nil)
-		req.Header.Set("X-API-Key", apiKeyID)
+		req = req.WithContext(middleware.WithAPIKeyID(req.Context(), apiKeyID))
 		rec := httptest.NewRecorder()
 		listWebhooksHandler(db).ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
@@ -161,9 +165,13 @@ func TestListWebhooksHandler_ScopedToOwnAPIKey(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/webhooks", nil)
-	req.Header.Set("X-API-Key", keyB)
+	req = req.WithContext(middleware.WithAPIKeyID(req.Context(), keyB))
 	rec := httptest.NewRecorder()
 	listWebhooksHandler(db).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body = %s", rec.Code, rec.Body.String())
+	}
 
 	var resp listWebhooksResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {

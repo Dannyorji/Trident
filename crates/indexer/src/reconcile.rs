@@ -707,6 +707,7 @@ mod tests {
                 pool_idle_timeout: std::time::Duration::from_secs(90),
                 pool_max_idle_per_host: 8,
                 tcp_keepalive: std::time::Duration::from_secs(60),
+                max_calls_per_sec: 50,
             },
         )
         .expect("rpc client");
@@ -827,6 +828,7 @@ mod tests {
                 pool_idle_timeout: std::time::Duration::from_secs(90),
                 pool_max_idle_per_host: 8,
                 tcp_keepalive: std::time::Duration::from_secs(60),
+                max_calls_per_sec: 50,
             },
         )
         .expect("rpc client");

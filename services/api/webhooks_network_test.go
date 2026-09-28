@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Depo-dev/trident/services/api/middleware"
 )
 
 // TestCreateWebhookHandler_RejectsUnknownNetwork guards against issue #252:
@@ -37,7 +39,7 @@ func TestCreateWebhookHandler_RejectsUnknownNetwork(t *testing.T) {
 
 	body := strings.NewReader(`{"contractId":"CCONTRACTX","targetUrl":"https://example.com/hook","network":"tesnet"}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/webhooks", body)
-	req.Header.Set("X-API-Key", apiKeyID)
+	req = req.WithContext(middleware.WithAPIKeyID(req.Context(), apiKeyID))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -82,7 +84,7 @@ func TestCreateWebhookHandler_AcceptsKnownNetwork(t *testing.T) {
 
 	body := strings.NewReader(`{"contractId":"CCONTRACTX","targetUrl":"https://example.com/hook","network":"mainnet"}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/webhooks", body)
-	req.Header.Set("X-API-Key", apiKeyID)
+	req = req.WithContext(middleware.WithAPIKeyID(req.Context(), apiKeyID))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 

@@ -120,6 +120,32 @@ malformed events.
 3. If it's a new, valid event shape, this is a parser bug — file/fix rather
    than treating it as transient.
 
+## TridentIndexerDeadLetteredEventsDetected
+
+**Means:** one or more events failed XDR decoding and were durably written to
+`parse_errors` (issue #414). `trident_indexer_dead_lettered_total` only
+increments once the dead-letter row is actually committed — after its own
+bounded retry — so this never fires for an event that was merely attempted
+and lost outright.
+
+**Why this threshold:** unlike the rate-based
+`TridentIndexerParseErrorRateHigh` alert, a healthy indexer keeps this
+counter flat, so any increase is worth a look. `> 0 over 1h, for 5m` catches
+every occurrence without paging on a single scrape.
+
+This is distinct from `TridentIndexerPersistDeadLetterBacklog`: that alert
+covers events which decoded fine but failed to *persist* into
+`soroban_events` (issue #208) and are captured in `failed_events` instead.
+This alert covers events that never decoded at all.
+
+**First steps:**
+1. Query `parse_errors` for the most recent rows and inspect `raw_payload` /
+   `error_message` for a common pattern.
+2. Check whether a Stellar protocol upgrade or RPC node version bump
+   coincides with the spike.
+3. If it's a new, valid event shape, this is a parser bug — file/fix rather
+   than treating it as transient.
+
 ## TridentIndexerUnexpectedScValVariant
 
 **Means:** an event payload contained an ScVal variant that no well-behaved
