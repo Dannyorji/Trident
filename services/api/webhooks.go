@@ -27,7 +27,9 @@ import (
 	"github.com/Depo-dev/trident/services/api/internal/metrics"
 	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/Depo-dev/trident/services/api/validation"
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -172,15 +174,61 @@ func verifyWebhookSignature(timestamp int64, body string, signature string, secr
 	return matched
 }
 
+// Default webhook pool size relative to the main pgxpool (defaultDBPoolSize
+// in main.go): the webhook pool serves CRUD, delivery recording, and the
+// worker rather than request-path reads, so it is sized smaller than the
+// primary pool rather than left unbounded (issue #644).
+const defaultWebhookDBPoolSize = 3
+const defaultWebhookDBPoolMaxIdleConns = 1
+const defaultWebhookDBPoolMaxConnLifetimeMS = 1_800_000 // 30 min, matches GO_API_DB_POOL_MAX_CONN_LIFETIME_MS default
+
 func newDB() (*sql.DB, error) {
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
 		return nil, errors.New("DATABASE_URL is not set")
 	}
-	db, err := sql.Open("pgx", dsn)
+
+	connConfig, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse DATABASE_URL: %w", err)
+	}
+
+	// Match the main pgxpool's statement_timeout/idle_in_transaction_session_timeout
+	// discipline (issue #238) so a stuck webhook query can't hold a connection
+	// indefinitely (issue #644). database/sql has no pool-level AfterConnect
+	// hook, but stdlib.RegisterConnConfig lets a driver name carry a
+	// pgx.ConnConfig with one, run once per new physical connection.
+	stmtTimeoutMS := envIntBounded("DB_STATEMENT_TIMEOUT_MS", defaultStatementTimeoutMS, statementTimeoutMinMS, statementTimeoutMaxMS)
+	idleTimeoutMS := envIntBounded("DB_IDLE_IN_TRANSACTION_TIMEOUT_MS", defaultIdleInTransactionTimeoutMS, statementTimeoutMinMS, statementTimeoutMaxMS)
+	connConfig.AfterConnect = func(ctx context.Context, conn *pgconn.PgConn) error {
+		if _, err := conn.Exec(ctx, fmt.Sprintf("SET statement_timeout = '%dms'", stmtTimeoutMS)).ReadAll(); err != nil {
+			return fmt.Errorf("set statement_timeout: %w", err)
+		}
+		if _, err := conn.Exec(ctx, fmt.Sprintf("SET idle_in_transaction_session_timeout = '%dms'", idleTimeoutMS)).ReadAll(); err != nil {
+			return fmt.Errorf("set idle_in_transaction_session_timeout: %w", err)
+		}
+		return nil
+	}
+
+	driverName := stdlib.RegisterConnConfig(connConfig)
+	db, err := sql.Open(driverName, "")
 	if err != nil {
 		return nil, err
 	}
+
+	// database/sql defaults to unlimited open connections and no idle/lifetime
+	// bound. Unlike main.go's pgxpool, this pool had never had explicit
+	// limits, so it could grow without bound under load and starve Postgres
+	// max_connections independently of the main pool's tuning (issue #644).
+	// Sized smaller than the main pool by default: this pool serves CRUD,
+	// delivery recording, and the worker, not request-path reads.
+	maxOpen := int(envInt32("WEBHOOK_DB_POOL_MAX_OPEN_CONNS", defaultWebhookDBPoolSize))
+	maxIdle := int(envInt32("WEBHOOK_DB_POOL_MAX_IDLE_CONNS", defaultWebhookDBPoolMaxIdleConns))
+	maxLifetime := envDurationMS("WEBHOOK_DB_POOL_MAX_CONN_LIFETIME_MS", defaultWebhookDBPoolMaxConnLifetimeMS)
+	db.SetMaxOpenConns(maxOpen)
+	db.SetMaxIdleConns(maxIdle)
+	db.SetConnMaxLifetime(maxLifetime)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
