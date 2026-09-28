@@ -173,8 +173,11 @@ const inFlightTTL = 60 * time.Second
 func idempotencyRedisKey(ctx context.Context, clientKey string) string {
 	tenant := APIKeyIDFromContext(ctx)
 	if tenant == "" {
-		// Admin-key and legacy env-var auth carry no per-key id. They share
-		// one namespace, kept distinct from any real tenant's.
+		// Admin-key auth carries no per-key id. Since issue #616, legacy
+		// env-var auth has its own tenant value (LegacyEnvKeyID) rather than
+		// landing here — kept distinct so two independently-configured
+		// legacy deployments sharing the same env-var hash don't collide
+		// with an admin-key caller's idempotency keys.
 		tenant = "unscoped"
 	}
 	sum := sha256.Sum256([]byte(tenant + "\x00" + clientKey))
