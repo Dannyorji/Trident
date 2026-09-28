@@ -255,6 +255,11 @@ func startWebhookWorker(ctx context.Context, db *sql.DB, redisClient *redis.Clie
 		consumerName = "webhook-worker"
 	}
 
+	// A routine restart mid-backoff must not silently drop a pending retry
+	// (issue #651) — resume anything left mid-backoff before picking up new
+	// stream entries.
+	resumePendingWebhookRetries(ctx, db)
+
 	go func() {
 		for {
 			entries, err := redisClient.XReadGroup(ctx, &redis.XReadGroupArgs{
@@ -471,7 +476,27 @@ func processWebhookEvent(ctx context.Context, db *sql.DB, redisClient *redis.Cli
 }
 
 func deliverSubscriptionWithRetry(ctx context.Context, db *sql.DB, sub webhookSubscription, event webhookEvent) error {
-	for attempt := 1; attempt <= maxWebhookAttempts; attempt++ {
+	return runDeliveryAttempts(ctx, db, sub, event, 1)
+}
+
+// resumeDeliveryRetry continues a delivery whose backoff was persisted by an
+// earlier attempt, starting at the given attempt number rather than 1. Used
+// by the restart-resume scan (issue #651) so a delivery that was mid-backoff
+// when the process restarted picks up where it left off instead of starting
+// the attempt count over.
+func resumeDeliveryRetry(ctx context.Context, db *sql.DB, sub webhookSubscription, event webhookEvent, fromAttempt int) error {
+	return runDeliveryAttempts(ctx, db, sub, event, fromAttempt)
+}
+
+func runDeliveryAttempts(ctx context.Context, db *sql.DB, sub webhookSubscription, event webhookEvent, fromAttempt int) error {
+	for attempt := fromAttempt; attempt <= maxWebhookAttempts; attempt++ {
+		// Record "attempted" before firing the HTTP call, so a crash
+		// mid-flight leaves a trace instead of bookkeeping silently out of
+		// sync with what actually happened at the receiver (issue #649).
+		if err := recordWebhookAttemptStarted(ctx, db, sub.ID, event.ID, attempt); err != nil {
+			slog.Warn("failed to record webhook delivery attempt start", "err", err)
+		}
+
 		start := time.Now()
 		result := performWebhookDelivery(ctx, sub, event)
 		durationMs := time.Since(start).Milliseconds()
@@ -484,7 +509,13 @@ func deliverSubscriptionWithRetry(ctx context.Context, db *sql.DB, sub webhookSu
 			status = "dead_lettered"
 		}
 
-		if err := recordWebhookDelivery(ctx, db, sub.ID, event.ID, attempt, status, result); err != nil {
+		var nextAttemptAt *time.Time
+		if !result.Success && !isLast {
+			at := time.Now().Add(time.Duration(1<<uint(attempt-1)) * time.Second)
+			nextAttemptAt = &at
+		}
+
+		if err := recordWebhookDelivery(ctx, db, sub.ID, event.ID, attempt, status, result, nextAttemptAt); err != nil {
 			slog.Warn("failed to record webhook delivery", "err", err)
 		}
 
@@ -509,6 +540,121 @@ func deliverSubscriptionWithRetry(ctx context.Context, db *sql.DB, sub webhookSu
 		}
 	}
 	return nil
+}
+
+// resumePendingWebhookRetries finds deliveries left mid-backoff by a process
+// restart (issue #651) — status 'failed', not dead-lettered, with a
+// next_attempt_at that has already elapsed — and resumes each one at its
+// next attempt number instead of leaving it stuck forever.
+func resumePendingWebhookRetries(ctx context.Context, db *sql.DB) {
+	if db == nil {
+		return
+	}
+	rows, err := db.QueryContext(ctx, `
+		SELECT wd.subscription_id, wd.event_id, wd.attempt
+		FROM webhook_deliveries wd
+		WHERE wd.status = 'failed'
+		  AND wd.next_attempt_at IS NOT NULL
+		  AND wd.next_attempt_at <= NOW()
+		  AND wd.id = (
+		      SELECT MAX(id) FROM webhook_deliveries
+		      WHERE subscription_id = wd.subscription_id AND event_id = wd.event_id
+		  )
+	`)
+	if err != nil {
+		slog.Warn("failed to query pending webhook retries", "err", err)
+		return
+	}
+	defer func() { _ = rows.Close() }()
+
+	type pending struct {
+		subscriptionID string
+		eventID        string
+		lastAttempt    int
+	}
+	var toResume []pending
+	for rows.Next() {
+		var p pending
+		if err := rows.Scan(&p.subscriptionID, &p.eventID, &p.lastAttempt); err != nil {
+			slog.Warn("failed to scan pending webhook retry", "err", err)
+			continue
+		}
+		toResume = append(toResume, p)
+	}
+	if err := rows.Err(); err != nil {
+		slog.Warn("failed to read pending webhook retries", "err", err)
+		return
+	}
+
+	for _, p := range toResume {
+		sub, event, err := loadSubscriptionAndEventForRetry(ctx, db, p.subscriptionID, p.eventID)
+		if err != nil {
+			slog.Warn("failed to load subscription/event for pending webhook retry",
+				"subscription_id", p.subscriptionID, "event_id", p.eventID, "err", err)
+			continue
+		}
+		go func(sub webhookSubscription, event webhookEvent, nextAttempt int) {
+			if err := resumeDeliveryRetry(ctx, db, sub, event, nextAttempt); err != nil {
+				slog.Warn("resumed webhook delivery failed", "subscription_id", sub.ID, "event_id", event.ID, "err", err)
+			}
+		}(sub, event, p.lastAttempt+1)
+	}
+}
+
+func loadSubscriptionAndEventForRetry(ctx context.Context, db *sql.DB, subscriptionID, eventID string) (webhookSubscription, webhookEvent, error) {
+	var sub webhookSubscription
+	var topic0 sql.NullString
+	var pausedAt sql.NullTime
+	var secondarySecret sql.NullString
+	err := db.QueryRowContext(ctx, `
+		SELECT id, api_key_id, contract_id, topic0, target_url, secret, secondary_secret, created_at, paused_at, network
+		FROM webhook_subscriptions WHERE id = $1
+	`, subscriptionID).Scan(&sub.ID, &sub.APIKeyID, &sub.ContractID, &topic0, &sub.TargetURL, &sub.Secret, &secondarySecret, &sub.CreatedAt, &pausedAt, &sub.Network)
+	if err != nil {
+		return webhookSubscription{}, webhookEvent{}, err
+	}
+	if topic0.Valid {
+		sub.Topic0 = &topic0.String
+	}
+	if pausedAt.Valid {
+		sub.PausedAt = &pausedAt.Time
+	}
+	if secondarySecret.Valid {
+		sub.SecondarySecret = &secondarySecret.String
+	}
+
+	event, err := loadSorobanEventByID(ctx, db, eventID)
+	if err != nil {
+		return webhookSubscription{}, webhookEvent{}, err
+	}
+	return sub, event, nil
+}
+
+// loadSorobanEventByID loads a soroban_events row for webhook replay/resume.
+// soroban_events has no `topic0` column — the generated column is
+// `topic_0` — and `data` is jsonb, not text; querying the wrong name/shape
+// here previously errored on every call, which the replay handler's now
+// removed silent fallback masked (issue #652).
+func loadSorobanEventByID(ctx context.Context, db *sql.DB, eventID string) (webhookEvent, error) {
+	var event webhookEvent
+	var topic0 sql.NullString
+	var data []byte
+	err := db.QueryRowContext(ctx, `
+		SELECT id, contract_id, ledger_sequence, topic_0, data, transaction_hash, network
+		FROM soroban_events WHERE id = $1
+	`, eventID).Scan(&event.ID, &event.ContractID, &event.LedgerSequence, &topic0, &data, &event.TransactionHash, &event.Network)
+	if err != nil {
+		return webhookEvent{}, err
+	}
+	if topic0.Valid {
+		event.Topic0 = topic0.String
+	}
+	if len(data) > 0 {
+		if err := json.Unmarshal(data, &event.Data); err != nil {
+			return webhookEvent{}, fmt.Errorf("unmarshal event data: %w", err)
+		}
+	}
+	return event, nil
 }
 
 func performWebhookDelivery(ctx context.Context, sub webhookSubscription, event webhookEvent) webhookDeliveryResult {
@@ -576,7 +722,33 @@ func buildWebhookPayload(subscriptionID string, event webhookEvent, timestamp in
 	return json.Marshal(payload)
 }
 
-func recordWebhookDelivery(ctx context.Context, db *sql.DB, subscriptionID string, eventID string, attempt int, status string, result webhookDeliveryResult) error {
+// recordWebhookAttemptStarted inserts a placeholder row for this delivery
+// attempt before the HTTP call fires, so a crash mid-flight is detectable
+// (issue #649) — a row with no completion recorded means the attempt started
+// and its outcome is unknown, rather than looking identical to an attempt
+// that never happened. The unique (subscription_id, event_id, attempt)
+// index makes this a no-op if the row already exists, e.g. on retry-resume
+// after a restart finds a row this same process already started.
+func recordWebhookAttemptStarted(ctx context.Context, db *sql.DB, subscriptionID string, eventID string, attempt int) error {
+	if db == nil {
+		return nil
+	}
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO webhook_deliveries (subscription_id, event_id, attempt, attempts, status, success)
+		VALUES ($1, $2, $3, $3, 'pending', false)
+		ON CONFLICT (subscription_id, event_id, attempt) DO NOTHING
+	`, subscriptionID, eventID, attempt)
+	return err
+}
+
+// recordWebhookDelivery records the outcome of a delivery attempt.
+// ON CONFLICT updates the placeholder row recordWebhookAttemptStarted
+// inserted for this attempt, rather than inserting a second row — the
+// unique (subscription_id, event_id, attempt) index (issue #649) makes a
+// duplicate delivery record for the same attempt impossible at the database
+// level. next_attempt_at persists when the next retry is due so a restart
+// mid-backoff can find and resume it (issue #651).
+func recordWebhookDelivery(ctx context.Context, db *sql.DB, subscriptionID string, eventID string, attempt int, status string, result webhookDeliveryResult, nextAttemptAt *time.Time) error {
 	if db == nil {
 		return nil
 	}
@@ -585,9 +757,16 @@ func recordWebhookDelivery(ctx context.Context, db *sql.DB, subscriptionID strin
 		statusCode = &result.StatusCode
 	}
 	_, err := db.ExecContext(ctx, `
-		INSERT INTO webhook_deliveries (subscription_id, event_id, attempt, attempts, status, status_code, response_body, success)
-		VALUES ($1, $2, $3, $3, $4, $5, $6, $7)
-	`, subscriptionID, eventID, attempt, status, statusCode, truncateString(result.ResponseBody, 500), result.Success)
+		INSERT INTO webhook_deliveries (subscription_id, event_id, attempt, attempts, status, status_code, response_body, success, next_attempt_at)
+		VALUES ($1, $2, $3, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (subscription_id, event_id, attempt) DO UPDATE SET
+			status = EXCLUDED.status,
+			status_code = EXCLUDED.status_code,
+			response_body = EXCLUDED.response_body,
+			success = EXCLUDED.success,
+			next_attempt_at = EXCLUDED.next_attempt_at,
+			delivered_at = NOW()
+	`, subscriptionID, eventID, attempt, status, statusCode, truncateString(result.ResponseBody, 500), result.Success, nextAttemptAt)
 	return err
 }
 
@@ -1168,15 +1347,18 @@ func replayDeadLetterHandler(db *sql.DB) http.HandlerFunc {
 			return
 		}
 
-		// Load the original event.
-		var event webhookEvent
-		err = db.QueryRowContext(r.Context(), `
-			SELECT id, contract_id, ledger_sequence, topic0, data::text, transaction_hash, network
-			FROM soroban_events WHERE id = $1
-		`, eventID).Scan(&event.ID, &event.ContractID, &event.LedgerSequence, &event.Topic0, &event.TransactionHash, &event.TransactionHash, &event.Network)
+		// Load the original event. A replay must not proceed on a
+		// zero-valued stand-in — that would deliver corrupted payload data
+		// to the subscriber under a valid signature (issue #652).
+		event, err := loadSorobanEventByID(r.Context(), db, eventID)
+		if errors.Is(err, sql.ErrNoRows) {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusNotFound, httputil.NOT_FOUND, "original event not found; cannot replay")
+			return
+		}
 		if err != nil {
-			// If event can't be loaded, synthesise a minimal one for replay.
-			event.ID = eventID
+			slog.Error("webhook handler error", "err", err)
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to load original event for replay")
+			return
 		}
 
 		start := time.Now()
@@ -1186,6 +1368,8 @@ func replayDeadLetterHandler(db *sql.DB) http.HandlerFunc {
 		if result.Success {
 			status = "success"
 		}
+		replayAttempt := prevAttempts + 1
+		if err := recordWebhookDelivery(r.Context(), db, subID, eventID, replayAttempt, status, result, nil); err != nil {
 		if err := recordWebhookDelivery(r.Context(), db, subID, eventID, replayAttempt, status, result); err != nil {
 			slog.Warn("failed to record replay delivery", "err", err)
 		}

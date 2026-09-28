@@ -6,7 +6,6 @@ import (
 
 	"github.com/Depo-dev/trident/services/api/cursor"
 	"github.com/Depo-dev/trident/services/api/gen"
-	"github.com/Depo-dev/trident/services/api/grpcclient"
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
 	"github.com/Depo-dev/trident/services/api/validation"
 	"github.com/Depo-dev/trident/services/api/ws"
@@ -72,9 +71,7 @@ func (b *GraphQLBackend) ListEvents(ctx context.Context, req ws.EventsQuery) (ws
 		grpcReq.LedgerTo = uint64(*req.LedgerTo)
 	}
 
-	resp, err := grpcclient.CallWithRetry(ctx, 2, func(ctx context.Context) (*gen.ListEventsResponse, error) {
-		return eventsClient.ListEvents(ctx, grpcReq)
-	})
+	resp, err := eventsClient.ListEvents(ctx, grpcReq)
 	if err != nil {
 		return ws.EventsPage{}, grpcToBackendError(err, "failed to fetch events")
 	}
@@ -101,9 +98,7 @@ func (b *GraphQLBackend) GetEvent(ctx context.Context, id, network string) (map[
 		return nil, ws.NewBackendError(httputil.UNAVAILABLE, "gRPC backend unavailable")
 	}
 
-	event, err := grpcclient.CallWithRetry(ctx, 2, func(ctx context.Context) (*gen.Event, error) {
-		return eventsClient.GetEvent(ctx, &gen.GetEventRequest{Id: id, Network: network})
-	})
+	event, err := eventsClient.GetEvent(ctx, &gen.GetEventRequest{Id: id, Network: network})
 	if err != nil {
 		// As in GetEvent: only a real 404 may present as "not found". A
 		// timeout or backend outage must not masquerade as a missing event

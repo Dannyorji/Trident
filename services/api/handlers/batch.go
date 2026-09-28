@@ -9,7 +9,6 @@ import (
 	"sync"
 
 	"github.com/Depo-dev/trident/services/api/gen"
-	"github.com/Depo-dev/trident/services/api/grpcclient"
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
 	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/Depo-dev/trident/services/api/validation"
@@ -131,6 +130,7 @@ func BatchGetEvents(w http.ResponseWriter, r *http.Request) {
 		batchGlobalSem <- struct{}{}
 		go func(i int, id string) {
 			defer wg.Done()
+			event, err := eventsClient.GetEvent(ctx, &gen.GetEventRequest{Id: id, Network: network})
 			defer func() { <-localSem }()
 			defer func() { <-batchGlobalSem }()
 			event, err := grpcclient.CallWithRetry(ctx, 1, func(ctx context.Context) (*gen.Event, error) {
