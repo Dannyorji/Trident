@@ -1267,6 +1267,38 @@ pub fn assert_no_default_partition_overflow(
     Ok(())
 }
 
+/// Read the current row count of `soroban_events_default` (issue #605), via
+/// the `soroban_events_default_partition_status` view (migration 0034).
+///
+/// Non-zero means `create_soroban_partition` will refuse to create any
+/// partition whose range overlaps these rows — see
+/// docs/db/default-partition-recovery.md for what to do about it. Returns
+/// `Ok(None)` rather than an error on a database that hasn't run migration
+/// 0034 yet (view does not exist): this is a monitoring signal, not a
+/// prerequisite for indexing, so its own absence should not fail the poll
+/// cycle it is checked from.
+pub async fn default_partition_row_count(pool: &PgPool) -> Result<Option<i64>, TridentError> {
+    let result: Result<(i64,), sqlx::Error> =
+        sqlx::query_as("SELECT row_count FROM soroban_events_default_partition_status")
+            .fetch_one(pool)
+            .await;
+
+    match result {
+        Ok((count,)) => Ok(Some(count)),
+        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("42P01") => {
+            // undefined_table: migration 0034 has not run on this database yet.
+            tracing::debug!(
+                "soroban_events_default_partition_status view not found (migration 0034 not applied); \
+                 skipping DEFAULT-partition check this cycle"
+            );
+            Ok(None)
+        }
+        Err(e) => Err(TridentError::storage(
+            anyhow::Error::new(e).context("default_partition_row_count"),
+        )),
+    }
+}
+
 /// Read alert state (last_alert_at, alert_fired) from system_state for
 /// `network` (issue #75). Shares the per-network cursor row (issue #600) so
 /// each network's lag-alert state is independent too.
@@ -1286,6 +1318,12 @@ pub async fn get_alert_state(
         alert_fired: row.1,
         rpc_degraded_fired: false,
         rpc_degraded_last_alert_at: None,
+        // Not persisted, same as rpc_degraded_* above (issue #605): re-derived
+        // fresh from soroban_events_default_partition_status every poll cycle
+        // by the caller, via default_partition_row_count, rather than round
+        // tripping through system_state.
+        default_partition_fired: false,
+        default_partition_last_alert_at: None,
     })
 }
 

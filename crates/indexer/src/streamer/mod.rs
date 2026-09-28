@@ -1288,12 +1288,29 @@ impl Streamer {
         if self.alerter.is_enabled() {
             match db::get_alert_state(&self.db, &self.config.network).await {
                 Ok(mut alert_state) => {
+                    // issue #605: checked on the same cadence as lag/RPC-degraded.
+                    // A query failure (other than the view being absent, which
+                    // default_partition_row_count itself already turns into
+                    // Ok(None)) must not abort alerting for the checks above —
+                    // logged and treated as "no signal this cycle".
+                    let default_partition_row_count =
+                        match db::default_partition_row_count(&self.db).await {
+                            Ok(count) => count,
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "Failed to read soroban_events_default row count"
+                                );
+                                None
+                            }
+                        };
                     let ctx = AlertContext {
                         last_ledger_indexed: *cursor,
                         chain_tip_ledger: self.last_chain_tip,
                         lag_threshold: self.config.alert_lag_threshold,
                         network: self.config.network.clone(),
                         rpc_all_degraded: self.rpc.health_scorer().all_degraded(),
+                        default_partition_row_count,
                     };
                     self.alerter.evaluate(&ctx, &mut alert_state).await;
                     if let Err(e) =

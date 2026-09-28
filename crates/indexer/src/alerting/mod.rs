@@ -55,6 +55,15 @@ pub struct AlertContext {
     pub network: String,
     /// Whether all RPC endpoints are critically degraded (score < 20).
     pub rpc_all_degraded: bool,
+    /// Row count from `soroban_events_default_partition_status` (migration
+    /// 0034, issue #605). Non-zero means rows have landed in the DEFAULT
+    /// catch-all partition of `soroban_events` — see
+    /// docs/db/default-partition-recovery.md for what that means and how to
+    /// recover. `None` when the check itself failed (e.g. the view is
+    /// missing on a database that hasn't run migration 0034 yet); treated
+    /// the same as `Some(0)` — no alert — since a failed check should not
+    /// itself page anyone, only be logged.
+    pub default_partition_row_count: Option<i64>,
 }
 
 /// Persistent alert state read from / written to `system_state`.
@@ -65,6 +74,9 @@ pub struct AlertState {
     /// State for RPC all-degraded alert.
     pub rpc_degraded_fired: bool,
     pub rpc_degraded_last_alert_at: Option<chrono::DateTime<Utc>>,
+    /// State for the DEFAULT-partition-occupied alert (issue #605).
+    pub default_partition_fired: bool,
+    pub default_partition_last_alert_at: Option<chrono::DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -103,6 +115,18 @@ pub(crate) struct RpcDegradedPayload {
     text: String,
 }
 
+#[derive(Debug, Serialize)]
+pub(crate) struct DefaultPartitionPayload {
+    alert: &'static str,
+    severity: String,
+    indexer: &'static str,
+    network: String,
+    row_count: i64,
+    timestamp: String,
+    message: String,
+    text: String,
+}
+
 /// Pluggable alert sink abstraction. Each implementation knows how to format
 /// and POST an alert to a specific backend.
 #[async_trait::async_trait]
@@ -119,6 +143,14 @@ pub trait AlertSink: Send + Sync {
         client: &Client,
         url: &str,
         payload: &RpcDegradedPayload,
+    ) -> bool;
+
+    /// Post a DEFAULT-partition-occupied payload (issue #605).
+    async fn post_default_partition(
+        &self,
+        client: &Client,
+        url: &str,
+        payload: &DefaultPartitionPayload,
     ) -> bool;
 }
 
@@ -140,6 +172,15 @@ impl AlertSink for GenericWebhook {
         client: &Client,
         url: &str,
         payload: &RpcDegradedPayload,
+    ) -> bool {
+        post_json_with_retry(client, url, payload).await
+    }
+
+    async fn post_default_partition(
+        &self,
+        client: &Client,
+        url: &str,
+        payload: &DefaultPartitionPayload,
     ) -> bool {
         post_json_with_retry(client, url, payload).await
     }
@@ -233,6 +274,47 @@ impl AlertSink for SlackWebhook {
                     "*{}* {} - All RPC endpoints critically degraded (health score < 20)\n{}",
                     payload.alert.to_uppercase(),
                     payload.network,
+                    payload.message
+                ),
+            }),
+        }];
+
+        let slack = SlackPayload {
+            text: payload.text.clone(),
+            blocks,
+        };
+
+        post_json_with_retry(client, url, &slack).await
+    }
+
+    async fn post_default_partition(
+        &self,
+        client: &Client,
+        url: &str,
+        payload: &DefaultPartitionPayload,
+    ) -> bool {
+        #[derive(Serialize)]
+        struct SlackBlock {
+            #[serde(rename = "type")]
+            kind: &'static str,
+            text: serde_json::Value,
+        }
+
+        #[derive(Serialize)]
+        struct SlackPayload {
+            text: String,
+            blocks: Vec<SlackBlock>,
+        }
+
+        let blocks = vec![SlackBlock {
+            kind: "section",
+            text: serde_json::json!({
+                "type": "mrkdwn",
+                "text": format!(
+                    "*{}* {} - {} row(s) in soroban_events_default\n{}",
+                    payload.alert.to_uppercase(),
+                    payload.network,
+                    payload.row_count,
                     payload.message
                 ),
             }),
@@ -376,6 +458,51 @@ impl AlertSink for PagerDuty {
 
         post_json_with_retry(client, url, &pd).await
     }
+
+    async fn post_default_partition(
+        &self,
+        client: &Client,
+        url: &str,
+        payload: &DefaultPartitionPayload,
+    ) -> bool {
+        #[derive(Serialize)]
+        struct PDEvent {
+            r#type: &'static str,
+            severity: String,
+            summary: String,
+            source: String,
+            timestamp: String,
+            custom_details: serde_json::Value,
+        }
+
+        #[derive(Serialize)]
+        struct PDPayload {
+            routing_key: String,
+            event_action: &'static str,
+            dedup_key: String,
+            payload: PDEvent,
+        }
+
+        let pd = PDPayload {
+            routing_key: self.routing_key.clone(),
+            event_action: "trigger",
+            dedup_key: format!("{}-{}-default-partition", payload.network, payload.indexer),
+            payload: PDEvent {
+                r#type: "alert",
+                severity: "critical".to_string(),
+                summary: payload.text.clone(),
+                source: payload.indexer.to_string(),
+                timestamp: payload.timestamp.clone(),
+                custom_details: serde_json::json!({
+                    "network": payload.network,
+                    "alert_type": "default_partition_occupied",
+                    "row_count": payload.row_count,
+                }),
+            },
+        };
+
+        post_json_with_retry(client, url, &pd).await
+    }
 }
 
 /// The alerting subsystem. Constructed once in `main` and passed to
@@ -469,6 +596,20 @@ impl Alerter {
             self.maybe_fire_rpc_degraded(ctx, state).await;
         } else {
             self.maybe_resolve_rpc_degraded(ctx, state).await;
+        }
+
+        // Check for rows in soroban_events_default (issue #605). A failed
+        // check (None) is treated as "no rows" for alerting purposes — see
+        // AlertContext::default_partition_row_count's doc comment — the
+        // failure itself is logged by the caller that ran the query, not
+        // re-logged here.
+        match ctx.default_partition_row_count {
+            Some(count) if count > 0 => {
+                self.maybe_fire_default_partition(ctx, state, count).await;
+            }
+            _ => {
+                self.maybe_resolve_default_partition(ctx, state).await;
+            }
         }
     }
 
@@ -654,6 +795,107 @@ impl Alerter {
             tracing::info!(network = %ctx.network, "RPC degraded recovery webhook fired");
         }
     }
+
+    /// Fire a DEFAULT-partition-occupied alert if outside the cooldown window
+    /// (issue #605). `row_count` is always > 0 here — the caller only reaches
+    /// this branch when `ctx.default_partition_row_count` is `Some(n)` with
+    /// `n > 0`.
+    async fn maybe_fire_default_partition(
+        &self,
+        ctx: &AlertContext,
+        state: &mut AlertState,
+        row_count: i64,
+    ) {
+        let now = Utc::now();
+
+        if let Some(last) = state.default_partition_last_alert_at {
+            let elapsed = (now - last).to_std().unwrap_or(Duration::ZERO);
+            if elapsed < self.cooldown {
+                tracing::debug!(
+                    row_count,
+                    cooldown_remaining_secs = (self.cooldown - elapsed).as_secs(),
+                    "DEFAULT-partition alert suppressed by cooldown"
+                );
+                return;
+            }
+        }
+
+        let timestamp = now.to_rfc3339();
+        let message = format!(
+            "{} row(s) have landed in soroban_events_default on {}. This blocks \
+             create_soroban_partition for any overlapping range. See \
+             docs/db/default-partition-recovery.md for the detach-move-reattach \
+             recovery procedure.",
+            row_count, ctx.network
+        );
+
+        let payload = DefaultPartitionPayload {
+            alert: "default_partition_occupied",
+            severity: Severity::Critical.as_str().to_string(),
+            indexer: "trident-indexer",
+            network: ctx.network.clone(),
+            row_count,
+            timestamp: timestamp.clone(),
+            message: message.clone(),
+            text: message,
+        };
+
+        let mut posted_any = false;
+        for (sink, url) in self.sinks.iter().zip(self.urls.iter()) {
+            let client = match &self.http {
+                Some(c) => c,
+                None => return,
+            };
+            if sink.post_default_partition(client, url, &payload).await {
+                posted_any = true;
+            }
+        }
+
+        if posted_any {
+            state.default_partition_last_alert_at = Some(now);
+            state.default_partition_fired = true;
+            tracing::info!(row_count, "DEFAULT-partition-occupied alert webhook fired");
+        }
+    }
+
+    /// Send a DEFAULT-partition recovery webhook if we previously fired an
+    /// alert (issue #605).
+    async fn maybe_resolve_default_partition(&self, ctx: &AlertContext, state: &mut AlertState) {
+        if !state.default_partition_fired {
+            return;
+        }
+
+        let timestamp = Utc::now().to_rfc3339();
+        let message = format!("soroban_events_default is empty again on {}.", ctx.network);
+
+        let payload = DefaultPartitionPayload {
+            alert: "default_partition_occupied_resolved",
+            severity: Severity::Info.as_str().to_string(),
+            indexer: "trident-indexer",
+            network: ctx.network.clone(),
+            row_count: 0,
+            timestamp,
+            message: message.clone(),
+            text: message,
+        };
+
+        let mut posted_any = false;
+        for (sink, url) in self.sinks.iter().zip(self.urls.iter()) {
+            let client = match &self.http {
+                Some(c) => c,
+                None => return,
+            };
+            if sink.post_default_partition(client, url, &payload).await {
+                posted_any = true;
+            }
+        }
+
+        if posted_any {
+            state.default_partition_fired = false;
+            state.default_partition_last_alert_at = None;
+            tracing::info!(network = %ctx.network, "DEFAULT-partition recovery webhook fired");
+        }
+    }
 }
 
 /// POST a JSON payload to the webhook URL.
@@ -719,6 +961,7 @@ mod tests {
             lag_threshold: threshold,
             network: "testnet".to_string(),
             rpc_all_degraded: false,
+            default_partition_row_count: Some(0),
         }
     }
 
@@ -763,8 +1006,7 @@ mod tests {
         let mut state = AlertState {
             last_alert_at: Some(Utc::now() - CDuration::minutes(5)),
             alert_fired: true,
-            rpc_degraded_fired: false,
-            rpc_degraded_last_alert_at: None,
+            ..Default::default()
         };
 
         // With a disabled alerter evaluate is a no-op; the guard is tested
@@ -784,8 +1026,7 @@ mod tests {
             // last alert was 31 minutes ago — cooldown expired
             last_alert_at: Some(Utc::now() - CDuration::minutes(31)),
             alert_fired: true,
-            rpc_degraded_fired: false,
-            rpc_degraded_last_alert_at: None,
+            ..Default::default()
         };
 
         // Disabled alerter: no HTTP call, but cooldown check would pass.
@@ -802,8 +1043,7 @@ mod tests {
         let mut state = AlertState {
             last_alert_at: None,
             alert_fired: false,
-            rpc_degraded_fired: false,
-            rpc_degraded_last_alert_at: None,
+            ..Default::default()
         };
 
         a.evaluate(&ctx, &mut state).await;
@@ -862,8 +1102,7 @@ mod tests {
         let mut state = AlertState {
             last_alert_at: Some(Utc::now() - CDuration::minutes(35)),
             alert_fired: true, // a previous alert was fired
-            rpc_degraded_fired: false,
-            rpc_degraded_last_alert_at: None,
+            ..Default::default()
         };
 
         alerter.evaluate(&ctx, &mut state).await;
@@ -922,12 +1161,147 @@ mod tests {
         let mut state = AlertState {
             last_alert_at: Some(Utc::now() - CDuration::minutes(5)),
             alert_fired: true,
-            rpc_degraded_fired: false,
-            rpc_degraded_last_alert_at: None,
+            ..Default::default()
         };
 
         alerter.evaluate(&ctx, &mut state).await;
 
         server.verify().await;
+    }
+
+    // ── DEFAULT-partition-occupied alert (issue #605) ──────────────────────
+
+    #[tokio::test]
+    async fn default_partition_alert_fires_when_rows_present() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/webhook"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/webhook", server.uri());
+        let alerter = make_alerter(Some(&url), 200, 30);
+        let mut ctx = make_ctx(999_990, 1_000_000, 200); // lag = 10, well under threshold
+        ctx.default_partition_row_count = Some(7);
+        let mut state = AlertState::default();
+
+        alerter.evaluate(&ctx, &mut state).await;
+
+        server.verify().await;
+        assert!(
+            state.default_partition_fired,
+            "default_partition_fired should be set after webhook"
+        );
+        assert!(state.default_partition_last_alert_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn default_partition_alert_does_not_fire_when_zero() {
+        let server = wiremock::MockServer::start().await;
+
+        // Expect exactly 0 calls: row_count = 0 must never fire.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/webhook"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/webhook", server.uri());
+        let alerter = make_alerter(Some(&url), 200, 30);
+        let ctx = make_ctx(999_990, 1_000_000, 200); // lag = 10; default_partition_row_count: Some(0)
+        let mut state = AlertState::default();
+
+        alerter.evaluate(&ctx, &mut state).await;
+
+        server.verify().await;
+        assert!(!state.default_partition_fired);
+    }
+
+    #[tokio::test]
+    async fn default_partition_alert_does_not_fire_on_failed_check() {
+        let server = wiremock::MockServer::start().await;
+
+        // A failed check (None) must not page anyone — see
+        // AlertContext::default_partition_row_count's doc comment.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/webhook"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/webhook", server.uri());
+        let alerter = make_alerter(Some(&url), 200, 30);
+        let mut ctx = make_ctx(999_990, 1_000_000, 200); // lag = 10, well under threshold
+        ctx.default_partition_row_count = None;
+        let mut state = AlertState::default();
+
+        alerter.evaluate(&ctx, &mut state).await;
+
+        server.verify().await;
+        assert!(!state.default_partition_fired);
+    }
+
+    #[tokio::test]
+    async fn default_partition_alert_cooldown_suppresses_second_fire() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/webhook"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/webhook", server.uri());
+        let alerter = make_alerter(Some(&url), 200, 30);
+        let mut ctx = make_ctx(999_990, 1_000_000, 200); // lag = 10, well under threshold
+        ctx.default_partition_row_count = Some(3);
+
+        // Already fired 5 minutes ago — within the 30-minute cooldown.
+        let mut state = AlertState {
+            default_partition_fired: true,
+            default_partition_last_alert_at: Some(Utc::now() - CDuration::minutes(5)),
+            ..Default::default()
+        };
+
+        alerter.evaluate(&ctx, &mut state).await;
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn default_partition_recovery_webhook_fires_when_rows_clear() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/webhook"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/webhook", server.uri());
+        let alerter = make_alerter(Some(&url), 200, 30);
+        // Rows have cleared: back to Some(0). lag = 10, well under threshold.
+        let ctx = make_ctx(999_990, 1_000_000, 200);
+        let mut state = AlertState {
+            default_partition_fired: true, // a previous alert was fired
+            default_partition_last_alert_at: Some(Utc::now() - CDuration::minutes(35)),
+            ..Default::default()
+        };
+
+        alerter.evaluate(&ctx, &mut state).await;
+
+        server.verify().await;
+        assert!(
+            !state.default_partition_fired,
+            "default_partition_fired should be cleared after recovery"
+        );
+        assert!(state.default_partition_last_alert_at.is_none());
     }
 }
