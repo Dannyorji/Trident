@@ -45,7 +45,7 @@ spec:
         {{- include "trident.podSecurityContext" (dict "uid" .Values.indexer.securityContextUid) | nindent 8 }}
       containers:
         - name: indexer
-          image: "{{ .Values.indexer.image.repository }}:{{ .Values.indexer.image.tag }}"
+          image: "{{ .Values.indexer.image.repository }}:{{ .Values.indexer.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           securityContext:
             {{- include "trident.containerSecurityContext" . | nindent 12 }}

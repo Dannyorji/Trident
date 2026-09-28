@@ -441,6 +441,18 @@ jobs:
       - name: Validate observability/rpc-alerts.yml
         run: ./promtool check rules observability/rpc-alerts.yml
 
+      # Issue #618: promtool above validates rule syntax only, not whether
+      # runbook_url annotations are present or point at a real doc section.
+      # Eight alerts shipped with the annotation silently absent even though
+      # their runbook sections already existed unlinked.
+      - name: Check alert runbook_url annotations resolve
+        run: |
+          python3 -m pip install --quiet pyyaml
+          bash scripts/check-runbook-urls.sh
+
+      - name: Test check-runbook-urls.sh detection logic
+        run: bash scripts/test-check-runbook-urls.sh
+
       - name: Download amtool
         run: |
           AM_VERSION="0.27.0"

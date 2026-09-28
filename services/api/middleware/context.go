@@ -9,6 +9,22 @@ const (
 	contextKeyNetwork  contextKey = "network"
 )
 
+// LegacyEnvKeyID is the sentinel APIKeyIDFromContext value attached to a
+// request authenticated via the legacy API_KEY_HASHES env-var path (issue
+// #616). It is deliberately not a UUID: legacy env-var keys have no row in
+// api_keys, so there is nothing for a real key id to reference. Callers that
+// key behaviour off "is this a DB-backed key" (audit_log.api_key_id,
+// per-key usage rollups) must check for this sentinel before treating
+// APIKeyIDFromContext's return value as a parseable UUID.
+const LegacyEnvKeyID = "legacy-env-key"
+
+// LegacyEnvNetwork is the network attached to a request authenticated via
+// the legacy env-var path. Legacy keys carry no network of their own, so
+// this makes the fallback an explicit, named decision on the auth path
+// instead of NetworkFromContext's implicit default kicking in silently
+// several layers downstream (issue #616).
+const LegacyEnvNetwork = "testnet"
+
 // APIKeyIDFromContext returns the authenticated API key UUID, or empty string
 // when the request was authenticated via the legacy env-var path.
 func APIKeyIDFromContext(ctx context.Context) string {

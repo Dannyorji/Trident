@@ -28,6 +28,16 @@ satisfied. Run it locally before any go/no-go call; see the script's header
 comment for what it deliberately does not check (truthfulness of the Evidence
 text, and open P1/P2 incidents — both still require a human).
 
+Row 1 (alerts verified firing) and row 8 (on-call schedule confirmed) have
+their own dedicated mechanical check, `scripts/check-oncall-readiness.sh`
+(issue #620), which fails while
+[`incident-response.md`'s on-call contacts](./runbooks/incident-response.md#on-call-owner--launch-week)
+or [`alert-routing.md`'s PagerDuty/Slack keys and pre-launch routing test
+table](./runbooks/alert-routing.md#pre-launch-routing-test) are still the
+unexecuted template — the same "not yet done" state this checklist's rows 1
+and 8 already report as blocking, made checkable at the document level
+instead of only at the summary-table level.
+
 | # | Gate | Pass/Fail | Evidence | Signed off by |
 |---|------|-----------|----------|----------------|
 | 1 | Alerts verified firing (trigger each alert deliberately, confirm on-call receives it) | | | |

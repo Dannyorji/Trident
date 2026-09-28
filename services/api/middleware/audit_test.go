@@ -194,17 +194,24 @@ func TestAuditContextFunctions(t *testing.T) {
 	if n := AuditNetworkFromContext(ctx); n != "" {
 		t.Error("expected empty network from empty context")
 	}
+	if s := AuditAuthSourceFromContext(ctx); s != "" {
+		t.Error("expected empty auth source from empty context")
+	}
 
 	// Set and retrieve
 	id := uuid.New()
 	ctx = WithAuditAPIKeyID(ctx, &id)
 	ctx = WithAuditNetwork(ctx, "testnet")
+	ctx = WithAuditAuthSource(ctx, "legacy-env")
 
 	if got := AuditAPIKeyIDFromContext(ctx); got == nil || *got != id {
 		t.Errorf("API key ID mismatch: got %v, want %v", got, id)
 	}
 	if got := AuditNetworkFromContext(ctx); got != "testnet" {
 		t.Errorf("network mismatch: got %q, want %q", got, "testnet")
+	}
+	if got := AuditAuthSourceFromContext(ctx); got != "legacy-env" {
+		t.Errorf("auth source mismatch: got %q, want %q", got, "legacy-env")
 	}
 }
 

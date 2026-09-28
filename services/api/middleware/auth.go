@@ -133,6 +133,34 @@ func withAuthenticatedKey(ctx context.Context, idStr, network string) context.Co
 	return ctx
 }
 
+// withLegacyAuthenticatedKey attaches identity, network and audit
+// attribution to ctx for a request authenticated via the legacy
+// API_KEY_HASHES env-var path (issue #616).
+//
+// Before this, a request on this path reached the handler with none of the
+// above set: APIKeyIDFromContext returned "" (indistinguishable from "no
+// auth ran"), NetworkFromContext silently fell through to its "testnet"
+// default several layers downstream, and the audit_log row for the request
+// had a NULL api_key_id with nothing else on it to say why — unattributable
+// for billing, audit and incident response.
+//
+// This does not call withAuthenticatedKey: that helper assumes idStr may
+// parse as a UUID naming a real api_keys row (WithAuditAPIKeyID requires
+// one — audit_log.api_key_id has a foreign key to api_keys). A legacy
+// env-var key has no such row, so fabricating a UUID for it would either
+// violate that constraint or silently misattribute the request to an
+// unrelated real key. Instead this sets LegacyEnvKeyID, a sentinel that is
+// deliberately not a UUID, and records "legacy-env" as audit_log.auth_source
+// (added by migration 0035) as the attribution in api_key_id's place.
+func withLegacyAuthenticatedKey(ctx context.Context) context.Context {
+	ctx = WithAPIKeyID(ctx, LegacyEnvKeyID)
+	ctx = WithNetwork(ctx, LegacyEnvNetwork)
+	ctx = WithAuditNetwork(ctx, LegacyEnvNetwork)
+	ctx = WithAuditAuthSource(ctx, "legacy-env")
+	SetLogAPIKeyID(ctx, LegacyEnvKeyID)
+	return ctx
+}
+
 // NewDBAuth returns an authentication middleware that:
 //  1. Looks up the hashed API key in Redis cache (5 min TTL).
 //  2. Falls back to the api_keys database table (active keys only).
@@ -209,7 +237,8 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 			validHashes := ParseKeyHashes(os.Getenv("API_KEY_HASHES"))
 			if len(validHashes) > 0 {
 				if ConstantTimeContains(validHashes, hmacKeyHash(key)) {
-					next.ServeHTTP(w, r)
+					ctx := withLegacyAuthenticatedKey(r.Context())
+					next.ServeHTTP(w, r.WithContext(ctx))
 					return
 				}
 			}
