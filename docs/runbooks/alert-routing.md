@@ -156,6 +156,28 @@ ones re-notify every 30 minutes.
 
 ## Pre-launch routing test
 
+**Status: not yet executed (issue #620).** The on-call contacts below in
+[`incident-response.md`](incident-response.md), the PagerDuty/Slack keys in
+this file, and every row of the test table below are still the unexecuted
+template — no real device has ever received a page through this path.
+Filling them in with real values and actually running the five steps against
+real infrastructure and a real team is what turns this from a template into
+a completed test, the same distinction
+[`docs/LAUNCH_CHECKLIST.md`](../LAUNCH_CHECKLIST.md) draws for the rest of
+the launch gate. `scripts/check-oncall-readiness.sh` checks this
+mechanically — run it locally to confirm the current state:
+
+```bash
+scripts/check-oncall-readiness.sh
+```
+
+It exits non-zero while any of the placeholders below remain, and exits 0
+once the on-call contacts, the PagerDuty/Slack keys, and all five test rows
+are genuinely filled in. It is not yet wired into CI as a required check,
+for the same reason `check-launch-gate.sh` isn't either: doing so before
+this is real work would fail every PR on a gap this script can only report,
+not close.
+
 Run this checklist before launch week. The goal is to confirm that a real
 alert produces a real page on a real device — not just that the config file
 parses.
