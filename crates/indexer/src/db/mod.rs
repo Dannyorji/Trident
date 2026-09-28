@@ -135,12 +135,22 @@ pub fn classify_storage_failure(err: &TridentError) -> StorageFailure {
 // Using the DNS namespace is arbitrary; what matters is that it is fixed.
 const EVENT_NS: Uuid = Uuid::NAMESPACE_DNS;
 
-/// Derive a deterministic UUID for an event from its natural key.
-/// Using the same inputs will always produce the same UUID, so duplicate
-/// events produce the same (ledger_sequence, id) pair and the insert's
-/// `ON CONFLICT DO NOTHING` absorbs the replay.
-fn event_uuid(contract_id: &str, ledger_sequence: u64, event_index: u32) -> Uuid {
-    let key = format!("{contract_id}:{ledger_sequence}:{event_index}");
+/// Derive a deterministic UUID for an event from inputs that depend only on
+/// the event itself, not on how it was batched.
+///
+/// Deliberately keyed on `(transaction_hash, raw_event_index)`, NOT
+/// `(ledger_sequence, event_index)`: `event_index` is mutated by
+/// `assign_unique_event_indexes` to break ties within a batch, so its final
+/// value depends on batch composition and iteration order, not the event
+/// itself. The same protocol event re-indexed under a different page
+/// boundary previously got a different UUID and inserted as a duplicate row,
+/// since `ON CONFLICT DO NOTHING` only catches an exact id match (issue
+/// #599). `transaction_hash` is already globally unique on its own, and
+/// `raw_event_index` (the RPC-reported/derived position, fixed at parse
+/// time and never mutated) is stable across runs regardless of batching, so
+/// the pair is both unique and reproducible.
+fn event_uuid(transaction_hash: &str, raw_event_index: u32) -> Uuid {
+    let key = format!("{transaction_hash}:{raw_event_index}");
     Uuid::new_v5(&EVENT_NS, key.as_bytes())
 }
 
@@ -246,11 +256,8 @@ impl EventColumns {
                 TridentError::storage(anyhow::Error::new(e).context("topics serialise"))
             })?;
 
-            cols.ids.push(event_uuid(
-                &event.contract_id,
-                event.ledger_sequence,
-                event.event_index,
-            ));
+            cols.ids
+                .push(event_uuid(&event.transaction_hash, event.raw_event_index));
             cols.contract_ids.push(event.contract_id.clone());
             cols.ledger_sequences.push(event.ledger_sequence as i64);
             cols.ledger_timestamps.push(ledger_ts);
@@ -389,11 +396,7 @@ where
             TridentError::storage(anyhow::Error::new(e).context("ledger timestamp parse"))
         })?;
 
-        event_ids.push(event_uuid(
-            &event.contract_id,
-            event.ledger_sequence,
-            event.event_index,
-        ));
+        event_ids.push(event_uuid(&event.transaction_hash, event.raw_event_index));
         contract_ids.push(event.contract_id.clone());
         event_types.push(token.event_type.as_str().to_string());
         from_addresses.push(token.from.clone());
@@ -553,11 +556,7 @@ where
     let mut ids: Vec<Uuid> = Vec::with_capacity(events.len());
     let mut payloads: Vec<serde_json::Value> = Vec::with_capacity(events.len());
     for event in events {
-        ids.push(event_uuid(
-            &event.contract_id,
-            event.ledger_sequence,
-            event.event_index,
-        ));
+        ids.push(event_uuid(&event.transaction_hash, event.raw_event_index));
         payloads.push(serde_json::to_value(event).map_err(|e| {
             TridentError::storage(anyhow::Error::new(e).context("outbox payload serialise"))
         })?);
@@ -783,12 +782,14 @@ pub async fn commit_page(pool: &PgPool, commit: PageCommit<'_>) -> Result<(), Tr
         // the snapshot it started with.
         sqlx::query(
             r#"
-            UPDATE system_state
-            SET value = $1, updated_at = NOW()
-            WHERE key = 'latest_ledger_cursor'
-              AND (value ~ '^[0-9]+$' IS NOT TRUE OR value::numeric < $2)
+            INSERT INTO system_state (key, value)
+            VALUES ($1, $2)
+            ON CONFLICT (key) DO UPDATE
+            SET value = $2, updated_at = NOW()
+            WHERE system_state.value ~ '^[0-9]+$' IS NOT TRUE OR system_state.value::numeric < $3
             "#,
         )
+        .bind(cursor_key(commit.network))
         .bind(cursor.to_string())
         .bind(cursor as i64)
         .execute(&mut *tx)
@@ -976,13 +977,26 @@ pub async fn close_filled_backfill_jobs(
     Ok(result.rows_affected())
 }
 
-/// Read the latest processed ledger cursor from system_state.
-pub async fn get_cursor(pool: &PgPool) -> Result<u64, TridentError> {
-    let row: (String,) =
-        sqlx::query_as("SELECT value FROM system_state WHERE key = 'latest_ledger_cursor'")
-            .fetch_one(pool)
-            .await
-            .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("get_cursor")))?;
+/// The single global `'latest_ledger_cursor'` key made two indexers on
+/// different networks against the same database fight over one cursor row
+/// (issue #600): the monotonic advance guard in `commit_page` prevents the
+/// lower-sequence network's cursor from ever moving once the other network's
+/// cursor is ahead, silently stopping that network's indexing entirely.
+/// Namespacing the key per network gives each network its own row under the
+/// same `system_state` table and schema — migration 0033 copies the
+/// pre-existing single row's value into the namespaced key for whichever
+/// network the deployment was already running, so no position is lost.
+fn cursor_key(network: &str) -> String {
+    format!("latest_ledger_cursor:{network}")
+}
+
+/// Read the latest processed ledger cursor from system_state for `network`.
+pub async fn get_cursor(pool: &PgPool, network: &str) -> Result<u64, TridentError> {
+    let row: (String,) = sqlx::query_as("SELECT value FROM system_state WHERE key = $1")
+        .bind(cursor_key(network))
+        .fetch_one(pool)
+        .await
+        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("get_cursor")))?;
 
     row.0
         .parse::<u64>()
@@ -1019,6 +1033,7 @@ pub async fn get_recent_ledger_metadata(
 /// Atomically remove all indexed data from `from_sequence` onwards and rewind the cursor to `new_cursor` (issue #196).
 pub async fn handle_reorg_rollback(
     pool: &PgPool,
+    network: &str,
     from_sequence: u64,
     new_cursor: u64,
 ) -> Result<(), TridentError> {
@@ -1079,13 +1094,12 @@ pub async fn handle_reorg_rollback(
         })?;
 
     // Rewind cursor in system_state
-    sqlx::query(
-        "UPDATE system_state SET value = $1, updated_at = NOW() WHERE key = 'latest_ledger_cursor'",
-    )
-    .bind(new_cursor.to_string())
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("reorg rewind cursor")))?;
+    sqlx::query("UPDATE system_state SET value = $1, updated_at = NOW() WHERE key = $2")
+        .bind(new_cursor.to_string())
+        .bind(cursor_key(network))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("reorg rewind cursor")))?;
 
     tx.commit()
         .await
@@ -1101,6 +1115,7 @@ pub async fn handle_reorg_rollback(
 /// duplicate-key issue and the write is O(1) regardless of table size.
 pub async fn update_health_stats(
     pool: &PgPool,
+    network: &str,
     last_ledger: i64,
     events_in_poll: i32,
     poll_duration: Duration,
@@ -1117,12 +1132,13 @@ pub async fn update_health_stats(
             poll_duration_ms      = $3,
             events_indexed_total  = COALESCE(events_indexed_total, 0) + $2,
             updated_at            = NOW()
-        WHERE key = 'latest_ledger_cursor'
+        WHERE key = $4
         "#,
     )
     .bind(last_ledger)
     .bind(events_in_poll)
     .bind(poll_ms)
+    .bind(cursor_key(network))
     .execute(pool)
     .await
     .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("update_health_stats")))?;
@@ -1251,14 +1267,19 @@ pub fn assert_no_default_partition_overflow(
     Ok(())
 }
 
-/// Read alert state (last_alert_at, alert_fired) from system_state (issue #75).
-pub async fn get_alert_state(pool: &PgPool) -> Result<crate::alerting::AlertState, TridentError> {
-    let row: (Option<chrono::DateTime<chrono::Utc>>, bool) = sqlx::query_as(
-        "SELECT last_alert_at, alert_fired FROM system_state WHERE key = 'latest_ledger_cursor'",
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("get_alert_state")))?;
+/// Read alert state (last_alert_at, alert_fired) from system_state for
+/// `network` (issue #75). Shares the per-network cursor row (issue #600) so
+/// each network's lag-alert state is independent too.
+pub async fn get_alert_state(
+    pool: &PgPool,
+    network: &str,
+) -> Result<crate::alerting::AlertState, TridentError> {
+    let row: (Option<chrono::DateTime<chrono::Utc>>, bool) =
+        sqlx::query_as("SELECT last_alert_at, alert_fired FROM system_state WHERE key = $1")
+            .bind(cursor_key(network))
+            .fetch_one(pool)
+            .await
+            .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("get_alert_state")))?;
 
     Ok(crate::alerting::AlertState {
         last_alert_at: row.0,
@@ -1268,9 +1289,11 @@ pub async fn get_alert_state(pool: &PgPool) -> Result<crate::alerting::AlertStat
     })
 }
 
-/// Persist alert state back to system_state after an alerting evaluation (issue #75).
+/// Persist alert state back to system_state after an alerting evaluation for
+/// `network` (issue #75, issue #600).
 pub async fn set_alert_state(
     pool: &PgPool,
+    network: &str,
     state: &crate::alerting::AlertState,
 ) -> Result<(), TridentError> {
     sqlx::query(
@@ -1279,11 +1302,12 @@ pub async fn set_alert_state(
         SET last_alert_at = $1,
             alert_fired   = $2,
             updated_at    = NOW()
-        WHERE key = 'latest_ledger_cursor'
+        WHERE key = $3
         "#,
     )
     .bind(state.last_alert_at)
     .bind(state.alert_fired)
+    .bind(cursor_key(network))
     .execute(pool)
     .await
     .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("set_alert_state")))?;
@@ -1627,6 +1651,7 @@ mod tests {
             ledger_timestamp: "2024-01-01T00:00:00Z".to_string(),
             transaction_hash: "txhash_abc123".to_string(),
             event_index,
+            raw_event_index: event_index,
             event_type: EventType::Contract,
             topics: vec![],
             data: json!({}),
@@ -1687,17 +1712,35 @@ mod tests {
     /// Deterministic UUID: same inputs must produce the same id.
     #[test]
     fn event_uuid_is_deterministic() {
-        let a = event_uuid("CABC", 100, 0);
-        let b = event_uuid("CABC", 100, 0);
+        let a = event_uuid("txhash-aa", 0);
+        let b = event_uuid("txhash-aa", 0);
         assert_eq!(a, b);
     }
 
     /// Different natural keys must produce different UUIDs.
     #[test]
     fn event_uuid_varies_with_inputs() {
-        let a = event_uuid("CABC", 100, 0);
-        let b = event_uuid("CABC", 100, 1);
+        let a = event_uuid("txhash-aa", 0);
+        let b = event_uuid("txhash-aa", 1);
         assert_ne!(a, b);
+    }
+
+    /// #599 regression: event_uuid must be keyed on raw_event_index, not on
+    /// event_index. The same event re-indexed under a different batch (so
+    /// assign_unique_event_indexes ties-breaks it to a different event_index)
+    /// must still produce the same UUID, so ON CONFLICT DO NOTHING actually
+    /// absorbs the replay instead of inserting a duplicate row.
+    #[test]
+    fn event_uuid_is_stable_across_different_tie_broken_event_indexes() {
+        // Same transaction_hash and raw_event_index; only the batch-local,
+        // tie-broken event_index differs (as it would across two runs whose
+        // page boundaries land differently).
+        let first_run = event_uuid("txhash-aa", 0);
+        let second_run = event_uuid("txhash-aa", 0);
+        assert_eq!(
+            first_run, second_run,
+            "event_uuid must depend only on (transaction_hash, raw_event_index)"
+        );
     }
 
     /// Dead-lettering the same event twice must collapse to ONE pending row
@@ -1819,6 +1862,162 @@ mod tests {
                 .expect("count query failed");
 
         assert_eq!(count.0, 1, "duplicate insert should be silently ignored");
+    }
+
+    /// #599 regression: the same protocol event indexed twice under
+    /// different batch compositions (so `event_index` ties-break to
+    /// different values each time — simulated here directly, since
+    /// `assign_unique_event_indexes` lives in `crates::parser`) must still
+    /// produce the same `event_uuid` and collapse to one row via
+    /// `ON CONFLICT DO NOTHING`. Before the fix, `event_uuid` was derived
+    /// from the batch-local `event_index`, so this scenario inserted a
+    /// duplicate row instead.
+    #[tokio::test]
+    async fn reindexing_the_same_page_under_different_batch_boundaries_inserts_one_row() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        // A transaction_hash unique to this test run: make_event's fixture
+        // hash ("txhash_abc123") is shared across many other tests in this
+        // module, and event_uuid is deliberately keyed on
+        // (transaction_hash, raw_event_index) alone (issue #599) - reusing
+        // the shared fixture hash here would collide with an unrelated
+        // test's row using the same raw_event_index.
+        let tx_hash = format!("txhash_599_{}", Uuid::new_v4());
+        let contract_id = "CABC_CONTRACT_599";
+
+        // Same underlying event (same transaction_hash, same raw_event_index
+        // of 0), but as it would appear tie-broken to event_index = 0 in one
+        // batch's page boundary...
+        let mut first_run_event = make_event(contract_id, 42, 0);
+        first_run_event.transaction_hash = tx_hash.clone();
+        first_run_event.raw_event_index = 0;
+
+        // ...and tie-broken to event_index = 1 in a different run whose page
+        // boundary grouped it alongside a different, earlier event on the
+        // same (ledger, tx_hash) pair. raw_event_index is unaffected by
+        // tie-breaking, so it stays 0 in both runs.
+        let mut second_run_event = make_event(contract_id, 42, 1);
+        second_run_event.transaction_hash = tx_hash.clone();
+        second_run_event.raw_event_index = 0;
+
+        insert_events_batch(&pool, &[first_run_event])
+            .await
+            .expect("first run insert failed");
+        insert_events_batch(&pool, &[second_run_event])
+            .await
+            .expect("second run insert must not error");
+
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM soroban_events WHERE transaction_hash = $1")
+                .bind(&tx_hash)
+                .fetch_one(&pool)
+                .await
+                .expect("count query failed");
+
+        assert_eq!(
+            count.0, 1,
+            "the same event re-indexed under a different batch boundary must not duplicate"
+        );
+
+        sqlx::query("DELETE FROM soroban_events WHERE transaction_hash = $1")
+            .bind(&tx_hash)
+            .execute(&pool)
+            .await
+            .expect("cleanup failed");
+    }
+
+    /// #599: the `raw_event_index = 0` fallback (stellar-rpc#382 — neither
+    /// `operationIndex` nor a parseable `id` suffix) must still be stable
+    /// across batches, exactly like any other index value.
+    #[tokio::test]
+    async fn raw_event_index_zero_fallback_is_stable_across_batches() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let contract_id = "CABC_CONTRACT_599_FALLBACK";
+        // Unique transaction hashes for this test run — see the comment in
+        // reindexing_the_same_page_under_different_batch_boundaries_inserts_one_row
+        // on why the shared make_event fixture hash can't be reused here.
+        let tx_hash_a = format!("txhash_599fb_a_{}", Uuid::new_v4());
+        let tx_hash_b = format!("txhash_599fb_b_{}", Uuid::new_v4());
+
+        // Every event in the batch fell back to raw_event_index = 0 (the
+        // stellar-rpc#382 condition), forcing assign_unique_event_indexes to
+        // tie-break the whole batch — event_index ends up 0, 1, 2, ... but
+        // raw_event_index stays 0 for every one of them.
+        let mut event_a = make_event(contract_id, 100, 0);
+        event_a.transaction_hash = tx_hash_a.clone();
+        event_a.raw_event_index = 0;
+        let mut event_b = make_event(contract_id, 100, 1);
+        event_b.transaction_hash = tx_hash_b.clone();
+        event_b.raw_event_index = 0;
+
+        insert_events_batch(&pool, &[event_a.clone(), event_b.clone()])
+            .await
+            .expect("insert failed");
+
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM soroban_events WHERE transaction_hash IN ($1, $2)",
+        )
+        .bind(&tx_hash_a)
+        .bind(&tx_hash_b)
+        .fetch_one(&pool)
+        .await
+        .expect("count query failed");
+
+        // Different transaction_hash values, so despite sharing
+        // raw_event_index = 0, these are two distinct events and both must
+        // be kept — this fallback path must not silently collapse unrelated
+        // events into each other either.
+        assert_eq!(
+            count.0, 2,
+            "two distinct events sharing the raw_event_index=0 fallback must both be inserted"
+        );
+
+        // Re-run the exact same insert (simulating a re-index of the same
+        // page): must still collapse to the same two rows, not four.
+        insert_events_batch(&pool, &[event_a, event_b])
+            .await
+            .expect("re-insert must not error");
+
+        let count_after_replay: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM soroban_events WHERE transaction_hash IN ($1, $2)",
+        )
+        .bind(&tx_hash_a)
+        .bind(&tx_hash_b)
+        .fetch_one(&pool)
+        .await
+        .expect("count query failed");
+        assert_eq!(
+            count_after_replay.0, 2,
+            "replay must not duplicate either row"
+        );
+
+        sqlx::query("DELETE FROM soroban_events WHERE transaction_hash IN ($1, $2)")
+            .bind(&tx_hash_a)
+            .bind(&tx_hash_b)
+            .execute(&pool)
+            .await
+            .expect("cleanup failed");
     }
 
     /// The `chk_soroban_events_network` CHECK constraint (migration 0031,
@@ -2139,7 +2338,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(count.0, 25, "every chunk of the page must land");
-        assert_eq!(get_cursor(&pool).await.unwrap(), 900);
+        assert_eq!(get_cursor(&pool, "testnet").await.unwrap(), 900);
 
         commit_page(&pool, commit(&events))
             .await
@@ -2582,10 +2781,13 @@ mod tests {
         let pool = PgPool::connect(&db_url).await.unwrap();
 
         // Establish a known starting point.
-        sqlx::query("UPDATE system_state SET value = '5000' WHERE key = 'latest_ledger_cursor'")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO system_state (key, value) VALUES ('latest_ledger_cursor:testnet', '5000')
+             ON CONFLICT (key) DO UPDATE SET value = '5000'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let contract_id = format!("CCURS_{}", Uuid::new_v4());
         let ahead = [make_event(&contract_id, 5100, 0)];
@@ -2608,7 +2810,7 @@ mod tests {
         commit_page(&pool, page(&ahead, 5100))
             .await
             .expect("advance commit failed");
-        assert_eq!(get_cursor(&pool).await.unwrap(), 5100);
+        assert_eq!(get_cursor(&pool, "testnet").await.unwrap(), 5100);
 
         // The slower replica now commits an older page. Its events must still
         // land, but the cursor must hold at 5100.
@@ -2617,7 +2819,7 @@ mod tests {
             .expect("stale commit failed");
 
         assert_eq!(
-            get_cursor(&pool).await.unwrap(),
+            get_cursor(&pool, "testnet").await.unwrap(),
             5100,
             "a stale replica must not rewind the cursor"
         );
@@ -2637,6 +2839,81 @@ mod tests {
             .unwrap();
     }
 
+    /// #600 regression: two indexers on different networks against one
+    /// database must advance completely independently. Before namespacing
+    /// the cursor key per network, the single shared 'latest_ledger_cursor'
+    /// row's monotonic-advance guard meant a mainnet indexer far ahead in
+    /// absolute ledger numbers would permanently block a lower-sequence
+    /// testnet indexer's cursor from ever moving, since the guard has no way
+    /// to tell the two networks' ledger numbers apart.
+    #[tokio::test]
+    async fn two_networks_advance_their_cursors_independently() {
+        let Some(db_url) = test_db_url("two_networks_advance_their_cursors_independently") else {
+            return;
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        // Reset both networks to a known starting point.
+        for network in ["mainnet", "testnet"] {
+            sqlx::query(&format!(
+                "INSERT INTO system_state (key, value) VALUES ('latest_ledger_cursor:{network}', '0')
+                 ON CONFLICT (key) DO UPDATE SET value = '0'"
+            ))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let mainnet_contract = format!("CMAIN_{}", Uuid::new_v4());
+        let testnet_contract = format!("CTEST_{}", Uuid::new_v4());
+
+        fn page<'a>(events: &'a [SorobanEvent], network: &'a str, cursor: u64) -> PageCommit<'a> {
+            PageCommit {
+                events,
+                token_events: &[],
+                invocation_metrics: &[],
+                storage_snapshots: &[],
+                network,
+                cursor: Some(cursor),
+                ledger: None,
+                batch_size: 10,
+            }
+        }
+
+        // Mainnet advances far ahead in absolute ledger numbers.
+        let mainnet_events = [make_event(&mainnet_contract, 9_000_000, 0)];
+        commit_page(&pool, page(&mainnet_events, "mainnet", 9_000_000))
+            .await
+            .expect("mainnet commit failed");
+
+        // Testnet, at a much lower absolute ledger number, must still be
+        // able to advance — this is exactly the scenario the single global
+        // key made impossible (a lower-sequence network could never move a
+        // cursor a higher-sequence network had already advanced).
+        let testnet_events = [make_event(&testnet_contract, 100, 0)];
+        commit_page(&pool, page(&testnet_events, "testnet", 100))
+            .await
+            .expect("testnet commit failed");
+
+        assert_eq!(
+            get_cursor(&pool, "mainnet").await.unwrap(),
+            9_000_000,
+            "mainnet's cursor must be unaffected by testnet advancing"
+        );
+        assert_eq!(
+            get_cursor(&pool, "testnet").await.unwrap(),
+            100,
+            "testnet must be able to advance despite mainnet being far ahead in absolute ledger numbers"
+        );
+
+        sqlx::query("DELETE FROM soroban_events WHERE contract_id IN ($1, $2)")
+            .bind(&mainnet_contract)
+            .bind(&testnet_contract)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
     /// Many writers racing to advance the cursor must converge on the highest
     /// value, not on whichever transaction happened to commit last (issue #418).
     #[tokio::test]
@@ -2646,10 +2923,13 @@ mod tests {
         };
 
         let setup = PgPool::connect(&db_url).await.unwrap();
-        sqlx::query("UPDATE system_state SET value = '0' WHERE key = 'latest_ledger_cursor'")
-            .execute(&setup)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO system_state (key, value) VALUES ('latest_ledger_cursor:testnet', '0')
+             ON CONFLICT (key) DO UPDATE SET value = '0'",
+        )
+        .execute(&setup)
+        .await
+        .unwrap();
 
         let contract_id = format!("CRACE_{}", Uuid::new_v4());
 
@@ -2689,7 +2969,7 @@ mod tests {
         }
 
         assert_eq!(
-            get_cursor(&setup).await.unwrap(),
+            get_cursor(&setup, "testnet").await.unwrap(),
             1200,
             "cursor must settle on the highest committed ledger, not the last writer"
         );

@@ -222,7 +222,7 @@ impl Reconciler {
         // Only compare ledgers the indexer has actually passed: a window
         // ahead of the cursor is not yet indexed and would read as one giant
         // false "missing" range.
-        let cursor = db::get_cursor(&self.db).await?;
+        let cursor = db::get_cursor(&self.db, &self.network).await?;
         let window_end = window_end.min(cursor);
         if window_end < window_start {
             return Err(TridentError::rpc(anyhow::anyhow!(
@@ -645,10 +645,13 @@ mod tests {
             .execute(&pool)
             .await
             .expect("clear allowlist");
-        sqlx::query("UPDATE system_state SET value = '30600' WHERE key = 'latest_ledger_cursor'")
-            .execute(&pool)
-            .await
-            .expect("set cursor");
+        sqlx::query(
+            "INSERT INTO system_state (key, value) VALUES ('latest_ledger_cursor:testnet', '30600')
+             ON CONFLICT (key) DO UPDATE SET value = '30600'",
+        )
+        .execute(&pool)
+        .await
+        .expect("set cursor");
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -777,10 +780,13 @@ mod tests {
         .execute(&pool)
         .await
         .expect("seed allowlist");
-        sqlx::query("UPDATE system_state SET value = '30600' WHERE key = 'latest_ledger_cursor'")
-            .execute(&pool)
-            .await
-            .expect("set cursor");
+        sqlx::query(
+            "INSERT INTO system_state (key, value) VALUES ('latest_ledger_cursor:testnet', '30600')
+             ON CONFLICT (key) DO UPDATE SET value = '30600'",
+        )
+        .execute(&pool)
+        .await
+        .expect("set cursor");
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))

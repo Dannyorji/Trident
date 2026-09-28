@@ -71,6 +71,7 @@ INSERT INTO contract_storage_snapshots (
 )
 ON CONFLICT (contract_id, network, storage_key, ledger_sequence) DO NOTHING;
 
+-- Per-network cursor key (issue #600); CI runs the indexer against testnet.
 UPDATE system_state
 SET last_ledger_indexed = 1000,
     events_indexed_total = 1,
@@ -78,4 +79,4 @@ SET last_ledger_indexed = 1000,
     poll_duration_ms = 1,
     last_poll_at = NOW(),
     updated_at = NOW()
-WHERE key = 'latest_ledger_cursor';
+WHERE key = 'latest_ledger_cursor:testnet';

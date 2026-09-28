@@ -254,6 +254,24 @@ groups:
             mismatch alert's silence as unknown, not clean.
           runbook_url: "docs/runbooks/alerts.md#tridentindexerreconciliationfailing"
 
+      - alert: TridentIndexerRetainedFloorLedgersSkipped
+        expr: increase(trident_indexer_retained_floor_ledgers_skipped_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: "Trident indexer permanently skipped {{ $value }} ledger(s) it could no longer retrieve from the RPC"
+          description: >
+            The indexer's cursor was outside the RPC's retention window and
+            was advanced to the oldest ledger the RPC still retains. Every
+            ledger between the old cursor and that floor is lost to live
+            polling - the indexer reports healthy (lag returns to 0) despite
+            the gap. The skipped range is enqueued as a backfill_jobs row;
+            run `crates/backfill --from-queue` to recover it before the
+            source RPC prunes further.
+          runbook_url: "docs/runbooks/alerts.md#tridentindexerretainedfloorledgersskipped"
+
   # ---------------------------------------------------------------------------
   # Stellar RPC health (#297).
   # ---------------------------------------------------------------------------

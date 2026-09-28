@@ -220,6 +220,34 @@ alert's silence is unknown, not clean.
    deploy, deep backfill), passes fail with "nothing to reconcile yet" -
    expected until the indexer catches up.
 
+## TridentIndexerRetainedFloorLedgersSkipped
+
+**Means:** the indexer's cursor was behind the RPC's retention window - the
+RPC rejected `getEvents` with "startLedger must be within the ledger range"
+(issue #388) - and the live poll loop recovered by jumping the cursor
+forward to the oldest ledger the RPC still retains. Every ledger strictly
+between the old cursor and that floor is permanently unreachable through
+live polling; the indexer then reports healthy (lag returns to 0, heartbeat
+fresh) with no other signal that history was lost.
+
+**Why this threshold:** any occurrence at all is real, permanent data loss
+for that range - there is no self-healing pass that would ever notice it on
+its own. `for: 0m` fires immediately; the 15-minute `increase()` window just
+avoids double-counting the same jump across scrape intervals.
+
+**First steps:**
+1. Find the "startLedger predates the RPC's retained history" warn log -
+   it names the `retained_floor` and the new `cursor`.
+2. Confirm a `backfill_jobs` row was enqueued for the skipped range: `SELECT
+   * FROM backfill_jobs WHERE network = '<network>' AND status IN
+   ('pending', 'running') ORDER BY created_at DESC LIMIT 5;`
+3. Run `crates/backfill --from-queue` against a source that still retains
+   the range (an archival RPC endpoint, if configured) before it prunes
+   further.
+4. If the indexer was down long enough to hit this repeatedly, check
+   `TridentIndexerProcessDown`/deploy history for why it fell behind by more
+   than one retention window in the first place.
+
 ## TridentIndexerRPCErrorRateHigh
 
 **Means:** over 5% of Stellar RPC calls (`getEvents`/`getLedgers`) errored in

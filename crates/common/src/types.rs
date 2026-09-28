@@ -133,8 +133,22 @@ pub struct SorobanEvent {
     pub ledger_timestamp: String,
     /// Hash of the transaction that emitted this event.
     pub transaction_hash: String,
-    /// Zero-based index of this event within its transaction.
+    /// Zero-based index of this event within its transaction, made unique
+    /// within a batch by `assign_unique_event_indexes` when the RPC reports
+    /// (or falls back to) a colliding value. Stored for the
+    /// `(ledger_sequence, transaction_hash, event_index, network)` natural
+    /// key constraint (migration 0025).
+    ///
+    /// NOT stable across re-indexing runs with different batch/page
+    /// boundaries (issue #599) — do not derive an identifier from this
+    /// field. Use `raw_event_index` for that.
     pub event_index: u32,
+    /// The event's position as reported (or derived) directly from the RPC,
+    /// before any batch-local tie-breaking. Depends only on the event
+    /// itself, so it is stable across re-indexing runs regardless of batch
+    /// composition (issue #599) — this, not `event_index`, is what
+    /// `event_uuid` must be derived from.
+    pub raw_event_index: u32,
     /// Category of event as reported by the Soroban host.
     pub event_type: EventType,
 }

@@ -89,11 +89,13 @@ if awk -v l="$start_lag" 'BEGIN { exit !(l + 0 < 1) }'; then
   cat >&2 <<EOF
 error: the indexer is already caught up (lag ${start_lag%.*}).
 
-There is no catch-up to measure. Rewind the cursor to create a deficit, e.g.:
+There is no catch-up to measure. Rewind the cursor to create a deficit, e.g.
+(the cursor key is namespaced per network — issue #600, replace <network>
+with the one this indexer is configured for, e.g. testnet):
 
   psql "\$DATABASE_URL" -c \\
     "UPDATE system_state SET value = (value::bigint - 10000)::text \\
-     WHERE key = 'latest_ledger_cursor'"
+     WHERE key = 'latest_ledger_cursor:<network>'"
 
 then restart the indexer and re-run this script.
 EOF
