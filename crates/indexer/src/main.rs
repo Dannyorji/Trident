@@ -63,6 +63,26 @@ enum Command {
         #[arg(long, default_value_t = 1000)]
         limit: i64,
     },
+
+    /// Compare the live chain tip against the highest named `soroban_events`
+    /// partition and fail if headroom is below a safety margin (issue #643).
+    ///
+    /// The pre-built mainnet partitions in migration 0017 were sized against
+    /// mainnet's ledger height at authoring time; by the time a mainnet
+    /// indexer is actually pointed at the network, that height is stale and
+    /// the ceiling may already be exhausted. This is a launch-day gap
+    /// distinct from routine partition exhaustion (which
+    /// TridentPartitionExhaustionWarning/Exhausted already alert on once the
+    /// indexer is running) — this check exists to catch it *before* cutover.
+    PartitionCheck {
+        /// Minimum ledgers of headroom required between the live chain tip
+        /// and the highest named partition's upper bound. Defaults to 5M
+        /// ledgers (~289 days at mainnet's ~17,280 ledgers/day), matching the
+        /// TridentPartitionExhaustionWarning threshold so pre-flight and
+        /// runtime alerting agree on what "enough headroom" means.
+        #[arg(long, default_value_t = 5_000_000)]
+        min_headroom_ledgers: i64,
+    },
 }
 
 /// Runs a `replay` subcommand to completion and exits — never starts the
@@ -145,6 +165,63 @@ fn truncate_error(msg: &str) -> String {
     }
 }
 
+/// Runs the `partition-check` subcommand to completion and exits (issue #643).
+///
+/// Compares the live Stellar RPC chain tip against the highest named
+/// `soroban_events` partition upper bound and fails loudly (non-zero exit)
+/// if the remaining headroom is below `min_headroom_ledgers`. Intended to run
+/// as an explicit pre-cutover gate, not as an ongoing check — routine
+/// exhaustion once the indexer is live is already covered by
+/// TridentPartitionExhaustionWarning/Exhausted in monitoring/alerts.yml.
+async fn run_partition_check(
+    min_headroom_ledgers: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
+
+    let cfg = config::Config::from_env()?;
+    let db = sqlx::PgPool::connect(&cfg.database_url).await?;
+
+    let ranges = db::named_partition_ranges(&db).await?;
+    let highest_upper = ranges.iter().map(|&(_, hi)| hi).max().ok_or_else(|| {
+        "no named soroban_events partitions found — only the DEFAULT catch-all exists"
+    })?;
+
+    let rpc = rpc::RpcClient::with_endpoints(
+        cfg.stellar_rpc_urls.clone(),
+        &rpc::RpcHttpSettings {
+            connect_timeout: cfg.rpc_connect_timeout,
+            request_timeout: cfg.rpc_request_timeout,
+            pool_idle_timeout: cfg.rpc_pool_idle_timeout,
+            pool_max_idle_per_host: cfg.rpc_pool_max_idle_per_host,
+            tcp_keepalive: cfg.rpc_tcp_keepalive,
+        },
+    )?;
+    let tip = rpc.get_latest_ledger().await?;
+
+    let headroom = highest_upper - tip as i64;
+
+    println!("network:                  {}", cfg.network);
+    println!("live chain tip:           {tip}");
+    println!("highest named partition:  {highest_upper} (exclusive upper bound)");
+    println!("headroom:                 {headroom} ledgers");
+    println!("required headroom:        {min_headroom_ledgers} ledgers");
+
+    if headroom < min_headroom_ledgers {
+        eprintln!(
+            "NO-GO: partition headroom ({headroom} ledgers) is below the required minimum \
+             ({min_headroom_ledgers} ledgers). Run `SELECT create_soroban_partition({highest_upper}, {});` \
+             (repeating as needed) to extend coverage before cutover (issue #643).",
+            highest_upper + 2_000_000,
+        );
+        std::process::exit(1);
+    }
+
+    println!("GO: partition headroom is sufficient.");
+    Ok(())
+}
+
 async fn print_pending(db: &sqlx::PgPool, limit: i64) -> Result<(), Box<dyn std::error::Error>> {
     let pending = db::list_pending_failed_events(db, limit).await?;
     if pending.is_empty() {
@@ -225,6 +302,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_env_filter(EnvFilter::from_default_env())
             .init();
         return run_replay(id, all, list, limit).await;
+    }
+    if let Some(Command::PartitionCheck {
+        min_headroom_ledgers,
+    }) = cli.command
+    {
+        return run_partition_check(min_headroom_ledgers).await;
     }
 
     init_tracing(init_tracer());

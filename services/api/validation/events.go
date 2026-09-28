@@ -109,6 +109,14 @@ const (
 	StatsLimitMin     = 1
 	StatsLimitMax     = 100
 	StatsLimitDefault = 50
+
+	// StatsMaxLedgerRange caps the width of an explicit from_ledger/to_ledger
+	// window on GET /v1/stats/contracts. Any explicit range bypasses the
+	// maintained rollup and falls back to a live aggregation over
+	// soroban_events (issue #654); without a cap that live scan grows
+	// unbounded with total historical event count. ~7 days at Stellar's
+	// ~5s ledger close time.
+	StatsMaxLedgerRange = 120_000
 )
 
 // validNetworks holds the accepted values for the ?network filter.
@@ -158,6 +166,21 @@ func ValidateQueryStats(
 	}
 	if to != nil {
 		p.ToLedger = *to
+	}
+
+	// An explicit range on either side bypasses the maintained rollup and
+	// falls back to live aggregation (issue #654's queryContractStats), so a
+	// one-sided or overly wide range must be rejected rather than left to
+	// scan an unbounded slice of soroban_events. Only the fully-default,
+	// unfiltered case (both nil) is exempt — that path is served entirely
+	// from the rollup.
+	if from != nil || to != nil {
+		if from == nil || to == nil {
+			return nil, Errorf("from_ledger", "from_ledger and to_ledger must both be set when either is provided")
+		}
+		if *to-*from > StatsMaxLedgerRange {
+			return nil, Errorf("to_ledger", "range (to_ledger - from_ledger) must not exceed %d ledgers", StatsMaxLedgerRange)
+		}
 	}
 
 	limit, verr := ValidateLimit("limit", limitStr, StatsLimitMin, StatsLimitMax, StatsLimitDefault)

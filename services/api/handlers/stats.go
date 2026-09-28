@@ -60,6 +60,15 @@ var (
 	// write deadline in Stream() failing, which always means "disconnect",
 	// so there is no separate drop counter to pair this with.
 	metricSSESlowConsumerDisconnects atomic.Int64
+
+	// Contract-stats rollup fallback (#654): incremented every time
+	// GET /v1/stats/contracts serves the default "all time" query from the
+	// live aggregation path instead of contract_stats_rollup, either because
+	// the rollup query itself failed or because it has never been populated
+	// for the network. A default-range request always prefers the rollup, so
+	// any sustained rate here means the rollup is broken and every request is
+	// silently re-scanning the full event history — alert on it.
+	metricContractStatsRollupFallback atomic.Int64
 )
 
 // RecordWebhookDelivery records the outcome and round-trip latency of a single
@@ -182,6 +191,10 @@ func MetricsHandler(pool *pgxpool.Pool, rdb *redis.Client) http.HandlerFunc {
 		_, _ = fmt.Fprintf(w, "# HELP trident_concurrency_in_flight Requests currently in flight.\n")
 		_, _ = fmt.Fprintf(w, "# TYPE trident_concurrency_in_flight gauge\n")
 		_, _ = fmt.Fprintf(w, "trident_concurrency_in_flight %d\n", middleware.InFlightRequests())
+
+		_, _ = fmt.Fprintf(w, "# HELP trident_contract_stats_rollup_fallback_total Times GET /v1/stats/contracts served the default-range query via live aggregation instead of the maintained rollup.\n")
+		_, _ = fmt.Fprintf(w, "# TYPE trident_contract_stats_rollup_fallback_total counter\n")
+		_, _ = fmt.Fprintf(w, "trident_contract_stats_rollup_fallback_total %d\n", metricContractStatsRollupFallback.Load())
 	}
 }
 
@@ -578,6 +591,9 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 			if err != nil {
 				slog.ErrorContext(r.Context(), "rollup query failed; falling back to live aggregation", "err", err)
 				usedRollup = false
+			}
+			if !usedRollup {
+				metricContractStatsRollupFallback.Add(1)
 			}
 		}
 		if !usedRollup {
