@@ -423,6 +423,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 pool_idle_timeout: cfg.rpc_pool_idle_timeout,
                 pool_max_idle_per_host: cfg.rpc_pool_max_idle_per_host,
                 tcp_keepalive: cfg.rpc_tcp_keepalive,
+                max_calls_per_sec: cfg.rpc_max_calls_per_sec,
             },
         )?;
         let reconciler = reconcile::Reconciler::new(&cfg, db_pool.clone(), reconcile_rpc);

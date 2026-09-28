@@ -608,7 +608,7 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 		// Get the latest ledger for the response metadata if to_ledger was not explicitly set
 		toLedger := params.ToLedger
 		if q.Get("to_ledger") == "" {
-			latestLedger, err := getLatestIndexedLedger(ctx, db)
+			latestLedger, err := getLatestIndexedLedger(ctx, db, params.Network)
 			if err != nil {
 				slog.ErrorContext(r.Context(), "failed to get latest ledger", "err", err)
 				// Continue anyway; use 0 as fallback
@@ -920,9 +920,13 @@ func RefreshContractStatsRollup(ctx context.Context, db SchemaRegistryDB) error 
 	return err
 }
 
-// getLatestIndexedLedger queries the database for the highest indexed ledger sequence.
-func getLatestIndexedLedger(ctx context.Context, db DBPool) (int64, error) {
+// getLatestIndexedLedger queries the database for the highest indexed ledger
+// sequence for the given network. Ledger sequences are not comparable across
+// networks, so this must scope by network like every other query in this
+// file — an unscoped MAX() would silently mix testnet and mainnet heights
+// once both are indexed in the same database (issue #653).
+func getLatestIndexedLedger(ctx context.Context, db DBPool, network string) (int64, error) {
 	var latest int64
-	err := db.QueryRow(ctx, "SELECT COALESCE(MAX(ledger_sequence), 0) FROM soroban_events").Scan(&latest)
+	err := db.QueryRow(ctx, "SELECT COALESCE(MAX(ledger_sequence), 0) FROM soroban_events WHERE network = $1", network).Scan(&latest)
 	return latest, err
 }
