@@ -18,6 +18,13 @@ use trident_common::TridentError;
 use crate::rpc::RpcClient;
 use crate::spec::contract_address;
 
+/// Maximum keys the Soroban RPC accepts in a single `getLedgerEntries`
+/// request. Unlike `getEvents` (`filters::MAX_CONTRACT_IDS_PER_FILTER`), the
+/// RPC has no documented per-call constant for this method, so this value is
+/// the commonly observed provider cap; exceeding it fails the whole call
+/// (issue #662).
+pub const MAX_LEDGER_ENTRY_KEYS_PER_REQUEST: usize = 200;
+
 /// One observed contract-storage value, ready to diff against the last
 /// persisted snapshot and insert if it changed.
 #[derive(Debug)]
@@ -91,7 +98,15 @@ pub async fn fetch_balance_snapshots(
         keys.push((holder, key_b64s.last().unwrap().clone()));
     }
 
-    let entries = rpc.get_ledger_entries(&key_b64s).await?;
+    // Chunk against the RPC's key-count cap the same way getEvents filters
+    // are chunked against MAX_CONTRACT_IDS_PER_FILTER (issue #662) — a page
+    // of transfer events can realistically produce more unique holders than
+    // one getLedgerEntries call accepts, and exceeding it fails the whole
+    // call rather than just the excess keys.
+    let mut entries = Vec::with_capacity(key_b64s.len());
+    for chunk in key_b64s.chunks(MAX_LEDGER_ENTRY_KEYS_PER_REQUEST) {
+        entries.extend(rpc.get_ledger_entries(chunk).await?);
+    }
 
     // getLedgerEntries only returns entries that exist, so match results back
     // to holders by the (base64) key it was requested with.
@@ -154,5 +169,67 @@ mod tests {
     #[test]
     fn rejects_an_invalid_holder_strkey() {
         assert!(balance_key(TEST_CONTRACT, "not-a-strkey").is_err());
+    }
+
+    fn distinct_holder(i: usize) -> String {
+        // Deterministic but distinct 32-byte ed25519 public keys, strkey
+        // encoded, so each holder produces a different Balance() ledger key.
+        use stellar_strkey::ed25519::PublicKey as StrkeyPublicKey;
+        let mut bytes = [0u8; 32];
+        bytes[0..8].copy_from_slice(&(i as u64).to_be_bytes());
+        StrkeyPublicKey(bytes).to_string()
+    }
+
+    /// A holder count that exceeds the RPC's per-call key cap must still
+    /// complete, split across multiple chunked `getLedgerEntries` calls
+    /// rather than sending one oversized request that the provider rejects
+    /// outright (issue #662).
+    #[tokio::test]
+    async fn fetch_balance_snapshots_chunks_beyond_the_per_request_key_cap() {
+        use crate::rpc::{RpcClient, RpcHttpSettings};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        struct CountingEmptyResponder {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl Respond for CountingEmptyResponder {
+            fn respond(&self, _req: &Request) -> ResponseTemplate {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "result": { "entries": [] }
+                }))
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(CountingEmptyResponder {
+                calls: calls.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let rpc = RpcClient::with_settings(server.uri(), &RpcHttpSettings::default()).unwrap();
+
+        let holder_count = MAX_LEDGER_ENTRY_KEYS_PER_REQUEST + 50;
+        let holders: Vec<String> = (0..holder_count).map(distinct_holder).collect();
+
+        let observations = fetch_balance_snapshots(&rpc, TEST_CONTRACT, &holders)
+            .await
+            .expect("chunked fetch must succeed");
+
+        assert!(observations.is_empty());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "holder count over the cap must split into 2 requests"
+        );
     }
 }

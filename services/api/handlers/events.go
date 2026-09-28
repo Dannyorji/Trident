@@ -8,7 +8,6 @@ import (
 
 	"github.com/Depo-dev/trident/services/api/cursor"
 	"github.com/Depo-dev/trident/services/api/gen"
-	"github.com/Depo-dev/trident/services/api/grpcclient"
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
 	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/Depo-dev/trident/services/api/validation"
@@ -114,9 +113,7 @@ func ListEvents(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), grpcCallTimeout)
 	defer cancel()
 
-	resp, err := grpcclient.CallWithRetry(ctx, 2, func(ctx context.Context) (*gen.ListEventsResponse, error) {
-		return eventsClient.ListEvents(ctx, grpcReq)
-	})
+	resp, err := eventsClient.ListEvents(ctx, grpcReq)
 	if err != nil {
 		statusCode, code := httputil.GRPCToHTTP(err)
 		slog.ErrorContext(r.Context(), "grpc ListEvents failed", "err", err)
@@ -166,9 +163,7 @@ func GetEvent(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), grpcCallTimeout)
 	defer cancel()
 
-	event, err := grpcclient.CallWithRetry(ctx, 2, func(ctx context.Context) (*gen.Event, error) {
-		return eventsClient.GetEvent(ctx, &gen.GetEventRequest{Id: id, Network: network})
-	})
+	event, err := eventsClient.GetEvent(ctx, &gen.GetEventRequest{Id: id, Network: network})
 	if err != nil {
 		statusCode, code := httputil.GRPCToHTTP(err)
 		slog.ErrorContext(r.Context(), "grpc GetEvent failed", "err", err)

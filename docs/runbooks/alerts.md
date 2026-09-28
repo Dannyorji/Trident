@@ -220,6 +220,34 @@ alert's silence is unknown, not clean.
    deploy, deep backfill), passes fail with "nothing to reconcile yet" -
    expected until the indexer catches up.
 
+## TridentIndexerRetainedFloorLedgersSkipped
+
+**Means:** the indexer's cursor was behind the RPC's retention window - the
+RPC rejected `getEvents` with "startLedger must be within the ledger range"
+(issue #388) - and the live poll loop recovered by jumping the cursor
+forward to the oldest ledger the RPC still retains. Every ledger strictly
+between the old cursor and that floor is permanently unreachable through
+live polling; the indexer then reports healthy (lag returns to 0, heartbeat
+fresh) with no other signal that history was lost.
+
+**Why this threshold:** any occurrence at all is real, permanent data loss
+for that range - there is no self-healing pass that would ever notice it on
+its own. `for: 0m` fires immediately; the 15-minute `increase()` window just
+avoids double-counting the same jump across scrape intervals.
+
+**First steps:**
+1. Find the "startLedger predates the RPC's retained history" warn log -
+   it names the `retained_floor` and the new `cursor`.
+2. Confirm a `backfill_jobs` row was enqueued for the skipped range: `SELECT
+   * FROM backfill_jobs WHERE network = '<network>' AND status IN
+   ('pending', 'running') ORDER BY created_at DESC LIMIT 5;`
+3. Run `crates/backfill --from-queue` against a source that still retains
+   the range (an archival RPC endpoint, if configured) before it prunes
+   further.
+4. If the indexer was down long enough to hit this repeatedly, check
+   `TridentIndexerProcessDown`/deploy history for why it fell behind by more
+   than one retention window in the first place.
+
 ## TridentIndexerRPCErrorRateHigh
 
 **Means:** over 5% of Stellar RPC calls (`getEvents`/`getLedgers`) errored in
@@ -969,3 +997,132 @@ had the gauges emitted but nothing alerting on them.
 3. The indexer's pool size is configured separately from the API's; raising
    it is a stopgap if the root cause is a query regression rather than
    organic load growth.
+
+## Container resource alerts (monitoring/alerts.yml, `trident.container.resources`)
+
+The three sections below (issue #444) were added to `monitoring/alerts.yml`
+with `runbook_url` already pointing at these anchors, but the sections
+themselves were never written — `scripts/check-runbook-urls.sh` (issue #618)
+now catches that class of drift going forward.
+
+## TridentContainerOOMKilled
+
+**Means:** a container (`api`, `grpc-api`, or `indexer`) was killed by the
+kernel OOM killer within the last 10 minutes
+(`kube_pod_container_status_terminated_reason{reason="OOMKilled"}`).
+
+**Why this threshold:** `for: 0m` — this fires immediately rather than after
+a sustained window, because an OOM kill is already a completed event by the
+time the metric exists; waiting to confirm it "persists" makes no sense for
+something that already happened once.
+
+**First steps:**
+1. Identify which container and pod from `{{ $labels.container }}` /
+   `{{ $labels.pod }}` in the alert.
+2. Check `container_memory_working_set_bytes` for that container leading up
+   to the kill, and correlate with `TridentContainerMemoryHigh` firing
+   beforehand if it did.
+3. Check whether the container's Go/Rust runtime has a memory limit
+   configured (`GOMEMLIMIT` for Go services) consistent with the pod's
+   `container_spec_memory_limit_bytes` — a runtime unaware of the container
+   limit will keep allocating past it instead of triggering its own GC
+   pressure response first.
+4. If this coincides with a traffic spike or backfill, treat it as a
+   capacity question (raise the limit) rather than a leak; if it recurs
+   under steady load, treat it as a leak and profile heap usage.
+
+**Escalation:** `severity: critical` — the container was already killed and
+restarted, which is itself a brief availability gap for whatever it served.
+
+## TridentContainerMemoryHigh
+
+**Means:** `container_memory_working_set_bytes` for `api`, `grpc-api`, or
+`indexer` has exceeded 85% of `container_spec_memory_limit_bytes` for 5
+minutes.
+
+**Why this threshold:** 85% sustained for 5 minutes is a leading indicator
+ahead of `TridentContainerOOMKilled` — the goal is to page on the trend
+before the kernel has to intervene, not only after.
+
+**First steps:**
+1. Check `{{ $labels.container }}` in `{{ $labels.pod }}` against recent
+   deploys or traffic changes.
+2. If this is trending up gradually rather than holding steady, treat it as
+   a candidate leak and prioritize investigation before it reaches
+   `TridentContainerOOMKilled`.
+3. If it's a step change correlated with load, raising the memory limit is a
+   reasonable stopgap while the root cause (or a horizontal-scaling fix) is
+   worked.
+
+**Escalation:** `severity: warning` — ticket, not page; this is the
+early-warning alert for the critical one above.
+
+## TridentContainerCPUThrottling
+
+**Means:** more than 25% of CPU periods were throttled under the container's
+CFS quota for `api`, `grpc-api`, or `indexer`, sustained for 10 minutes
+(`container_cpu_cfs_throttled_periods_total` /
+`container_cpu_cfs_periods_total`).
+
+**Why this threshold:** CFS throttling at this level means the container is
+routinely hitting its CPU quota and being paused mid-timeslice, which shows
+up as latency and jitter even though the process never crashes or restarts —
+distinct from and often less visible than the memory alerts above.
+
+**First steps:**
+1. Check `{{ $labels.container }}` in `{{ $labels.pod }}` against
+   `TridentAPIHTTP5xxRateHigh` / `TridentRPCHighLatency` for whether the
+   throttling is visibly degrading response times.
+2. Check whether this correlates with a request-rate increase (organic
+   growth, worth raising CPU limits or scaling out replicas) or a regression
+   in a specific code path (worth profiling before just raising the limit).
+3. Raising the CPU limit is the direct mitigation; scaling out replicas is
+   the alternative when the workload parallelizes well across pods.
+
+**Escalation:** `severity: warning` — degraded latency, not an outage.
+
+## TridentRPCHealthScoreLow
+
+**Means:** `trident_rpc_health_score` for an RPC endpoint has been below 50
+(the midpoint of its 0-100 scale, `crates/indexer/src/rpc/health.rs`) for 10
+minutes.
+
+**Why this threshold:** the health scorer penalizes an endpoint faster than
+it recovers once it starts erroring or slowing down, ahead of the connection
+pool actually failing over to another endpoint — this is the leading
+indicator, `TridentRPCHealthScoreCritical` below is the trailing one.
+
+**First steps:**
+1. Check `trident_indexer_rpc_errors_total` and
+   `trident_indexer_rpc_call_duration_seconds` for `{{ $labels.endpoint }}`
+   to see which is driving the penalty.
+2. Compare against `TridentRPCHighErrorRate` / `TridentRPCHighLatency` above
+   — this may already be firing alongside one of them for the same
+   endpoint.
+3. If only one endpoint is configured, there's no failover target; treat
+   this as an early warning to add a secondary endpoint (issue #213) rather
+   than waiting for `TridentRPCHealthScoreCritical`.
+
+**Escalation:** `severity: ticket` — not urgent enough to page on its own.
+
+## TridentRPCHealthScoreCritical
+
+**Means:** `trident_rpc_health_score` for an RPC endpoint has been below 20
+for 5 minutes — near the scorer's floor of 0.
+
+**Why this threshold:** 20/100 sustained for 5 minutes means the scorer
+considers this endpoint close to unusable, not merely degraded.
+
+**First steps:**
+1. Check `trident_indexer_rpc_active_endpoint` for `{{ $labels.endpoint }}`
+   to confirm whether failover to another configured endpoint has already
+   occurred.
+2. If this is the only configured endpoint, ingest is likely already
+   degraded or stalled — treat as the same incident as
+   `IngestFreshnessFastBurn` / `IndexerHeartbeatStalled` if either of those
+   is also firing.
+3. Same diagnostic steps as `TridentRPCHealthScoreLow` above for isolating
+   the cause on this endpoint.
+
+**Escalation:** `severity: page` — this endpoint is near-unusable by the
+scorer's own floor.

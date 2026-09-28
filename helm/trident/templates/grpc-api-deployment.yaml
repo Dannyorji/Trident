@@ -20,7 +20,7 @@ spec:
         {{- include "trident.podSecurityContext" (dict "uid" .Values.grpcApi.securityContextUid) | nindent 8 }}
       containers:
         - name: grpc-api
-          image: "{{ .Values.grpcApi.image.repository }}:{{ .Values.grpcApi.image.tag }}"
+          image: "{{ .Values.grpcApi.image.repository }}:{{ .Values.grpcApi.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           securityContext:
             {{- include "trident.containerSecurityContext" . | nindent 12 }}

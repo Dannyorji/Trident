@@ -590,7 +590,11 @@ func loadRetentionConfig() retentionConfig {
 		AuditLogDays:          envInt("RETENTION_AUDIT_LOG_DAYS", 90),
 		ParseErrorsDays:       envInt("RETENTION_PARSE_ERRORS_DAYS", 30),
 		WebhookDeliveriesDays: envInt("RETENTION_WEBHOOK_DELIVERIES_DAYS", 30),
-		SorobanEventsDays:     envInt("RETENTION_SOROBAN_EVENTS_DAYS", 0), // 0 = disabled
+		// Highest-volume table; unlike audit_log/parse_errors/webhook_deliveries
+		// it previously defaulted to 0 (disabled), letting it grow unbounded
+		// with growing indexes/WAL/vacuum pressure unless an operator opted in
+		// explicitly (#645). 90 days matches the audit log's window.
+		SorobanEventsDays: envInt("RETENTION_SOROBAN_EVENTS_DAYS", 90),
 		// event_outbox is the fastest-growing unbounded table (issue #604):
 		// rows are only ever flipped published = TRUE, never deleted, and
 		// each carries a full JSONB copy of the event. 7 days is generous

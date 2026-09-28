@@ -50,6 +50,27 @@ func TestKeyUsage_NoAuthenticatedKey_Returns501(t *testing.T) {
 	}
 }
 
+// TestKeyUsage_LegacyEnvKey_Returns501NotServerError is the regression test
+// for issue #616's usage.go half: a legacy env-var authenticated request
+// now reaches KeyUsage with a non-empty, non-UUID sentinel id
+// (middleware.LegacyEnvKeyID) instead of "". Before the dedicated check,
+// that sentinel would fall through the idStr == "" guard and fail
+// uuid.Parse, misreporting the caller's lack of per-key usage data as a 500
+// "invalid authenticated key id" server error. It must instead get a clear
+// 501 same family as the "no key at all" case, not a 500.
+func TestKeyUsage_LegacyEnvKey_Returns501NotServerError(t *testing.T) {
+	h := handlers.KeyUsage(handlers.UsageConfig{DB: unconnectedPool(t)})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/usage", nil)
+	req = req.WithContext(middleware.WithAPIKeyID(req.Context(), middleware.LegacyEnvKeyID))
+	rr := httptest.NewRecorder()
+	h(rr, req)
+
+	if rr.Code != http.StatusNotImplemented {
+		t.Errorf("want 501 for a legacy env-var key, got %d", rr.Code)
+	}
+}
+
 func TestKeyUsage_InvalidWindow_Returns400(t *testing.T) {
 	h := handlers.KeyUsage(handlers.UsageConfig{DB: unconnectedPool(t)})
 

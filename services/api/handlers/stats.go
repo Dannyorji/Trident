@@ -60,6 +60,15 @@ var (
 	// write deadline in Stream() failing, which always means "disconnect",
 	// so there is no separate drop counter to pair this with.
 	metricSSESlowConsumerDisconnects atomic.Int64
+
+	// Contract-stats rollup fallback (#654): incremented every time
+	// GET /v1/stats/contracts serves the default "all time" query from the
+	// live aggregation path instead of contract_stats_rollup, either because
+	// the rollup query itself failed or because it has never been populated
+	// for the network. A default-range request always prefers the rollup, so
+	// any sustained rate here means the rollup is broken and every request is
+	// silently re-scanning the full event history — alert on it.
+	metricContractStatsRollupFallback atomic.Int64
 )
 
 // RecordWebhookDelivery records the outcome and round-trip latency of a single
@@ -182,6 +191,10 @@ func MetricsHandler(pool *pgxpool.Pool, rdb *redis.Client) http.HandlerFunc {
 		_, _ = fmt.Fprintf(w, "# HELP trident_concurrency_in_flight Requests currently in flight.\n")
 		_, _ = fmt.Fprintf(w, "# TYPE trident_concurrency_in_flight gauge\n")
 		_, _ = fmt.Fprintf(w, "trident_concurrency_in_flight %d\n", middleware.InFlightRequests())
+
+		_, _ = fmt.Fprintf(w, "# HELP trident_contract_stats_rollup_fallback_total Times GET /v1/stats/contracts served the default-range query via live aggregation instead of the maintained rollup.\n")
+		_, _ = fmt.Fprintf(w, "# TYPE trident_contract_stats_rollup_fallback_total counter\n")
+		_, _ = fmt.Fprintf(w, "trident_contract_stats_rollup_fallback_total %d\n", metricContractStatsRollupFallback.Load())
 	}
 }
 
@@ -579,6 +592,9 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 				slog.ErrorContext(r.Context(), "rollup query failed; falling back to live aggregation", "err", err)
 				usedRollup = false
 			}
+			if !usedRollup {
+				metricContractStatsRollupFallback.Add(1)
+			}
 		}
 		if !usedRollup {
 			stats, err = queryContractStats(ctx, db, params, afterKey)
@@ -592,7 +608,7 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 		// Get the latest ledger for the response metadata if to_ledger was not explicitly set
 		toLedger := params.ToLedger
 		if q.Get("to_ledger") == "" {
-			latestLedger, err := getLatestIndexedLedger(ctx, db)
+			latestLedger, err := getLatestIndexedLedger(ctx, db, params.Network)
 			if err != nil {
 				slog.ErrorContext(r.Context(), "failed to get latest ledger", "err", err)
 				// Continue anyway; use 0 as fallback
@@ -904,9 +920,13 @@ func RefreshContractStatsRollup(ctx context.Context, db SchemaRegistryDB) error 
 	return err
 }
 
-// getLatestIndexedLedger queries the database for the highest indexed ledger sequence.
-func getLatestIndexedLedger(ctx context.Context, db DBPool) (int64, error) {
+// getLatestIndexedLedger queries the database for the highest indexed ledger
+// sequence for the given network. Ledger sequences are not comparable across
+// networks, so this must scope by network like every other query in this
+// file — an unscoped MAX() would silently mix testnet and mainnet heights
+// once both are indexed in the same database (issue #653).
+func getLatestIndexedLedger(ctx context.Context, db DBPool, network string) (int64, error) {
 	var latest int64
-	err := db.QueryRow(ctx, "SELECT COALESCE(MAX(ledger_sequence), 0) FROM soroban_events").Scan(&latest)
+	err := db.QueryRow(ctx, "SELECT COALESCE(MAX(ledger_sequence), 0) FROM soroban_events WHERE network = $1", network).Scan(&latest)
 	return latest, err
 }

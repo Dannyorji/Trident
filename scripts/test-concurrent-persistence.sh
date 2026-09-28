@@ -110,11 +110,13 @@ if [[ "${constraint:-0}" -lt 1 ]]; then
 fi
 echo "  natural-key UNIQUE index present ($constraint)"
 
+# The cursor key is namespaced per network (issue #600); the Rust tests this
+# script cross-checks (crates/indexer/src/db/mod.rs) all run against "testnet".
 cursor="$(psql "$DATABASE_URL" -tAc "
-  SELECT value FROM system_state WHERE key = 'latest_ledger_cursor';
+  SELECT value FROM system_state WHERE key = 'latest_ledger_cursor:testnet';
 ")"
 if [[ -z "$cursor" ]]; then
-  echo "FAIL: no latest_ledger_cursor row in system_state" >&2
+  echo "FAIL: no latest_ledger_cursor:testnet row in system_state" >&2
   exit 1
 fi
 echo "  cursor present at ledger ${cursor}"

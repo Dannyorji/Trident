@@ -190,6 +190,18 @@ func KeyUsage(cfg UsageConfig) http.HandlerFunc {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusNotImplemented, httputil.UNAVAILABLE, "usage metering requires a DB-backed API key")
 			return
 		}
+		// Legacy env-var keys (issue #616) authenticate successfully and
+		// reach here with idStr == middleware.LegacyEnvKeyID, a deliberately
+		// non-UUID sentinel — they have no api_keys row to key a rollup on,
+		// so this can never become a UUID no matter how APIKeyIDFromContext
+		// changes. Checked ahead of uuid.Parse so that case gets its own
+		// clear, correct 501 instead of falling into "invalid authenticated
+		// key id" (500), which would misreport a legacy key's absence of
+		// per-key usage data as a server bug.
+		if idStr == middleware.LegacyEnvKeyID {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusNotImplemented, httputil.UNAVAILABLE, "usage metering is not available for legacy env-var authenticated keys")
+			return
+		}
 		keyID, err := uuid.Parse(idStr)
 		if err != nil {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "invalid authenticated key id")

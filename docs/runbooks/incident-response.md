@@ -87,6 +87,13 @@ Response:
 
 ## On-call owner — launch week
 
+**Status: not yet named (issue #620).** Both contacts below are still the
+unexecuted template — `scripts/check-oncall-readiness.sh` checks for this
+placeholder mechanically; see
+[`alert-routing.md`'s pre-launch routing test](alert-routing.md#pre-launch-routing-test)
+for the rest of what has to be real before launch (PagerDuty/Slack keys, the
+routing test itself).
+
 **Primary on-call:** [FILL IN: name, GitHub handle, mobile number or pager
 handle — e.g. `@alice`, +1-555-0100, PagerDuty target `alice-trident`]
 

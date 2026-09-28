@@ -118,6 +118,7 @@ mod tests {
             ledger_timestamp: "2024-01-01T00:00:00Z".to_string(),
             transaction_hash: "txhash".to_string(),
             event_index: 3,
+            raw_event_index: 3,
             event_type: EventType::Contract,
             topics: vec!["transfer".to_string()],
             data: json!({"amount": 10}),
