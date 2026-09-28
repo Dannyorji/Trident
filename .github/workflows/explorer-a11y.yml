@@ -1,0 +1,85 @@
+name: Explorer Accessibility
+
+# Issue #626: explorer/package.json defines an a11y-test script
+# (scripts/a11y-test.ts, axe-core against the built pages) that was never
+# wired into any workflow — it only ran if someone remembered to invoke it
+# by hand. Unlike perf-test, this script drives a locally-built server with
+# a hardcoded fixture contract/event path (no live testnet dependency), so
+# it can run on every push/PR touching explorer/ rather than only on a
+# schedule; explorer-build.yml's own smoke-test step establishes that a
+# non-2xx response against the fixture contract ID is expected and fine —
+# axe-core still inspects whatever the page renders (including its error
+# state), which is exactly what this check needs to catch regressions in.
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - "explorer/**"
+      - ".github/workflows/explorer-a11y.yml"
+  pull_request:
+    paths:
+      - "explorer/**"
+      - ".github/workflows/explorer-a11y.yml"
+  schedule:
+    # Weekly safety net, matching explorer-perf.yml's cadence, in case a
+    # regression slips in through an unrelated dependency bump.
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+
+jobs:
+  a11y-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.12'
+          cache: 'npm'
+          cache-dependency-path: 'explorer/package-lock.json'
+
+      - name: Install explorer dependencies
+        working-directory: explorer
+        run: npm install --legacy-peer-deps
+
+      - name: Install Playwright browsers
+        working-directory: explorer
+        run: npx playwright install --with-deps chromium
+
+      - name: Build
+        working-directory: explorer
+        run: npm run build
+
+      - name: Start the built server
+        working-directory: explorer
+        env:
+          TRIDENT_TESTNET_API_URL: https://api.testnet.trident.dev
+          TRIDENT_MAINNET_API_URL: https://api.mainnet.trident.dev
+          EXPLORER_API_KEY: ci-smoke-test-key
+          PORT: 4321
+        run: |
+          node dist/server/entry.mjs &
+          echo $! > server.pid
+          for i in $(seq 1 20); do
+            code=$(curl --silent --show-error --max-time 2 -o /dev/null -w '%{http_code}' \
+              "http://localhost:4321/" 2>/dev/null || echo "000")
+            if [ "$code" != "000" ]; then
+              echo "Server responded with HTTP $code"
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "Server did not respond within the timeout" >&2
+          exit 1
+
+      - name: Run accessibility test
+        working-directory: explorer
+        run: npm run a11y-test -- --url http://localhost:4321
+
+      - name: Stop the server
+        if: always()
+        working-directory: explorer
+        run: kill "$(cat server.pid)" 2>/dev/null || true
