@@ -39,8 +39,8 @@ Open `.env` and set every value below. Do not leave defaults in production.
 |---|---|
 | `DATABASE_URL` | PostgreSQL connection string, e.g. `postgresql://trident:password@postgres:5432/trident` |
 | `REDIS_URL` | Redis connection string, e.g. `redis://redis:6379` |
-| `STELLAR_RPC_URL` | Soroban RPC endpoint (`https://soroban-testnet.stellar.org` for testnet) |
-| `NETWORK` | One of `mainnet`, `testnet`, or `futurenet` |
+| `STELLAR_RPC_URL` | Soroban RPC endpoint for the chosen `NETWORK` — `https://soroban-testnet.stellar.org` for testnet; for mainnet a provider or self-hosted endpoint, see [Testnet vs. mainnet configuration](#testnet-vs-mainnet-configuration) |
+| `NETWORK` | One of `mainnet`, `testnet`, or `futurenet`; must match `STELLAR_RPC_URL` |
 | `POLL_INTERVAL_MS` | Ledger poll interval in milliseconds (default: `5000`) |
 | `INDEX_DIAGNOSTIC` | Set `false` in production (diagnostic events are high-volume) |
 | `LOG_LEVEL` | One of `error`, `warn`, `info`, `debug`, `trace` (use `info` in production) |
@@ -57,6 +57,49 @@ Open `.env` and set every value below. Do not leave defaults in production.
 | `PER_IP_RATE_LIMIT_WINDOW_MS` | Window for the per-IP limit above, in milliseconds (default: `1000`) |
 | `TRUSTED_PROXY_ENABLED` | Set `true` **only** when the API is known to sit entirely behind the provided nginx config (or an equivalent proxy) that is the sole path reachable by clients — resolves the per-IP rate limiter's client IP from the last hop of `X-Forwarded-For` instead of the raw TCP peer address. Leaving this unset/`false` is always safe; enabling it when untrusted clients can reach the API directly lets them spoof their rate-limit bucket via a forged header. See `services/api/middleware/abuse.go` (`trustedClientIP`) and `docs/threat-model.md`. |
 | `MAX_IN_FLIGHT_REQUESTS` | Global concurrency cap — requests beyond this many in-flight get `503` to shed load (default: `500`) |
+
+#### Testnet vs. mainnet configuration
+
+`STELLAR_RPC_URL` and `NETWORK` must be changed together. Testnet:
+
+```bash
+NETWORK=testnet
+STELLAR_RPC_URL=https://soroban-testnet.stellar.org
+```
+
+Mainnet:
+
+```bash
+NETWORK=mainnet
+STELLAR_RPC_URL=https://<your-mainnet-rpc-provider>/<api-key>   # placeholder
+INDEX_DIAGNOSTIC=false
+```
+
+The Stellar Development Foundation does not operate a public mainnet Soroban RPC
+for production workloads, so you must source one:
+
+1. **Hosted provider.** Pick one from the
+   [Stellar RPC provider list](https://developers.stellar.org/docs/data/apis/rpc/providers)
+   (for example Blockdaemon, Validation Cloud or QuickNode), create a mainnet
+   endpoint, and copy its HTTPS URL. The URL typically embeds an API key: keep it
+   in your secret store, not in git.
+2. **Self-hosted `stellar-rpc`.** Run your own node
+   ([docs](https://developers.stellar.org/docs/data/apis/rpc)) and point
+   `STELLAR_RPC_URL` at it. Set its event retention window to comfortably exceed
+   the longest indexer outage you want to recover from without a backfill.
+
+Whatever you choose, verify it before deploying:
+
+```bash
+curl -s -X POST "$STELLAR_RPC_URL" -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getNetwork"}'
+```
+
+The response `passphrase` should be `Public Global Stellar Network ; September 2015`
+for mainnet (`Test SDF Network ; September 2015` for testnet). Also check that the plan's
+`getEvents` rate limit and history window cover your expected event volume (see
+[`runbooks/mainnet-event-volume-spike.md`](runbooks/mainnet-event-volume-spike.md)),
+and consider a second endpoint for failover via `STELLAR_RPC_URLS` (see below).
 
 #### Indexer RPC transport and failover
 
