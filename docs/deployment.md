@@ -423,6 +423,89 @@ Go API   ─┘        default_pool_size = 20
 (N replicas)
 ```
 
+### Sizing pools as replicas scale
+
+Three numbers interact, and they are easy to confuse:
+
+| Quantity | Setting | What it limits |
+|---|---|---|
+| **Client connections** (app -> PgBouncer) | `*_DB_POOL_SIZE` x replicas, summed across tiers | Bounded by PgBouncer `max_client_conn` (compose: `PGBOUNCER_MAX_CLIENT_CONN`, 1000) |
+| **Server connections** (PgBouncer -> Postgres) | `PGBOUNCER_DEFAULT_POOL_SIZE` (20) | One pool per (user, database) pair. All Trident services share one user/db, so this is **one shared pool for the whole system** |
+| **Postgres backends** | `max_connections` (Postgres default 100) | Must cover the server pool plus admin, migrations and monitoring sessions |
+
+Because PgBouncer runs in **transaction** mode, the client total is allowed to
+be (much) larger than the server pool: a server connection is held only while a
+transaction runs. So the default stack (indexer 3 + gRPC API 10 + 3 Go replicas
+x 5 = 28 client connections against a server pool of 20) is fine. The server
+pool does **not** need to be >= the sum of client pools; it needs to be >= the
+number of transactions that run *at the same moment*. When it is too small,
+clients queue (`cl_waiting` in `SHOW POOLS`) and latency rises, until
+`query_wait_timeout` errors appear.
+
+#### Formulas
+
+```
+client_conns   = INDEXER_DB_POOL_SIZE                       (x 1 replica)
+               + GRPC_API_DB_POOL_SIZE  x grpc_replicas
+               + GO_API_DB_POOL_SIZE    x go_replicas        must be <= max_client_conn
+
+busy_conns     = peak_requests_per_second x avg_db_time_per_request_s   (Little's law)
+               + indexer_writers (1-3)
+
+default_pool_size  = ceil(busy_conns x 2)   rounded up to a multiple of 5
+                       (2x covers bursts and slow queries)
+
+max_connections    >= default_pool_size + 10   (admin, migrations, psql, monitoring)
+```
+
+Measure `avg_db_time_per_request_s` rather than guessing: it is the mean
+transaction time from `SHOW STATS` (`avg_xact_time`, microseconds) or
+`GET /v1/admin/db`. The 8 ms used below is an assumption for indexed
+`ListEvents`/`GetEvent` queries (see [`performance.md`](performance.md)).
+
+#### Worked example: growing toward mainnet traffic
+
+Assumptions: each Go replica handles a peak of 250 requests/s, each costing one
+~8 ms transaction (about 2 busy connections per replica); one gRPC replica for
+every two Go replicas; one indexer.
+
+| Go replicas | gRPC replicas | Peak req/s | Client conns | Busy conns | `default_pool_size` | Postgres `max_connections` |
+|---|---|---|---|---|---|---|
+| 3 | 2 | 750 | 3 + 20 + 15 = 38 | 6 + 3 = 9 | **20** (default is fine) | 100 (default) |
+| 6 | 3 | 1,500 | 3 + 30 + 30 = 63 | 12 + 3 = 15 | **30** | 100 |
+| 12 | 6 | 3,000 | 3 + 60 + 60 = 123 | 24 + 3 = 27 | **55** | 100 |
+| 24 | 12 | 6,000 | 3 + 120 + 120 = 243 | 48 + 3 = 51 | **105** | 150 |
+
+Reading the 12-replica row: 123 client connections are well under
+`max_client_conn` (1000), but 27 busy transactions at peak would queue behind
+the default pool of 20, so raise it to 55 and confirm Postgres allows
+`55 + 10 = 65` backends. Set it in the compose file (or your PgBouncer config):
+
+```yaml
+PGBOUNCER_DEFAULT_POOL_SIZE: 55
+PGBOUNCER_MAX_CLIENT_CONN: 1000
+```
+
+and, if you exceed Postgres's `max_connections`, raise that too (a restart is
+needed).
+
+**Limits.** Raising the pool is not free: each Postgres backend costs memory and
+contention grows past roughly 2-4x the database's CPU cores. If the formula asks
+for more than that (as the 24-replica row does on a small instance), scale the
+database or add a read replica rather than growing the pool further.
+**Shrinking the per-replica pool** (`GO_API_DB_POOL_SIZE`) is an option when you
+add many replicas and only the client-connection total is the concern.
+
+#### Thresholds: when to change the configuration
+
+| Signal | Meaning | Action |
+|---|---|---|
+| `SHOW POOLS` `cl_waiting` > 0 sustained, or `maxwait` rising | Server pool too small | Raise `PGBOUNCER_DEFAULT_POOL_SIZE` (and `max_connections`) |
+| `trident_api_db_pool_acquired_connections` at `trident_api_db_pool_max_connections` while `cl_waiting` = 0 | Per-replica pool too small, PgBouncer has room | Raise `GO_API_DB_POOL_SIZE` |
+| Client connections approaching `max_client_conn` | Too many replicas x pool | Raise `PGBOUNCER_MAX_CLIENT_CONN` or lower per-replica pools |
+| Postgres "too many clients" errors | `default_pool_size + other sessions` > `max_connections` | Raise `max_connections` or lower the pool |
+| Adding replicas | Client total and busy connections both grow | Re-run the formulas above **before** scaling out |
+
 ### PgBouncer Transaction Mode: Common Pitfalls
 
 Transaction pooling is efficient but means **no session state survives across transaction boundaries**. The following do **not** work in transaction mode:
