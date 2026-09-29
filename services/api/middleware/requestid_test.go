@@ -78,7 +78,7 @@ func TestRequestID_EndToEnd_LogsAndErrorEnvelope(t *testing.T) {
 	final := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "boom")
 	})
-	h := middleware.Chain(final, middleware.RequestID, middleware.StructuredLogging)
+	h := middleware.Chain(final, middleware.RequestID, middleware.StructuredLogging(nil))
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/events", nil)
 	req.Header.Set(reqIDHeader, incoming)

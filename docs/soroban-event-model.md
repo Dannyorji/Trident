@@ -42,13 +42,30 @@ Trident decodes all `ScVal` types to their natural JSON equivalents:
 | `ScvI128` / `ScvU128` / `ScvI256` / `ScvU256` | **decimal string** (see below) |
 | `ScvI64` / `ScvU64` | number |
 | `ScvI32` / `ScvU32` | number |
-| `ScvBytes` | string (base64) |
+| `ScvBytes` | string (lowercase hex) |
+| `ScvTimepoint` / `ScvDuration` | **decimal string** (u64; see below) |
 | `ScvVoid` | `null` |
-| `ScvError` | object `{ "type": "…", "code": N }` |
+| `ScvError` | string (debug form, e.g. `Contract(ScErrorCode(1))`) |
 
 ### Big-integer encoding
 
 128-bit and 256-bit integer types are serialised as **decimal strings** to avoid precision loss in JavaScript (`Number.MAX_SAFE_INTEGER` is only 53 bits). Consumers must parse these with a BigInt library before doing arithmetic.
+
+`ScvTimepoint` and `ScvDuration` are u64-valued and are serialised as decimal
+strings for the same reason: a Unix timestamp fits comfortably in 53 bits
+today, but the type's full range does not, and a value that silently loses
+precision at the top of its range is worse than one that is consistently a
+string.
+
+`ScvI64` / `ScvU64` remain JSON numbers for backwards compatibility with
+existing consumers. That is a known inconsistency with the rule above — they
+have the same 64-bit range problem — and changing it is a breaking change to
+the event body, so it is deliberately out of scope here.
+
+`ScvError` is rendered with Rust's debug formatting rather than projected to a
+structured object. The variant carries a contract-defined error code whose
+meaning is specific to the emitting contract, so there is no stable schema to
+promise; the debug form preserves the code without inventing one.
 
 ```json
 "amount": "1000000000000"

@@ -1,0 +1,76 @@
+# Production overlay for the Trident Helm chart (issue #622).
+#
+# Before this file, only values.yaml (the chart defaults) and
+# values-staging.yaml existed, so production configuration was undefined:
+# a self-hoster deploying to production had no documented starting point
+# other than copying and hand-editing the staging overlay, whose whole
+# purpose is the opposite (issue #313 scaled it down from production
+# defaults for a low-traffic smoke-test environment).
+#
+# Applied on top of values.yaml via:
+#   helm upgrade --install trident helm/trident \
+#     -f helm/trident/values.yaml -f helm/trident/values-prod.yaml \
+#     --namespace trident-prod --create-namespace
+#
+# Unlike values-staging.yaml, this deliberately does NOT set --set
+# <service>.image.tag: production should run the version-pinned image that
+# ships with this chart release (values.yaml's image.tag defaults to empty,
+# which falls back to Chart.yaml's appVersion, issue #622) rather than a
+# per-commit SHA. Pin an explicit released version instead by setting
+# Chart.yaml's appVersion at release time, or overriding
+# <service>.image.tag directly for a specific hotfix.
+#
+# This file does not itself make a production deployment "done" - the
+# same caveat docs/LAUNCH_CHECKLIST.md already states for the rest of the
+# launch gate applies here: TLS hosts, resource sizing, and node placement
+# below are reasonable starting defaults, not this deployment's actual
+# infrastructure, which only whoever operates the cluster can supply. See
+# docs/kubernetes.md#production for what to review before using this as-is.
+
+# Production runs at values.yaml's un-overridden replica counts / resource
+# requests (goApi: 2 replicas + HPA to 10, indexer/grpcApi: 1 replica each -
+# see values.yaml's own comments on why the indexer is single-replica).
+# Nothing below repeats those; this file only overrides what should
+# genuinely differ between environments.
+
+# values.yaml's default edge model is kept: bundled nginx (TLS terminated
+# in front of it by whatever load balancer/CDN you put in front, e.g. an AWS
+# NLB + ACM cert) rather than the Ingress resource. This just strengthens
+# nginx's own PodDisruptionBudget for production availability.
+nginx:
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+
+# ---------------------------------------------------------------------------
+# Ingress — an alternative to the bundled nginx above, for clusters with an
+# Ingress controller (ingress-nginx, ALB, GCE) doing TLS termination
+# in-cluster via cert-manager instead. To use this instead of nginx: set
+# nginx.enabled: false above, flip ingress.enabled: true below, and replace
+# host/tls with your real hostname and cert secret.
+# ---------------------------------------------------------------------------
+# ingress:
+#   enabled: true
+#   className: "nginx"
+#   annotations:
+#     cert-manager.io/cluster-issuer: letsencrypt-prod
+#     nginx.ingress.kubernetes.io/ssl-redirect: "true"
+#     nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+#     nginx.ingress.kubernetes.io/hsts: "true"
+#     nginx.ingress.kubernetes.io/hsts-max-age: "31536000"
+#     nginx.ingress.kubernetes.io/hsts-include-subdomains: "true"
+#     nginx.ingress.kubernetes.io/hsts-preload: "true"
+#   host: trident.example.com
+#   tls:
+#     - secretName: trident-tls
+#       hosts:
+#         - trident.example.com
+
+# Production keeps the existingSecret pattern (issue #305) by default, same
+# as staging - populate trident-secrets in the production namespace/cluster
+# with real production DATABASE_URL/REDIS_URL/API keys. Set
+# externalSecret.enabled: true instead (and configure secretStoreRef/data
+# below to point at your real secrets backend) if secrets are managed by an
+# external-secrets operator rather than provisioned by hand.
+global:
+  existingSecret: trident-secrets

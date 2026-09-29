@@ -1,0 +1,106 @@
+# Alertmanager routing configuration for Trident (issue #526).
+#
+# Prometheus's alerts.yml already fires correctly on indexer silence, not
+# just lag: TridentIndexerHeartbeatStale (the poll loop hasn't advanced),
+# TridentIndexerMetricsMissing (absent() — the /metrics endpoint isn't even
+# scrapeable), and TridentIndexerProcessDown (up{job="trident-indexer"}==0)
+# together mean killing the indexer outright pages just as reliably as it
+# falling behind. What was missing until this file: nothing actually routed
+# any of those alerts anywhere. Prometheus can evaluate every rule in
+# alerts.yml correctly and still page nobody if there's no Alertmanager
+# config wiring `severity`/`service` labels to a receiver.
+#
+# On-call owner (issue #526's "route it to the on-call owner named in #445"):
+# #445 ("launch: incident response process with a named on-call owner") is
+# itself still open — no on-call owner or escalation path has actually been
+# named anywhere in this repo yet (confirmed: no PagerDuty/Opsgenie/on-call
+# config exists in any form before this file). Naming a real person/team and
+# their paging identity is a decision only the project's operators can make,
+# not something to invent here. `on-call-critical` below is the receiver
+# every critical Trident alert already routes to; wire its `pagerduty_configs`
+# / `webhook_configs` / `slack_configs` to the actual on-call tool once #445
+# names one, using this receiver name and route so no alerts.yml or routing
+# change is needed at that point — only this receiver's delivery config.
+
+route:
+  receiver: default-null
+  group_by: ["alertname", "service"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    # Every indexer-silence/lag/RPC alert in alerts.yml already carries
+    # `service: indexer`; critical ones must page, warnings can wait for the
+    # default digest cadence.
+    - matchers:
+        - service = "indexer"
+        - severity = "critical"
+      receiver: on-call-critical
+      group_wait: 10s
+      repeat_interval: 1h
+      continue: false
+
+    - matchers:
+        - service = "indexer"
+        - severity = "warning"
+      receiver: on-call-warning
+      continue: false
+
+    - matchers:
+        - severity = "critical"
+      receiver: on-call-critical
+      group_wait: 10s
+      repeat_interval: 1h
+      continue: false
+
+    - matchers:
+        - severity = "warning"
+      receiver: on-call-warning
+      continue: false
+
+receivers:
+  # Delivery is real, not a placeholder. A receiver with no *_configs is a
+  # VALID Alertmanager config that accepts every notification and discards it,
+  # so commented-out integrations here would make `on-call-critical`
+  # behaviourally identical to `default-null`: `amtool check-config` passes,
+  # the routing tree looks correct, and nobody is ever paged. That failure is
+  # silent and only discovered during the incident it was meant to catch.
+  #
+  # #445 (naming the on-call owner) is still open, so the paging *identity*
+  # is supplied at deploy time via envsubst rather than invented here:
+  #
+  #   PAGERDUTY_ROUTING_KEY=<key> SLACK_WEBHOOK_URL=<url> \
+  #     envsubst < monitoring/alertmanager.yml > /etc/alertmanager/config.yml
+  #
+  # Both variables are REQUIRED — Alertmanager rejects an empty routing_key
+  # and an empty Slack api_url at startup, so a deploy that forgets them fails
+  # loudly at boot instead of coming up healthy and paging into a void. That
+  # is the intended behaviour: no on-call target configured should stop the
+  # deploy, not silently disable alerting. Once #445 names the owner, replace
+  # the two variables with that team's real values and drop the envsubst step.
+  - name: on-call-critical
+    pagerduty_configs:
+      - routing_key: "${PAGERDUTY_ROUTING_KEY}"
+        description: '{{ .CommonAnnotations.summary }}'
+        severity: critical
+        details:
+          alertname: '{{ .CommonLabels.alertname }}'
+          service: '{{ .CommonLabels.service }}'
+          runbook_url: '{{ .CommonAnnotations.runbook_url }}'
+        send_resolved: true
+
+  - name: on-call-warning
+    slack_configs:
+      - api_url: "${SLACK_WEBHOOK_URL}"
+        channel: "#trident-alerts"
+        title: '{{ .CommonAnnotations.summary }}'
+        text: >-
+          {{ .CommonAnnotations.description }}
+          {{ with .CommonAnnotations.runbook_url }}Runbook: {{ . }}{{ end }}
+        send_resolved: true
+
+  # Alertmanager requires every route to resolve to a defined receiver, even
+  # one that intentionally does nothing — this is that intentional sink, not
+  # a stand-in for a real on-call route (see the two receivers above for
+  # those).
+  - name: default-null

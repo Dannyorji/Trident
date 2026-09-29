@@ -53,14 +53,29 @@ services:
   # ---------------------------------------------------------------------------
   redis:
     restart: "no"
+    ports:
+      - "6380:6379"
 
   # ---------------------------------------------------------------------------
-  # PgBouncer — disabled in CI. All services use DATABASE_URL pointing
-  # directly at postgres:5432 (set in .env.ci).
+  # PgBouncer — opt-in in CI. Application traffic still connects directly to
+  # Postgres; the e2e job enables it to test the admin statistics endpoint.
   # ---------------------------------------------------------------------------
   pgbouncer:
     profiles:
       - pgbouncer  # only started when this profile is explicitly selected
+    environment:
+      # CI only: the admin console (the virtual `pgbouncer` database behind
+      # GET /v1/admin/db) cannot authenticate under scram-sha-256 on
+      # PgBouncer 1.15 — even with auth_query resolving the user, SCRAM
+      # verification against the console fails, which is why that endpoint
+      # has never returned 200 in CI. md5 works and is adequate here: the
+      # credential is the publicly-documented `.env.ci` fixture password on a
+      # container-network-only port.
+      #
+      # The base compose keeps scram-sha-256 for real deployments. Fold this
+      # override away once PgBouncer is upgraded past 1.15 (see the pin note
+      # in docker-compose.yml) and confirm the endpoint still answers 200.
+      PGBOUNCER_AUTH_TYPE: md5
 
   # ---------------------------------------------------------------------------
   # Rust gRPC API — added here because it is not in the base compose.
@@ -137,6 +152,10 @@ services:
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
       CORS_DEV_MODE: ${CORS_DEV_MODE:-false}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Leave ample room for the contract cases, then deliberately exhaust
+      # this public-endpoint limit to verify documented 429 responses.
+      PER_IP_RATE_LIMIT_RPS: 100
+      RATE_LIMIT_FREE_RPS: 100
     ports:
       - "${PORT:-3000}:${PORT:-3000}"
     # Replace (not merge with) the base depends_on so the profile-disabled

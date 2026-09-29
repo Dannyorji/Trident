@@ -29,7 +29,7 @@ spec:
       {{- end }}
       containers:
         - name: go-api
-          image: "{{ .Values.goApi.image.repository }}:{{ .Values.goApi.image.tag }}"
+          image: "{{ .Values.goApi.image.repository }}:{{ .Values.goApi.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           securityContext:
             {{- include "trident.containerSecurityContext" . | nindent 12 }}
@@ -61,6 +61,11 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.global.existingSecret }}
                   key: ADMIN_API_KEY
+            - name: API_KEY_SALT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.global.existingSecret }}
+                  key: API_KEY_SALT
             {{- if .Values.internalMTLS.enabled }}
             # Behind a flag (issue #320): the Go API dials the gRPC server
             # with a client cert and verifies the server against

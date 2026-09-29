@@ -126,6 +126,14 @@ impl TridentError {
     pub fn fatal(&self) -> bool {
         self.severity() == Severity::Fatal
     }
+
+    /// Whether this is specifically an RPC-layer failure, as opposed to a
+    /// storage, parse, or config error. Used by the streamer's circuit
+    /// breaker (issue #197), which trips on sustained RPC outages and should
+    /// not open because of an unrelated database blip.
+    pub fn is_rpc(&self) -> bool {
+        matches!(self, TridentError::RpcError { .. })
+    }
 }
 
 #[cfg(test)]
@@ -145,6 +153,14 @@ mod tests {
         let err = TridentError::storage(anyhow::anyhow!("pool timeout"));
         assert_eq!(err.severity(), Severity::Retryable);
         assert!(err.retryable());
+    }
+
+    #[test]
+    fn only_rpc_errors_report_is_rpc() {
+        assert!(TridentError::rpc(anyhow::anyhow!("x")).is_rpc());
+        assert!(!TridentError::storage(anyhow::anyhow!("x")).is_rpc());
+        assert!(!TridentError::parse(anyhow::anyhow!("x")).is_rpc());
+        assert!(!TridentError::config(anyhow::anyhow!("x")).is_rpc());
     }
 
     #[test]

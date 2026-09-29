@@ -113,11 +113,49 @@ and consider a second endpoint for failover via `STELLAR_RPC_URLS` (see below).
 | `RPC_TCP_KEEPALIVE_MS` | TCP keep-alive probe interval (default: `60000`) |
 | `RPC_FAILOVER_THRESHOLD` | Consecutive failures before the active endpoint is parked (default: `3`) |
 | `RPC_ENDPOINT_COOLDOWN_MS` | How long a parked endpoint waits before it is tried again (default: `30000`) |
+| `RPC_BREAKER_FAILURE_THRESHOLD` | Consecutive RPC-layer poll failures before the circuit breaker opens (default: `5`) |
+| `RPC_BREAKER_COOLDOWN_MS` | How long the breaker stays open before allowing a probe poll (default: `30000`) |
 
 Without an explicit request timeout a stalled RPC connection blocks a poll
 indefinitely: the retry wrapper only reacts to returned errors, never to a call
 that never returns. Timeouts are classified retryable, so they engage backoff
 and count toward the failover threshold.
+
+#### Indexer replica count — single-writer by design
+
+**The indexer runs as exactly one replica. This is enforced, not advisory.**
+
+`helm/trident/templates/indexer-deployment.yaml` fails template rendering if
+`indexer.replicaCount` is greater than 1, and sets the deployment strategy to
+`Recreate` so a rolling update cannot briefly run two pods at once.
+
+Why enforce rather than merely recommend (issue #418):
+
+- **Correctness is not the problem.** Two indexers against one database are
+  safe. Event persistence is exactly-once via the natural-key `UNIQUE`
+  constraint (migration `0025_soroban_events_natural_key.sql`) combined with
+  `ON CONFLICT DO NOTHING`, and the cursor advance is monotonic — a lagging
+  replica cannot rewind a cursor another replica has already moved forward.
+  Both properties are covered by integration tests in
+  `crates/indexer/src/db/mod.rs`.
+- **Usefulness is the problem.** There is no leader election and no work
+  partitioning, so every replica polls the same ledger ranges and decodes the
+  same events. Two replicas do the same work twice and consume double the RPC
+  quota for no additional throughput.
+
+So the guarantees above exist to make an *accidental* double-deploy survivable —
+a rollout overlap, a stale pod that outlives its replacement — not to make
+scale-out a supported configuration.
+
+Verify the invariants against a live database with:
+
+```bash
+scripts/test-concurrent-persistence.sh --database-url "$DATABASE_URL"
+```
+
+If indexing throughput becomes a bottleneck, the fix is vertical (more CPU for
+decode, a larger `MAX_EVENTS_PER_POLL`, a faster RPC endpoint) or a genuine
+work-partitioning design — not raising the replica count.
 
 #### Indexer outbox relay
 
@@ -751,7 +789,6 @@ fly config validate -c fly/api.toml
 fly config validate -c fly/grpc-api.toml
 fly config validate -c fly/indexer.toml
 ```
->>>>>>> origin/dev
 
 ### Updating secrets
 
@@ -862,14 +899,19 @@ without access to a real Kubernetes cluster or cloud credentials — the
 following require you to provision them once:
 
 - **Secrets**: `STAGING_KUBECONFIG` (repo/org secret, base64-encoded
-  kubeconfig scoped to the staging namespace) and `STAGING_API_KEY` must be
-  set for `deploy-staging`/`smoke-test-staging` to run at all. Without them,
-  those jobs are skipped (not failed) — see `check-staging-config` in the
-  workflow.
-- **Variables**: `STAGING_NAMESPACE` (defaults to `trident-staging`),
+  kubeconfig scoped to the staging namespace), `STAGING_API_KEY`,
+  `STAGING_DATABASE_URL` (when runner migrations are used), and
+  `STAGING_ALERT_WEBHOOK_URL` (optional) are stored as encrypted secrets. The
+  kubeconfig and database URL must be set for `deploy-staging`/`smoke-test-staging`
+  to run at all. Without them, `check-staging-config` **fails** and names the
+  missing credentials, so a deploy that did not happen never reports green
+  (issue #395). To skip intentionally — a dry run with no staging environment
+  provisioned — trigger the workflow via `workflow_dispatch` with
+  `dry_run=true`; the check then emits a notice, sets `configured=false`, and
+  the deploy and smoke-test jobs are skipped without failing the run.
+- **Variables**: `STAGING_NAMESPACE` (defaults to `trident-staging`) and
   `STAGING_URL` (public URL of the deployed staging stack, used by the smoke
-  test), `STAGING_DATABASE_URL` (for the migration step, if runner-reachable),
-  and `STAGING_ALERT_WEBHOOK_URL` (optional).
+  test). Variables must never contain credentials.
 - **Migrations are stubbed pending issue #308** ("database migration job as
   a Helm hook", still open): the workflow currently runs
   `sqlx migrate run` directly from the GitHub Actions runner against

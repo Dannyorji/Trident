@@ -88,6 +88,12 @@ var knownContractEventSchemas = map[string][]ContractEventFieldSchema{
 	},
 }
 
+// ContractEventSchemas observes a contract's event schemas from the indexed
+// event tables and persists them to contract_event_schemas on every call
+// (see persistContractSchemas). Because it writes on every request, this
+// handler must never be wrapped in middleware.ResponseCache: a cache HIT
+// would skip the write for the rest of the TTL, silently decoupling schema
+// persistence from cache state (issue #571).
 func ContractEventSchemas(db SchemaRegistryDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		contractID := r.PathValue("id")
@@ -373,7 +379,7 @@ func persistContractSchemas(ctx context.Context, db SchemaRegistryDB, contractID
                 field_schema = EXCLUDED.field_schema,
                 observed_source = EXCLUDED.observed_source,
                 updated_at = NOW()
-        `, contractID, network, schema.EventName, codeHash, payload, schema.Source); err != nil {
+        `, contractID, network, schema.EventName, codeHash, string(payload), schema.Source); err != nil {
 			return err
 		}
 	}

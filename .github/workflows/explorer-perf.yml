@@ -1,0 +1,72 @@
+name: Explorer Performance Budget
+
+on:
+  schedule:
+    # Run weekly (Mondays at 9 AM UTC)
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+    inputs:
+      api_url:
+        description: 'Testnet API URL'
+        required: false
+        default: 'https://api.testnet.trident.dev'
+      api_key:
+        description: 'Explorer API key'
+        required: false
+
+jobs:
+  perf-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: 'explorer/package-lock.json'
+
+      - name: Install dependencies
+        working-directory: explorer
+        run: npm ci
+
+      - name: Run performance test
+        working-directory: explorer
+        env:
+          API_URL: ${{ github.event.inputs.api_url || 'https://api.testnet.trident.dev' }}
+          API_KEY: ${{ secrets.EXPLORER_API_KEY }}
+        run: |
+          npm run perf-test -- \
+            --api-url "$API_URL" \
+            --api-key "$API_KEY" \
+            --contract-id "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+
+      - name: Report results
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const workflow = context.workflow;
+            const status = '${{ job.status }}';
+            const message = `**Explorer Performance Budget** (${status.toUpperCase()})
+            
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            
+            Check PERFORMANCE_BUDGET.md for targets.`;
+            
+            console.log(message);
+
+      - name: Notify on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '⚠️ Performance budget check failed. See workflow run for details.'
+            });

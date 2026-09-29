@@ -39,12 +39,12 @@ const eventStreamGapEvent = `event: gap\ndata: {"message":"requested Last-Event-
 // stops all streaming work without a detached goroutine.
 //
 // It honours the standard SSE Last-Event-ID header (issue #235):
-// - On first connect: tail the stream from the latest id.
-// - On reconnect with Last-Event-ID: resume from that id + 1.
-// - If the requested id is older than the retention window, emit a `gap` event
-//   and resume from the oldest available id.
-// - Every SSE event includes an `id:` field so the browser automatically sends
-//   Last-Event-ID on reconnect.
+//   - On first connect: tail the stream from the latest id.
+//   - On reconnect with Last-Event-ID: resume from that id + 1.
+//   - If the requested id is older than the retention window, emit a `gap` event
+//     and resume from the oldest available id.
+//   - Every SSE event includes an `id:` field so the browser automatically sends
+//     Last-Event-ID on reconnect.
 func Stream(rdb streamRedisClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
@@ -61,11 +61,7 @@ func Stream(rdb streamRedisClient) http.HandlerFunc {
 			return
 		}
 
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "streaming is not supported")
-			return
-		}
+		rc := http.NewResponseController(w)
 
 		// Honour Last-Event-ID for resumption (issue #235).
 		// If the header is present and non-empty, try to resume from that point.
@@ -80,7 +76,7 @@ func Stream(rdb streamRedisClient) http.HandlerFunc {
 					slog.Warn("sse: write failed, disconnecting slow consumer", "contractId", contractID, "err", writeErr)
 					return
 				}
-				flusher.Flush()
+				_ = rc.Flush()
 
 				oldest, err := earliestStreamID(r.Context(), rdb)
 				if err != nil {
@@ -115,9 +111,11 @@ func Stream(rdb streamRedisClient) http.HandlerFunc {
 		h.Set("Cache-Control", "no-cache")
 		h.Set("X-Accel-Buffering", "no")
 		h.Set("Connection", "keep-alive")
-		rc := http.NewResponseController(w)
 		w.WriteHeader(http.StatusOK)
-		flusher.Flush()
+		if err := rc.Flush(); err != nil {
+			slog.Warn("sse: response writer cannot flush", "err", err)
+			return
+		}
 
 		topic0 := q.Get("topic0")
 
@@ -172,7 +170,7 @@ func Stream(rdb streamRedisClient) http.HandlerFunc {
 						slog.Warn("sse: write failed, disconnecting slow consumer", "contractId", contractID, "err", writeErr)
 						return
 					}
-					flusher.Flush()
+					_ = rc.Flush()
 				}
 			}
 		}

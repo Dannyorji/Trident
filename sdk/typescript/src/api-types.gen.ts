@@ -44,6 +44,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/version": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Build and schema version
+         * @description Reports which build is running — semantic version tag, git commit SHA, build timestamp, and the highest applied database migration (issue #397). Answers "which build is live?" during an incident without reading GHCR tags or pod specs.
+         *     Authenticated: the commit SHA and schema version narrow the search for known-vulnerable code paths, so this is not public. Use /v1/ready for an unauthenticated liveness signal.
+         *     When the database is unreachable the endpoint still returns 200 with build metadata and a null schema_version, so it stays usable during exactly the outage you need it for.
+         */
+        get: operations["getVersion"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/events": {
         parameters: {
             query?: never;
@@ -173,6 +195,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/contracts/{id}/metadata": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get SEP-41 token metadata for a contract
+         * @description Returns the token name, symbol, and decimals for a contract that implements the SEP-41 read interface (issue #263).
+         *     Served from the `token_metadata` table, which the indexer populates and refreshes; this endpoint never calls the Stellar RPC itself.
+         *     Always answers 200 for a well-formed contract id, never 404. A contract that has not been resolved yet and one that was resolved and is not a token both return `is_token: false` with the remaining fields null — the two cases are indistinguishable from this endpoint, matching the resolver's own cached negative result.
+         */
+        get: operations["getTokenMetadata"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/contracts/{id}/storage": {
         parameters: {
             query?: never;
@@ -262,7 +306,7 @@ export interface paths {
         };
         /**
          * List API keys
-         * @description List all API keys (admin only)
+         * @description List API keys (admin only), keyset-paginated (issue #220). Ordered newest first (created_at DESC, id DESC as tiebreaker); cursor is opaque — never construct or parse it, just pass back the value returned in next_cursor.
          */
         get: operations["listApiKeys"];
         put?: never;
@@ -271,6 +315,26 @@ export interface paths {
          * @description Generate a new API key for authentication
          */
         post: operations["createApiKey"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/api-keys/{id}/rotate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rotate an API key
+         * @description Mint a replacement key that inherits the label, network, and rate-limit tier of the key identified by `id` (admin only). The plaintext key is returned once, in this response, and cannot be retrieved again. The existing key is not revoked by this call — revoke it with DELETE /v1/api-keys/{id} once callers have moved over, which evicts it from the auth cache immediately.
+         */
+        post: operations["rotateApiKey"];
         delete?: never;
         options?: never;
         head?: never;
@@ -294,7 +358,11 @@ export interface paths {
         delete: operations["deleteApiKey"];
         options?: never;
         head?: never;
-        patch?: never;
+        /**
+         * Update an API key
+         * @description Update an API key's label and/or rate-limit tier (admin only). At least one of the two fields must be present. A tier change takes effect immediately — the shared tier cache is invalidated on success. Only active (non-revoked) keys can be updated.
+         */
+        patch: operations["updateApiKey"];
         trace?: never;
     };
     "/v1/admin/db": {
@@ -311,6 +379,294 @@ export interface paths {
         get: operations["getAdminDbStats"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/keys/{id}/usage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * API key usage report
+         * @description Per-key usage over a time window (admin only), aggregated from the audit log. Both `from` and `to` are required RFC 3339 timestamps; the window may not exceed 31 days. Unknown query parameters are rejected.
+         */
+        get: operations["getAdminKeyUsage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/keys/{id}/usage-rollup": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * API key usage rollup (admin)
+         * @description Same shape as GET /v1/usage but for any key id, gated by X-Admin-Key. Backed by the maintained usage_rollup table rather than a live audit_log scan, so it stays cheap regardless of how far back `from` reaches.
+         */
+        get: operations["getAdminKeyUsageRollup"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/usage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Self-serve API key usage rollup
+         * @description The authenticated caller's own usage rollup for an optional [from, to) window; defaults to the last 30 days. Requires a DB-backed API key — legacy env-hash auth has no key id to key the rollup on.
+         */
+        get: operations["getKeyUsage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/contracts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List registered contracts
+         * @description Keyset-paginated list of contracts registered for indexing (admin only). `limit` outside 1..200 silently falls back to the default of 100; unknown query parameters are ignored.
+         */
+        get: operations["listAdminContracts"];
+        put?: never;
+        /**
+         * Register a contract for indexing
+         * @description Register (or re-register) a contract in the indexing allowlist (admin only). Upserts on (contract_id, network) — re-registering an existing contract updates its label and index_from and still returns 201.
+         */
+        post: operations["createAdminContract"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/contracts/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Unregister a contract
+         * @description Remove a contract registration by its registration ID (the `id` returned at registration, not the contract address). Idempotent — deleting a non-existent registration still returns 204.
+         */
+        delete: operations["deleteAdminContract"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/contracts/{id}/call": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Simulate a read-only contract call
+         * @description Simulate a contract function invocation via Soroban RPC and return the decoded result. Nothing is submitted to the network. Note the three success shapes: a simulation-level failure still returns HTTP 200 with `success: false` and `error` set; a result that cannot be decoded returns `success: true` with only `raw_xdr`.
+         */
+        post: operations["callContract"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/webhooks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List webhook subscriptions
+         * @description Keyset-paginated webhook subscriptions owned by the calling API key (issue #220), newest first (createdAt DESC, id DESC as tiebreaker). Includes each subscription's signing secret. Returns JSON null (not an empty array) when the key owns no subscriptions.
+         */
+        get: operations["listWebhooks"];
+        put?: never;
+        /**
+         * Create a webhook subscription
+         * @description Subscribe a target URL to events from a contract. Target URLs must be https, resolve publicly, and not point at private, loopback, link-local, or metadata addresses. The returned secret signs every delivery. Note the camelCase field names — webhook endpoints predate the snake_case convention and are not yet part of the frozen v1 surface.
+         */
+        post: operations["createWebhook"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/webhooks/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete a webhook subscription
+         * @description Permanently delete a webhook subscription and stop its deliveries.
+         */
+        delete: operations["deleteWebhook"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/webhooks/{id}/rotate-secret": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rotate a webhook signing secret
+         * @description Generate a new primary signing secret for the subscription, demoting the current one to secondary in the same statement so in-flight deliveries signed with the old secret still verify. Scoped to the caller's API key: rotating another tenant's subscription returns 404. Requires a database-backed API key; legacy env-hash authentication carries no key identity to scope ownership to.
+         */
+        post: operations["rotateWebhookSecret"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/webhooks/{id}/pause": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Pause webhook deliveries
+         * @description Pause deliveries for a subscription. Returns the paused status even when the ID matches no subscription (no existence check).
+         */
+        patch: operations["pauseWebhook"];
+        trace?: never;
+    };
+    "/v1/webhooks/{id}/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Resume webhook deliveries
+         * @description Resume deliveries for a paused subscription. Returns the resumed status even when the ID matches no subscription (no existence check).
+         */
+        patch: operations["resumeWebhook"];
+        trace?: never;
+    };
+    "/v1/webhooks/{id}/deliveries": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List recent webhook deliveries
+         * @description The 100 most recent delivery attempts for a subscription, newest first. Returns JSON null (not an empty array) when there are none.
+         */
+        get: operations["listWebhookDeliveries"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/webhooks/{id}/dead-letters": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List dead-lettered deliveries
+         * @description Deliveries that exhausted their retries (status dead_lettered), up to 200, newest first. Always an array — empty when there are none.
+         */
+        get: operations["listWebhookDeadLetters"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/webhooks/{id}/dead-letters/{deliveryId}/replay": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Replay a dead-lettered delivery
+         * @description Re-attempt one dead-lettered delivery and record the outcome. The response reports the replay result in snake_case (unlike the other webhook endpoints).
+         */
+        post: operations["replayWebhookDeadLetter"];
         delete?: never;
         options?: never;
         head?: never;
@@ -387,7 +743,7 @@ export interface components {
             /** @description Whether more results are available */
             has_more: boolean;
             /** @description Opaque cursor for next page (null if has_more is false) */
-            next_cursor?: string | null;
+            next_cursor: string | null;
         };
         LivenessResponse: {
             /**
@@ -417,6 +773,25 @@ export interface components {
             indexer_lag: number | null;
             checks: components["schemas"]["ReadyChecks"];
         };
+        VersionResponse: {
+            /**
+             * @description Semantic version tag of the running build, or "dev" for a binary built without release ldflags.
+             * @example v1.2.3
+             */
+            version: string;
+            /**
+             * @description Full git commit SHA the binary was built from, or "unknown" when not injected at build time.
+             * @example 2e6ad17c8f9b4a1d3e5f7a9c2b4d6e8f0a1c3e5d
+             */
+            commit_sha: string;
+            /**
+             * @description RFC 3339 build time, or "unknown" when not injected at build time. Not typed as date-time because of that sentinel.
+             * @example 2026-08-26T15:19:00Z
+             */
+            build_timestamp: string;
+            /** @description Highest applied migration version from _sqlx_migrations, as a string. Null when no migrations have been applied yet or when Postgres is unreachable — the endpoint still returns 200 in that case so build metadata stays available during an outage. */
+            schema_version: string | null;
+        };
         IndexerStatsResponse: {
             /**
              * @description Indexer health status
@@ -429,42 +804,42 @@ export interface components {
              * Format: int64
              * @description Latest indexed ledger sequence
              */
-            last_ledger_indexed?: number | null;
+            last_ledger_indexed: number | null;
             /**
              * Format: int64
              * @description Current chain tip ledger (from RPC)
              */
-            chain_tip_ledger?: number | null;
+            chain_tip_ledger: number | null;
             /**
              * Format: int64
              * @description Number of ledgers behind chain tip
              */
-            lag_ledgers?: number | null;
+            lag_ledgers: number | null;
             /**
              * Format: double
              * @description Estimated wall-clock staleness in seconds: lag_ledgers times Stellar's protocol-target ledger close time (~5s). Null whenever lag_ledgers is null. See docs/observability/data-freshness.md for the full freshness contract this field is part of.
              */
-            lag_seconds_estimated?: number | null;
+            lag_seconds_estimated: number | null;
             /**
              * Format: int64
              * @description Cumulative events indexed
              */
-            events_indexed_total?: number | null;
+            events_indexed_total: number | null;
             /**
              * Format: int32
              * @description Events processed in last poll
              */
-            events_last_poll?: number | null;
+            events_last_poll: number | null;
             /**
              * Format: int32
              * @description Average poll duration in milliseconds
              */
-            avg_poll_duration_ms?: number | null;
+            avg_poll_duration_ms: number | null;
             /**
              * Format: date-time
              * @description Timestamp of last successful poll
              */
-            last_poll_at?: string | null;
+            last_poll_at: string | null;
         };
         TokenMetadataResponse: {
             /** @description Soroban contract address */
@@ -550,13 +925,27 @@ export interface components {
             /** @description Storage snapshot values (latest, or full history when queried via /storage/history) */
             values: components["schemas"]["ContractStorageValue"][];
         };
+        ContractStorageHistoryResponse: {
+            /** @description The contract whose storage history was queried */
+            contract_id: string;
+            /** @description Network the contract is indexed on */
+            network: string;
+            /** @description The storage key whose history was queried */
+            storage_key: string;
+            /** @description Storage history entries, oldest first */
+            values: components["schemas"]["ContractStorageValue"][];
+            /** @description Whether more pages are available */
+            has_more: boolean;
+            /** @description Opaque cursor to pass as the cursor parameter for the next page */
+            next_cursor?: string | null;
+        };
         ContractStorageValue: {
             /** @description Base64-encoded XDR LedgerKey this value was read from */
             storage_key: string;
             /** @description Human-readable decoded storage key */
             key: unknown;
             /** @description Human-readable decoded value (absent when the entry was removed) */
-            value?: unknown;
+            value: unknown;
             /**
              * Format: int64
              * @description Ledger sequence at which this value was observed
@@ -591,6 +980,10 @@ export interface components {
              * @description Timestamp when response was generated
              */
             generated_at: string;
+            /** @description Whether more pages are available */
+            has_more: boolean;
+            /** @description Opaque cursor to pass as the cursor parameter for the next page */
+            next_cursor?: string | null;
         };
         ContractStats: {
             /** @description Soroban contract address */
@@ -610,11 +1003,237 @@ export interface components {
              * @description Timestamp of last event for this contract
              */
             last_seen_at: string;
+            /** Format: int64 */
+            invocation_count: number | null;
+            /** Format: int64 */
+            total_fee_charged: number | null;
+            /** Format: double */
+            avg_fee_charged: number | null;
+            /** Format: double */
+            avg_cpu_instructions: number | null;
+            /** Format: double */
+            avg_read_bytes: number | null;
+            /** Format: double */
+            avg_write_bytes: number | null;
+        };
+        APIKeyResponse: {
+            /** Format: uuid */
+            id: string;
+            key_prefix: string;
+            /** @description Raw key, returned only at creation time. */
+            key?: string;
+            label: string;
+            /** @enum {string} */
+            network: "testnet" | "mainnet";
+            rate_limit_tier: string;
+            created_by?: string;
+            /** Format: date-time */
+            last_used_at: string | null;
+            /** Format: int64 */
+            request_count: number;
+            /** Format: date-time */
+            revoked_at?: string | null;
+            /** Format: date-time */
+            created_at: string;
+        };
+        ListAPIKeysResponse: {
+            api_keys: components["schemas"]["APIKeyResponse"][];
+            /** @description Whether another page is available. */
+            has_more: boolean;
+            /** @description Opaque cursor for the next page (null if has_more is false). */
+            next_cursor: string | null;
+        };
+        ListContractsResponse: {
+            contracts: components["schemas"]["ContractResponse"][];
+            /** @description Whether another page is available. */
+            has_more: boolean;
+            /** @description Opaque cursor for the next page (null if has_more is false). */
+            next_cursor: string | null;
+        };
+        AdminKeyUsageResponse: {
+            /** Format: uuid */
+            api_key_id: string;
+            /** Format: date-time */
+            from: string;
+            /** Format: date-time */
+            to: string;
+            /** Format: int64 */
+            total_requests: number;
+            /**
+             * Format: int64
+             * @description Requests with status code < 400
+             */
+            successful_requests: number;
+            /** @description Per-endpoint breakdown; empty when the window has no requests */
+            by_endpoint: components["schemas"]["EndpointUsage"][];
+        };
+        EndpointUsage: {
+            endpoint: string;
+            /** Format: int64 */
+            requests: number;
+            avg_duration_ms: number;
+        };
+        UsageResponse: {
+            /** Format: uuid */
+            api_key_id: string;
+            /** Format: date-time */
+            from: string;
+            /** Format: date-time */
+            to: string;
+            /** Format: int64 */
+            total_requests: number;
+            /** Format: int64 */
+            total_errors: number;
+            /** @description Daily buckets from the maintained usage_rollup table, oldest first; empty when the window has no rollup rows. */
+            days: components["schemas"]["UsageRollupRow"][];
+        };
+        UsageRollupRow: {
+            /** Format: date-time */
+            period_start: string;
+            /** Format: date-time */
+            period_end: string;
+            /** Format: int64 */
+            request_count: number;
+            /** Format: int64 */
+            error_count: number;
+            avg_duration_ms: number;
+        };
+        ContractRegistrationRequest: {
+            /** @description Contract address (C... strkey, 56 characters) */
+            contract_id: string;
+            /** @description Network scope; omitted or empty means all networks */
+            network?: string;
+            /** @description Human-readable label */
+            label?: string;
+            /**
+             * Format: int64
+             * @description Ledger sequence to start indexing from
+             * @default 0
+             */
+            index_from: number;
+        };
+        ContractResponse: {
+            /** Format: uuid */
+            id: string;
+            /** @description Stellar contract id (C... strkey). */
+            contract_id: string;
+            network?: string | null;
+            label?: string | null;
+            /**
+             * Format: int64
+             * @description Ledger sequence indexing began from.
+             */
+            index_from: number;
+            /** Format: date-time */
+            created_at: string;
+        };
+        ContractCallRequest: {
+            /** @description Contract function name to invoke */
+            function: string;
+            /** @description Base64-encoded XDR ScVal arguments, in order */
+            args?: string[];
+        };
+        ContractCallResponse: {
+            /** @description False when the simulation itself reported a failure (still HTTP 200) */
+            success: boolean;
+            /** @description Decoded return value; omitted when undecodable or failed */
+            result?: unknown;
+            /** @description Raw base64 XDR of the return value; omitted on failure */
+            raw_xdr?: string;
+            /** @description Simulation error message; present only when success=false */
+            error?: string;
+        };
+        WebhookSubscription: {
+            /** Format: uuid */
+            id: string;
+            /** @description Omitted when empty */
+            apiKeyId?: string;
+            contractId: string;
+            /** @description Topic filter; omitted when unfiltered */
+            topic0?: string | null;
+            targetUrl: string;
+            /** @description HMAC signing secret for deliveries; omitted when empty */
+            secret?: string;
+            /** Format: date-time */
+            createdAt: string;
+            /**
+             * Format: date-time
+             * @description Present while deliveries are paused
+             */
+            pausedAt?: string | null;
+            network: string;
+        };
+        ListWebhooksResponse: {
+            webhooks: components["schemas"]["WebhookSubscription"][];
+            /** @description Whether another page is available. */
+            has_more: boolean;
+            /** @description Opaque cursor for the next page (null if has_more is false). */
+            next_cursor: string | null;
+        };
+        WebhookCreateRequest: {
+            contractId: string;
+            /** @description Optional topic filter */
+            topic0?: string | null;
+            /** @description Delivery target; must be https with a publicly resolvable, non-private host */
+            targetUrl: string;
+            /** @default testnet */
+            network: string;
+        };
+        WebhookCreateResponse: {
+            /** Format: uuid */
+            id: string;
+            /** @description HMAC signing secret — shown here and in the listing */
+            secret: string;
+            targetUrl: string;
+            contractId: string;
+            network: string;
+        };
+        WebhookDelivery: {
+            /** Format: int64 */
+            id: number;
+            /** Format: uuid */
+            subscriptionId: string;
+            eventId: string;
+            attempt: number;
+            attempts: number;
+            status: string;
+            /** @description HTTP status of the delivery attempt; omitted when none occurred */
+            statusCode?: number | null;
+            /** @description Omitted when empty */
+            responseBody?: string;
+            /** Format: date-time */
+            deliveredAt: string;
+            success: boolean;
+        };
+        WebhookRotateSecretResponse: {
+            /** Format: uuid */
+            id: string;
+            /** @description The new primary signing secret (whsec_ prefixed) */
+            secret: string;
+            /** @description The demoted secret, now serving as secondary during the overlap window */
+            previousSecret: string;
+        };
+        WebhookStatusResponse: {
+            /** @enum {string} */
+            status: "paused" | "resumed";
+        };
+        WebhookReplayResponse: {
+            success: boolean;
+            /** @enum {string} */
+            status: "success" | "failed";
+            attempt: number;
+            /** @description 0 when no HTTP response occurred */
+            status_code: number;
+            /** @description Truncated to 500 characters */
+            response_body: string;
         };
         ErrorResponse: {
             error: {
-                /** @description Error code (e.g., INVALID_ARGUMENT, INTERNAL, UNAVAILABLE) */
-                code: string;
+                /**
+                 * @description Machine-readable error code. Matches httputil.ErrorCode exactly (services/api/internal/httputil/errors.go).
+                 * @enum {string}
+                 */
+                code: "NOT_FOUND" | "UNAUTHORIZED" | "RATE_LIMITED" | "INVALID_ARGUMENT" | "UNAVAILABLE" | "INTERNAL" | "PAYLOAD_TOO_LARGE" | "FORBIDDEN" | "CONFLICT";
                 /** @description Human-readable error message */
                 message: string;
                 /** @description Request ID for debugging */
@@ -643,6 +1262,15 @@ export interface components {
         };
         /** @description Requested resource was not found */
         NotFound: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ErrorResponse"];
+            };
+        };
+        /** @description An unexpected server-side error occurred (error.code INTERNAL) */
+        InternalError: {
             headers: {
                 [name: string]: unknown;
             };
@@ -683,8 +1311,23 @@ export interface components {
                 "application/json": components["schemas"]["ErrorResponse"];
             };
         };
+        /** @description The supplied Idempotency-Key was already used with a request that does not match this one (error.code CONFLICT). Retry with a new key, or resend the exact original request body to get the original response replayed instead (issue #225). */
+        Conflict: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ErrorResponse"];
+            };
+        };
     };
-    parameters: never;
+    parameters: {
+        /**
+         * @description Opt-in de-duplication for retried create requests (issue #225). A retry carrying the same key and an identical request body replays the original response (see the `Idempotent-Replayed: true` response header) instead of creating a second resource. The same key reused with a different body is rejected with 409 Conflict. Keys are remembered for 24 hours; max length 255 characters.
+         * @example 7da8f2b1-2e3c-4b8a-9f0d-6a1e5c3d9b7f
+         */
+        IdempotencyKey: string;
+    };
     requestBodies: never;
     headers: {
         /**
@@ -712,6 +1355,11 @@ export interface components {
          * @example HIT
          */
         "X-Cache": "HIT" | "MISS";
+        /**
+         * @description Present and set to "true" only when this response was replayed from a prior request carrying the same Idempotency-Key (issue #225). Absent on the original (first) execution.
+         * @example true
+         */
+        "Idempotent-Replayed": "true";
     };
     pathItems: never;
 }
@@ -770,24 +1418,44 @@ export interface operations {
             };
         };
     };
+    getVersion: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Build metadata for the running instance */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VersionResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            429: components["responses"]["RateLimitExceeded"];
+        };
+    };
     listEvents: {
         parameters: {
             query?: {
                 /**
                  * @description Filter by Soroban contract address (strkey format, 56 chars starting with C)
-                 * @example CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM
+                 * @example CA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVSGZ
                  */
-                contract_id?: string;
+                contractId?: string;
                 /** @description Filter by primary topic (XDR-encoded) */
-                topic_0?: string;
+                topic0?: string;
                 /** @description Filter by secondary topic (XDR-encoded) */
-                topic_1?: string;
+                topic1?: string;
                 /** @description Lower bound of ledger range (inclusive) */
-                from_ledger?: number;
+                ledgerFrom?: number;
                 /** @description Upper bound of ledger range (inclusive) */
-                to_ledger?: number;
-                /** @description Network to query */
-                network?: "testnet" | "mainnet";
+                ledgerTo?: number;
                 /** @description Maximum number of events to return */
                 limit?: number;
                 /** @description Opaque pagination cursor from previous response's next_cursor (for next page) */
@@ -865,9 +1533,9 @@ export interface operations {
         parameters: {
             query: {
                 /** @description Contract to subscribe to */
-                contract_id: string;
+                contractId: string;
                 /** @description Optional topic filter */
-                topic_0?: string;
+                topic0?: string;
             };
             header?: never;
             path?: never;
@@ -884,7 +1552,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "text/event-stream": Record<string, never>;
+                    "text/event-stream": string;
                 };
             };
             400: components["responses"]["BadRequest"];
@@ -947,9 +1615,10 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Contract event schema registry entry */
+            /** @description Contract event schema registry entry. Cached for 5 minutes (issue #221) — see X-Cache. */
             200: {
                 headers: {
+                    "X-Cache": components["headers"]["X-Cache"];
                     "X-RateLimit-Limit": components["headers"]["X-RateLimit-Limit"];
                     "X-RateLimit-Remaining": components["headers"]["X-RateLimit-Remaining"];
                     "X-RateLimit-Reset": components["headers"]["X-RateLimit-Reset"];
@@ -977,9 +1646,10 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Contract spec and detected interfaces */
+            /** @description Contract spec and detected interfaces. Cached for 5 minutes (issue #221) — see X-Cache. */
             200: {
                 headers: {
+                    "X-Cache": components["headers"]["X-Cache"];
                     "X-RateLimit-Limit": components["headers"]["X-RateLimit-Limit"];
                     "X-RateLimit-Remaining": components["headers"]["X-RateLimit-Remaining"];
                     "X-RateLimit-Reset": components["headers"]["X-RateLimit-Reset"];
@@ -992,6 +1662,33 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimitExceeded"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getTokenMetadata: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Soroban contract address */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Token metadata, or is_token false when not a resolved token */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TokenMetadataResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
             429: components["responses"]["RateLimitExceeded"];
             503: components["responses"]["ServiceUnavailable"];
         };
@@ -1031,6 +1728,10 @@ export interface operations {
             query: {
                 /** @description Storage key to fetch history for, as returned by the storage/spec endpoints */
                 key: string;
+                /** @description Maximum number of history entries to return */
+                limit?: number;
+                /** @description Opaque pagination cursor from previous response's next_cursor (for next page) */
+                cursor?: string;
             };
             header?: never;
             path: {
@@ -1050,7 +1751,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ContractStorageResponse"];
+                    "application/json": components["schemas"]["ContractStorageHistoryResponse"];
                 };
             };
             400: components["responses"]["BadRequest"];
@@ -1092,6 +1793,8 @@ export interface operations {
                 network?: "testnet" | "mainnet";
                 /** @description Number of top contracts to return */
                 limit?: number;
+                /** @description Opaque pagination cursor from previous response's next_cursor (for next page) */
+                cursor?: string;
             };
             header?: never;
             path?: never;
@@ -1120,36 +1823,27 @@ export interface operations {
     };
     listApiKeys: {
         parameters: {
-            query?: never;
+            query?: {
+                limit?: number;
+                /** @description Opaque pagination cursor from a previous response's next_cursor. */
+                cursor?: string;
+            };
             header?: never;
             path?: never;
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description List of API keys */
+            /** @description Page of API keys */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        keys?: {
-                            /** Format: uuid */
-                            id?: string;
-                            key_prefix?: string;
-                            label?: string;
-                            network?: string;
-                            rate_limit_tier?: string;
-                            /** Format: date-time */
-                            last_used_at?: string;
-                            request_count?: number;
-                            /** Format: date-time */
-                            created_at?: string;
-                        }[];
-                    };
+                    "application/json": components["schemas"]["ListAPIKeysResponse"];
                 };
             };
+            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             429: components["responses"]["TooManyRequestsIPOnly"];
         };
@@ -1157,7 +1851,13 @@ export interface operations {
     createApiKey: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Opt-in de-duplication for retried create requests (issue #225). A retry carrying the same key and an identical request body replays the original response (see the `Idempotent-Replayed: true` response header) instead of creating a second resource. The same key reused with a different body is rejected with 409 Conflict. Keys are remembered for 24 hours; max length 255 characters.
+                 * @example 7da8f2b1-2e3c-4b8a-9f0d-6a1e5c3d9b7f
+                 */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+            };
             path?: never;
             cookie?: never;
         };
@@ -1185,22 +1885,57 @@ export interface operations {
             /** @description API key created */
             201: {
                 headers: {
+                    "Idempotent-Replayed": components["headers"]["Idempotent-Replayed"];
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        /** Format: uuid */
-                        id?: string;
-                        /** @description The raw API key (shown only once) */
-                        key?: string;
-                        /** @description First 16 characters of key for reference */
-                        key_prefix?: string;
-                    };
+                    "application/json": components["schemas"]["APIKeyResponse"];
                 };
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            409: components["responses"]["Conflict"];
             429: components["responses"]["TooManyRequestsIPOnly"];
+        };
+    };
+    rotateApiKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description ID of the active key to rotate */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Replacement key created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIKeyResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /** @description No active API key with that id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            429: components["responses"]["TooManyRequestsIPOnly"];
+            /** @description Rotation failed */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     deleteApiKey: {
@@ -1235,6 +1970,69 @@ export interface operations {
             429: components["responses"]["TooManyRequestsIPOnly"];
         };
     };
+    updateApiKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description API key ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description New display label for the key */
+                    label?: string;
+                    /** @description New rate-limit tier name */
+                    rate_limit_tier?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description The updated API key */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIKeyResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /** @description Admin API key is not configured on the server */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description API key not found (or already revoked) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Request body exceeds the 1 MiB limit */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            429: components["responses"]["TooManyRequestsIPOnly"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
     getAdminDbStats: {
         parameters: {
             query?: never;
@@ -1250,11 +2048,597 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": Record<string, never>;
+                    "application/json": {
+                        pools: {
+                            [key: string]: unknown;
+                        }[];
+                        stats: {
+                            [key: string]: unknown;
+                        }[];
+                    };
                 };
             };
             401: components["responses"]["Unauthorized"];
             429: components["responses"]["TooManyRequestsIPOnly"];
+            /** @description The PgBouncer admin console could not be read. It is the upstream here, so a failure to reach it is a bad-gateway condition rather than an error in this service (see handlers/admin.go). */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description The endpoint is not configured — ADMIN_API_KEY or PGBOUNCER_ADMIN_URL is unset, so no stats source exists. Deploying without PgBouncer is a supported configuration. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getAdminKeyUsage: {
+        parameters: {
+            query: {
+                /** @description Window start (RFC 3339) */
+                from: string;
+                /** @description Window end (RFC 3339); must be >= from, window <= 31 days */
+                to: string;
+            };
+            header?: never;
+            path: {
+                /** @description API key ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Usage aggregates for the key over the window */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminKeyUsageResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            429: components["responses"]["TooManyRequestsIPOnly"];
+            /** @description Usage query failed */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getAdminKeyUsageRollup: {
+        parameters: {
+            query?: {
+                /** @description Window start (RFC 3339); defaults to 30 days before `to` */
+                from?: string;
+                /** @description Window end (RFC 3339); defaults to now */
+                to?: string;
+            };
+            header?: never;
+            path: {
+                /** @description API key ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Usage rollup for the key over the window */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UsageResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            429: components["responses"]["TooManyRequestsIPOnly"];
+            500: components["responses"]["InternalError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getKeyUsage: {
+        parameters: {
+            query?: {
+                /** @description Window start (RFC 3339); defaults to 30 days before `to` */
+                from?: string;
+                /** @description Window end (RFC 3339); defaults to now */
+                to?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Usage rollup for the calling key over the window */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UsageResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            429: components["responses"]["RateLimitExceeded"];
+            500: components["responses"]["InternalError"];
+            /** @description The authenticated key is not DB-backed (legacy env-hash auth carries no key id to key the rollup on) */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    listAdminContracts: {
+        parameters: {
+            query?: {
+                /** @description Page size */
+                limit?: number;
+                /** @description Opaque pagination cursor from a previous page's next_cursor */
+                cursor?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One page of registered contracts */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ListContractsResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            429: components["responses"]["TooManyRequestsIPOnly"];
+            /** @description Listing failed (including a malformed cursor) */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    createAdminContract: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ContractRegistrationRequest"];
+            };
+        };
+        responses: {
+            /** @description Contract registered (created or updated) */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContractResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /** @description Request body exceeds the 1 MiB limit */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            429: components["responses"]["TooManyRequestsIPOnly"];
+            /** @description Registration failed */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    deleteAdminContract: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Contract registration ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Registration removed (or never existed) */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            429: components["responses"]["TooManyRequestsIPOnly"];
+            /** @description Delete failed (including a malformed registration ID) */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    callContract: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Contract address (C... strkey, 56 characters) */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ContractCallRequest"];
+            };
+        };
+        responses: {
+            /** @description Simulation completed (including simulation-level failures, which report success=false with an error message) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContractCallResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /** @description Request body exceeds the 1 MiB limit */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            429: components["responses"]["RateLimitExceeded"];
+            /** @description Soroban RPC call failed or returned no result */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    listWebhooks: {
+        parameters: {
+            query?: {
+                limit?: number;
+                /** @description Opaque pagination cursor from a previous response's next_cursor. */
+                cursor?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Page of subscriptions owned by the calling key */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ListWebhooksResponse"];
+                };
+            };
+            /** @description Invalid limit or cursor (plain-text body) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            429: components["responses"]["RateLimitExceeded"];
+            500: components["responses"]["InternalError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    createWebhook: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WebhookCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description Subscription created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookCreateResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /** @description Request body exceeds the 1 MiB limit */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            429: components["responses"]["RateLimitExceeded"];
+            500: components["responses"]["InternalError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    deleteWebhook: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Subscription ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Subscription deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimitExceeded"];
+            500: components["responses"]["InternalError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    rotateWebhookSecret: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Subscription ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Secret rotated */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookRotateSecretResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /** @description No subscription with this ID belongs to the caller's API key */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            429: components["responses"]["RateLimitExceeded"];
+            500: components["responses"]["InternalError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    pauseWebhook: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Subscription ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deliveries paused */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookStatusResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            429: components["responses"]["RateLimitExceeded"];
+            500: components["responses"]["InternalError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    resumeWebhook: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Subscription ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deliveries resumed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookStatusResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            429: components["responses"]["RateLimitExceeded"];
+            500: components["responses"]["InternalError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    listWebhookDeliveries: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Subscription ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Recent delivery attempts (null when none) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookDelivery"][] | null;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            429: components["responses"]["RateLimitExceeded"];
+            500: components["responses"]["InternalError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    listWebhookDeadLetters: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Subscription ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Dead-lettered delivery attempts */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookDelivery"][];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            429: components["responses"]["RateLimitExceeded"];
+            500: components["responses"]["InternalError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    replayWebhookDeadLetter: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Subscription ID */
+                id: string;
+                /** @description Numeric delivery ID from the dead-letters listing */
+                deliveryId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Replay attempted; success reflects the delivery outcome */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookReplayResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimitExceeded"];
+            500: components["responses"]["InternalError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     getMetrics: {
@@ -1272,7 +2656,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "text/plain; version=0.0.4": string;
+                    "text/plain; version=0.0.4; charset=utf-8": string;
                 };
             };
         };

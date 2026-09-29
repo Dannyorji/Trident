@@ -4,6 +4,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Depo-dev/trident/services/api/cursor"
 )
@@ -174,7 +175,7 @@ func TestValidateNetwork(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, verr := ValidateNetwork("network", tt.value, DefaultNetwork)
+			got, verr := ValidateNetwork("network", tt.value, "testnet")
 			if (verr != nil) != tt.wantErr {
 				t.Fatalf("got err %v, wantErr=%v", verr, tt.wantErr)
 			}
@@ -228,12 +229,26 @@ func TestValidateTimeRange(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, _, verr := ValidateTimeRange("from", "to", tt.from, tt.to)
+			_, _, verr := ValidateTimeRange("from", "to", tt.from, tt.to, 31*24*time.Hour)
 			if (verr != nil) != tt.wantErr {
 				t.Fatalf("got %v, wantErr=%v", verr, tt.wantErr)
 			}
 		})
 	}
+
+	const from, wide = "2024-01-01T00:00:00Z", "2024-06-01T00:00:00Z"
+
+	t.Run("exceeds max duration", func(t *testing.T) {
+		if _, _, verr := ValidateTimeRange("from", "to", from, wide, 31*24*time.Hour); verr == nil {
+			t.Fatal("expected a window wider than the cap to be rejected")
+		}
+	})
+
+	t.Run("zero max duration means uncapped", func(t *testing.T) {
+		if _, _, verr := ValidateTimeRange("from", "to", from, wide, 0); verr != nil {
+			t.Fatalf("got %v, want no error when the cap is disabled", verr)
+		}
+	})
 }
 
 func TestRejectUnknownParams(t *testing.T) {

@@ -1,0 +1,77 @@
+# cargo-audit configuration for Trident
+#
+# Ignore list for pre-existing advisories surfaced by the first real
+# Dependency audit run (issue #373). Each entry documents:
+#   - Which advisory is affected
+#   - Why we accept the risk
+#   - Date triaged
+#
+# NOTE: cargo-audit's schema requires `ignore` to be an array of advisory-ID
+# strings. The `{ id = "...", reason = "..." }` table form is cargo-deny
+# syntax and makes cargo-audit exit with a fatal parse error, so the
+# rationale for each entry lives in the comment above it. deny.toml keeps
+# the table form, which is correct for that tool.
+#
+# Review date: 2026-11-30 (90 days from triage)
+
+[advisories]
+ignore = [
+    # crossbeam-epoch: invalid pointer dereference in fmt::Pointer impl.
+    # Only affects fmt::Display; fmt::Debug is unaffected. Our code never
+    # formats Atomic/Shared pointers via Display. No upstream fix available
+    # yet. Triaged 2026-08-30 (#373).
+    "RUSTSEC-2026-0204",
+
+    # RSA Marvin attack: key-recovery timing sidechannel. Reached only
+    # transitively -- our code never performs RSA private-key operations.
+    # The vulnerable path is unreachable from our dependency graph.
+    # Triaged 2026-08-30 (#373).
+    "RUSTSEC-2023-0071",
+
+    # Pre-existing advisory in a transitive dependency. No fix available;
+    # our code does not exercise the affected path. Triaged 2026-08-30 (#373).
+    "RUSTSEC-2026-0049",
+
+    # Reported against two dependency paths. Affected API not called by our
+    # code. No fix available. Triaged 2026-08-30 (#373).
+    "RUSTSEC-2026-0098",
+
+    # Reported against two dependency paths. Affected API not called by our
+    # code. No fix available. Triaged 2026-08-30 (#373).
+    "RUSTSEC-2026-0099",
+
+    # Reported against two dependency paths. Affected API not called by our
+    # code. No fix available. Triaged 2026-08-30 (#373).
+    "RUSTSEC-2026-0104",
+
+    # Pre-existing advisory in a transitive dependency. No fix available;
+    # our code does not exercise the affected path. Triaged 2026-08-30 (#373).
+    "RUSTSEC-2026-0190",
+
+    # sqlx 0.7: binary protocol misinterpretation caused by truncating
+    # casts. The workspace pins sqlx 0.7 across four crates; upgrading is a
+    # real semver-major change that needs its own PR (noted in #373).
+    # Triaged 2026-08-30 (#373).
+    "RUSTSEC-2024-0363",
+
+    # paste crate is unmaintained. It is a build-time macro with no runtime
+    # surface. No security impact; replacement tracked separately.
+    # Triaged 2026-08-30 (#373).
+    "RUSTSEC-2024-0436",
+
+    # Pre-existing advisory in a transitive dependency. No fix available;
+    # our code does not exercise the affected path. Triaged 2026-08-30 (#373).
+    "RUSTSEC-2025-0119",
+
+    # Reported against two dependency paths. Affected API not called by our
+    # code. No fix available. Triaged 2026-08-30 (#373).
+    "RUSTSEC-2025-0134",
+
+    # h2 unbounded empty DATA frames. The advisory's fix is >=0.4.16; the
+    # h2 0.4.x path was upgraded to 0.4.19 in this changeset and is clean.
+    # The remaining hit is h2 0.3.27, reached only through tonic 0.11 ->
+    # hyper 0.14 (opentelemetry-otlp 0.15). The 0.3 line has no patched
+    # release, so clearing it requires a tonic/opentelemetry major upgrade,
+    # which needs its own PR. Triaged 2026-08-30.
+    "RUSTSEC-2026-0258",
+]

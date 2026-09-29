@@ -1,0 +1,21 @@
+name: Quickstart CI
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+
+jobs:
+  verify-quickstart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Validate Quickstart Code Samples
+        run: |
+          echo "Validating quickstart TypeScript sample syntax..."
+          npx tsc --noEmit docs/site/examples/quickstart.ts

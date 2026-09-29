@@ -10,15 +10,24 @@ on:
         options:
           - typescript
           - python
+          - rust
+          - go
+          - react
+          - all
       version:
         description: "Semver version to publish (e.g. 1.2.3)"
         required: true
         type: string
+      dry_run:
+        description: "Build, test, and package without publishing to any registry"
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   publish-typescript:
     name: Publish TypeScript SDK to npm
-    if: inputs.sdk == 'typescript'
+    if: inputs.sdk == 'typescript' || inputs.sdk == 'all'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -101,9 +110,16 @@ jobs:
           rm -rf "$SMOKE_DIR"
 
       - name: Publish to npm
+        if: ${{ !inputs.dry_run }}
         run: npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Dry run — skipped publish
+        if: ${{ inputs.dry_run }}
+        run: |
+          echo "Dry run: package built and smoke-tested, not published."
+          npm pack --dry-run
 
   # ---------------------------------------------------------------------------
   # Python — build once, verify twice: TestPyPI first, then PyPI behind a
@@ -118,7 +134,7 @@ jobs:
   # ---------------------------------------------------------------------------
   publish-python-testpypi:
     name: Publish Python SDK to TestPyPI
-    if: inputs.sdk == 'python'
+    if: inputs.sdk == 'python' || inputs.sdk == 'all'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -200,7 +216,7 @@ jobs:
   publish-python-pypi:
     name: Publish Python SDK to PyPI
     needs: publish-python-testpypi
-    if: inputs.sdk == 'python'
+    if: inputs.sdk == 'python' || inputs.sdk == 'all'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -240,3 +256,211 @@ jobs:
         uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
         with:
           packages-dir: sdk/python/dist
+
+  # ---------------------------------------------------------------------------
+  # Rust — crates.io. Issue #429: sdk/rust had no publish path at all, so it
+  # could not be installed by users regardless of how well it was tested.
+  #
+  # `cargo publish --dry-run` runs unconditionally before the real publish: it
+  # packages and compiles the crate exactly as crates.io will, which catches the
+  # common failure of a crate that builds in-workspace but not standalone (a
+  # path dependency, or a file missing from the package include list).
+  # ---------------------------------------------------------------------------
+  publish-rust:
+    name: Publish Rust SDK to crates.io
+    if: inputs.sdk == 'rust' || inputs.sdk == 'all'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/rust
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Validate version input is semver
+        run: |
+          if ! [[ "${{ inputs.version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'${{ inputs.version }}' is not a valid semver version"
+            exit 1
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+
+      - name: Set version
+        run: |
+          sed -i "0,/^version = \".*\"/s//version = \"${{ inputs.version }}\"/" Cargo.toml
+          grep -m1 '^version' Cargo.toml
+
+      - name: Test
+        run: cargo test
+
+      # Runs whether or not this is a dry run: this is the step that proves the
+      # crate is actually publishable, so skipping it on a real publish would
+      # defeat the point of having it.
+      - name: Package (dry run)
+        run: cargo publish --dry-run --allow-dirty
+
+      - name: Publish to crates.io
+        if: ${{ !inputs.dry_run }}
+        run: cargo publish --allow-dirty
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # Go — the module proxy publishes from a git tag rather than an upload, so
+  # "publishing" here means creating the tag `sdk/go/vX.Y.Z` and warming the
+  # proxy so the first `go get` does not have to wait for indexing.
+  # ---------------------------------------------------------------------------
+  publish-go:
+    name: Publish Go SDK (tag + proxy warm)
+    if: inputs.sdk == 'go' || inputs.sdk == 'all'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Validate version input is semver
+        run: |
+          if ! [[ "${{ inputs.version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'${{ inputs.version }}' is not a valid semver version"
+            exit 1
+          fi
+
+      - name: Set up Go
+        uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491 # v5.0.0
+        with:
+          go-version: "1.25"
+          cache-dependency-path: sdk/go/go.sum
+
+      - name: Test
+        working-directory: sdk/go
+        run: go test ./...
+
+      # go.mod carries no version of its own, so sdk/go/VERSION is what
+      # scripts/check-sdk-versions.sh reads. Keeping it in step with the tag is
+      # what makes the alignment check meaningful for Go.
+      - name: Verify VERSION file matches the requested version
+        working-directory: sdk/go
+        run: |
+          declared="$(tr -d '[:space:]' < VERSION)"
+          if [ "$declared" != "${{ inputs.version }}" ]; then
+            echo "::error::sdk/go/VERSION is $declared but publishing ${{ inputs.version }}."
+            echo "Run scripts/check-sdk-versions.sh --fix and commit before publishing."
+            exit 1
+          fi
+
+      - name: Create module tag
+        if: ${{ !inputs.dry_run }}
+        run: |
+          tag="sdk/go/v${{ inputs.version }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "::error::tag $tag already exists — published module versions are immutable"
+            exit 1
+          fi
+          git tag "$tag"
+          git push origin "$tag"
+
+      - name: Warm the module proxy
+        if: ${{ !inputs.dry_run }}
+        run: |
+          module="github.com/Telocel-Labs/Trident/sdk/go"
+          for _ in $(seq 1 10); do
+            if curl -fsS "https://proxy.golang.org/${module}/@v/v${{ inputs.version }}.info"; then
+              echo "proxy is serving v${{ inputs.version }}"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::warning::proxy did not serve v${{ inputs.version }} within 150s; it usually appears shortly after."
+
+      - name: Dry run — skipped tag and publish
+        if: ${{ inputs.dry_run }}
+        run: |
+          echo "Dry run: tests passed and VERSION verified; tag sdk/go/v${{ inputs.version }} not created."
+
+  # ---------------------------------------------------------------------------
+  # React — npm, same shape as the TypeScript SDK. It depends on the TypeScript
+  # SDK via `file:../typescript`, which resolves only inside this repo, so the
+  # published package must depend on the registry version instead. That rewrite
+  # happens here rather than being committed, so local development keeps using
+  # the workspace copy.
+  # ---------------------------------------------------------------------------
+  publish-react:
+    name: Publish React SDK to npm
+    if: inputs.sdk == 'react' || inputs.sdk == 'all'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Validate version input is semver
+        run: |
+          if ! [[ "${{ inputs.version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'${{ inputs.version }}' is not a valid semver version"
+            exit 1
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Build the TypeScript SDK
+        working-directory: sdk/typescript
+        run: npm ci && npm run build
+
+      - name: Install dependencies
+        working-directory: sdk/react
+        run: npm ci
+
+      - name: Test
+        working-directory: sdk/react
+        run: npm test
+
+      - name: Set version
+        working-directory: sdk/react
+        run: npm version "${{ inputs.version }}" --no-git-tag-version --allow-same-version
+
+      - name: Point the workspace dependency at the published TypeScript SDK
+        working-directory: sdk/react
+        env:
+          TARGET_VERSION: ${{ inputs.version }}
+        run: |
+          node <<'NODE'
+          const fs = require("fs");
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          const name = "@trident-indexer/sdk";
+          const range = "^" + process.env.TARGET_VERSION;
+          for (const field of ["dependencies", "peerDependencies"]) {
+            const dep = pkg[field] && pkg[field][name];
+            if (dep && dep.startsWith("file:")) {
+              pkg[field][name] = range;
+              console.log("rewrote " + field + "." + name + " -> " + range);
+            }
+          }
+          fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
+          NODE
+
+      - name: Build
+        working-directory: sdk/react
+        run: npm run build
+
+      - name: Publish to npm
+        if: ${{ !inputs.dry_run }}
+        working-directory: sdk/react
+        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Dry run — skipped publish
+        if: ${{ inputs.dry_run }}
+        working-directory: sdk/react
+        run: |
+          echo "Dry run: package built and workspace dependency rewritten, not published."
+          npm pack --dry-run

@@ -54,6 +54,15 @@ services:
       DATABASES_PASSWORD: ${POSTGRES_PASSWORD}
       PGBOUNCER_LISTEN_PORT: 6432
       PGBOUNCER_AUTH_TYPE: scram-sha-256
+      # With scram-sha-256 and no userlist file, PgBouncer has no credentials
+      # to verify against and rejects every login to the virtual `pgbouncer`
+      # database with "no such user" — which is why GET /v1/admin/db could
+      # never return 200 (the admin console was unreachable, not misrouted).
+      # AUTH_USER/AUTH_QUERY let it look the hash up in Postgres instead of
+      # maintaining a userlist that would duplicate the password in a second
+      # place.
+      PGBOUNCER_AUTH_USER: ${POSTGRES_USER}
+      PGBOUNCER_AUTH_QUERY: SELECT usename, passwd FROM pg_shadow WHERE usename=$$1
       PGBOUNCER_POOL_MODE: transaction
       PGBOUNCER_MAX_CLIENT_CONN: 1000
       # DEFAULT_POOL_SIZE is the per-(user,db) ceiling of real connections

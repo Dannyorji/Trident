@@ -48,6 +48,7 @@ groups:
             trident_indexer_rpc_retries_total / trident_indexer_rpc_failovers_total
             and trident_indexer_last_poll_timestamp_seconds for a stalled or
             struggling poll loop.
+          runbook_url: "docs/runbooks/alerts.md#ingestfreshnessfastburn"
 
       # Slow burn: 6x burn rate — exhausts the budget in ~5 days if
       # sustained. Longer windows (30m/6h) so this doesn't fire on
@@ -67,6 +68,7 @@ groups:
             trident_indexer_ledger_lag has exceeded 30s for a sustained
             share of both the last 30m and the last 6h. Not urgent enough to
             page, but investigate before it becomes a fast burn.
+          runbook_url: "docs/runbooks/alerts.md#ingestfreshnessslowburn"
 
       # Dead-man's-switch: catches a fully stalled indexer that a lag-ratio
       # rule alone can miss if the gauge itself stops updating.
@@ -81,6 +83,7 @@ groups:
           description: >-
             trident_indexer_last_poll_timestamp_seconds has not advanced —
             the indexer process may be hung, crashed, or stuck retrying RPC.
+          runbook_url: "docs/runbooks/alerts.md#indexerheartbeatstalled"
 
       # Direct threshold alert on sustained high lag (issue #293), independent
       # of the error-budget/burn-rate math above: a straightforward "lag has
@@ -103,20 +106,23 @@ groups:
             trident_indexer_rpc_errors_total / trident_indexer_rpc_active_endpoint
             (observability/rpc-alerts.yml) for whether the RPC provider is
             the cause.
+          runbook_url: "docs/runbooks/alerts.md#tridentingestlagsustainedhigh"
 
   # ---------------------------------------------------------------------------
   # Stubbed — do not enable until issue #295 (RED metrics for services/api)
-  # ships http_requests_total / http_request_duration_seconds with route and
-  # status_code labels. See docs/slo.md SLO 2 / SLO 3 for the target query
-  # shapes these rules should eventually mirror.
+  # ships the full set of labels needed for SLO 2/3. The metrics exist today
+  # as trident_api_http_requests_total and
+  # trident_api_http_request_duration_seconds (services/api/middleware/metrics.go),
+  # but are still being validated against production traffic patterns before
+  # burn-rate thresholds can be confidently set. See docs/slo.md SLO 2 / SLO 3.
   # ---------------------------------------------------------------------------
   # - name: trident-slo-api-latency-availability
   #   rules:
   #     - record: trident:api_availability_error_ratio5m
   #       expr: |
   #         1 - (
-  #           sum(rate(http_requests_total{status_code!~"5.."}[5m]))
+  #           sum(rate(trident_api_http_requests_total{status!~"5.."}[5m]))
   #           /
-  #           sum(rate(http_requests_total[5m]))
+  #           sum(rate(trident_api_http_requests_total[5m]))
   #         )
   #     # ... mirror the fast/slow burn pattern above once the metric exists.

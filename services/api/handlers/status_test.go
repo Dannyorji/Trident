@@ -62,9 +62,7 @@ func TestInternalStatus_ValidKey_Returns200(t *testing.T) {
 // TestInternalStatus_NoRawKeyLeakage sends a distinctive, known
 // X-Internal-Key value (both a wrong one on a 401 response and the correct
 // one on a 200 response) and asserts the raw key string never appears
-// anywhere in the response body. The internal key is only ever compared via
-// validAdminKey's constant-time check and never echoed, logged, or embedded
-// in an error message, so this should hold for both outcomes.
+// anywhere in the response body.
 func TestInternalStatus_NoRawKeyLeakage(t *testing.T) {
 	const rawInternalKey = "trident-internal-status-super-secret-value"
 	t.Setenv("INTERNAL_API_KEY", rawInternalKey)

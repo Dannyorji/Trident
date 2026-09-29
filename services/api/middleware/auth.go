@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
 	"net/http"
@@ -25,6 +26,27 @@ type DBAuthConfig struct {
 	}
 	// Redis is used for caching successful lookups (5 min TTL). Optional.
 	Redis *redis.Client
+	// UsageTrack receives the authenticated key's id on every successful
+	// DB-backed or cached auth (issue #615), feeding
+	// handlers.NewAPIKeyUsageTracker's batched request_count/last_used_at
+	// flush. Optional: nil disables tracking (matches main.go's existing
+	// "only start the tracker when pool != nil" behavior).
+	UsageTrack chan<- string
+}
+
+// trackUsage sends idStr on track without blocking the request: the channel
+// is large (4096) and drained every few seconds, but a request must never
+// wait on it, and a full channel must never be treated as an error, usage
+// tracking is explicitly non-critical (NewAPIKeyUsageTracker's own doc
+// comment).
+func trackUsage(track chan<- string, idStr string) {
+	if track == nil {
+		return
+	}
+	select {
+	case track <- idStr:
+	default:
+	}
 }
 
 const authCacheTTL = 5 * time.Minute
@@ -36,7 +58,12 @@ const authCacheTTL = 5 * time.Minute
 const authDBQueryTimeout = 2 * time.Second
 
 // ParseKeyHashes parses a comma-separated list of HMAC-SHA256 hex digests
-// (as stored in API_KEY_HASHES) into a set for O(1) lookup.
+// (as stored in API_KEY_HASHES) into a set for lookup.
+//
+// It reads only its argument. Falling back to API_KEY here would make a parse
+// function depend on the environment and would quietly widen the auth surface:
+// API_KEY holds a plaintext key, not a digest, so such a value could never
+// match anyway and would fail as a silent no-match rather than an error.
 func ParseKeyHashes(raw string) map[string]struct{} {
 	out := map[string]struct{}{}
 	for _, h := range strings.Split(raw, ",") {
@@ -46,6 +73,18 @@ func ParseKeyHashes(raw string) map[string]struct{} {
 		}
 	}
 	return out
+}
+
+// ConstantTimeContains checks whether target matches any hash in validHashes in
+// constant time using crypto/subtle.ConstantTimeCompare to avoid timing side-channel attacks.
+func ConstantTimeContains(validHashes map[string]struct{}, target string) bool {
+	var match int
+	for hash := range validHashes {
+		if len(hash) == len(target) {
+			match |= subtle.ConstantTimeCompare([]byte(hash), []byte(target))
+		}
+	}
+	return match == 1
 }
 
 // hmacKeyHash computes HMAC-SHA256 of key using API_KEY_SALT — used for the
@@ -87,6 +126,38 @@ func withAuthenticatedKey(ctx context.Context, idStr, network string) context.Co
 	if id, err := uuid.Parse(idStr); err == nil {
 		ctx = WithAuditAPIKeyID(ctx, &id)
 	}
+	// Also surfaces on StructuredLogging's end-of-request log line (issue
+	// #239) — see requestLogState for why this can't just be another
+	// context.WithValue.
+	SetLogAPIKeyID(ctx, idStr)
+	return ctx
+}
+
+// withLegacyAuthenticatedKey attaches identity, network and audit
+// attribution to ctx for a request authenticated via the legacy
+// API_KEY_HASHES env-var path (issue #616).
+//
+// Before this, a request on this path reached the handler with none of the
+// above set: APIKeyIDFromContext returned "" (indistinguishable from "no
+// auth ran"), NetworkFromContext silently fell through to its "testnet"
+// default several layers downstream, and the audit_log row for the request
+// had a NULL api_key_id with nothing else on it to say why — unattributable
+// for billing, audit and incident response.
+//
+// This does not call withAuthenticatedKey: that helper assumes idStr may
+// parse as a UUID naming a real api_keys row (WithAuditAPIKeyID requires
+// one — audit_log.api_key_id has a foreign key to api_keys). A legacy
+// env-var key has no such row, so fabricating a UUID for it would either
+// violate that constraint or silently misattribute the request to an
+// unrelated real key. Instead this sets LegacyEnvKeyID, a sentinel that is
+// deliberately not a UUID, and records "legacy-env" as audit_log.auth_source
+// (added by migration 0035) as the attribution in api_key_id's place.
+func withLegacyAuthenticatedKey(ctx context.Context) context.Context {
+	ctx = WithAPIKeyID(ctx, LegacyEnvKeyID)
+	ctx = WithNetwork(ctx, LegacyEnvNetwork)
+	ctx = WithAuditNetwork(ctx, LegacyEnvNetwork)
+	ctx = WithAuditAuthSource(ctx, "legacy-env")
+	SetLogAPIKeyID(ctx, LegacyEnvKeyID)
 	return ctx
 }
 
@@ -102,6 +173,11 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Public paths — skip auth entirely.
 			path := r.URL.Path
+			// /v1/version stays authenticated: it publishes the exact commit
+			// SHA and applied schema version, which narrows an attacker's
+			// search for known-vulnerable code paths. Operators debugging
+			// "which build is live?" have a key; anonymous callers do not
+			// need one. /v1/ready already covers unauthenticated liveness.
 			if path == "/v1/health" || path == "/v1/ready" || path == "/metrics" {
 				next.ServeHTTP(w, r)
 				return
@@ -127,6 +203,7 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 					if len(parts) == 2 {
 						network = parts[1]
 					}
+					trackUsage(cfg.UsageTrack, parts[0])
 					ctx := withAuthenticatedKey(r.Context(), parts[0], network)
 					next.ServeHTTP(w, r.WithContext(ctx))
 					return
@@ -149,6 +226,7 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 						cfg.Redis.Set(r.Context(), authRedisCacheKey(dbHash),
 							id+":"+network, authCacheTTL)
 					}
+					trackUsage(cfg.UsageTrack, id)
 					ctx := withAuthenticatedKey(r.Context(), id, network)
 					next.ServeHTTP(w, r.WithContext(ctx))
 					return
@@ -158,24 +236,15 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 			// ── 3. Legacy env-var fallback (API_KEY_HASHES) ────────────────
 			validHashes := ParseKeyHashes(os.Getenv("API_KEY_HASHES"))
 			if len(validHashes) > 0 {
-				if _, ok := validHashes[hmacKeyHash(key)]; ok {
-					next.ServeHTTP(w, r)
+				if ConstantTimeContains(validHashes, hmacKeyHash(key)) {
+					ctx := withLegacyAuthenticatedKey(r.Context())
+					next.ServeHTTP(w, r.WithContext(ctx))
 					return
 				}
 			}
 
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "Unauthorized")
 		})
-	}
-}
-
-// Validator returns a func(string) bool that checks whether the HMAC-SHA256
-// of the provided key is in the given valid hashes set. Used by the GraphQL
-// WebSocket handler which needs a standalone key-check function.
-func Validator(hashes map[string]struct{}) func(string) bool {
-	return func(key string) bool {
-		_, ok := hashes[hmacKeyHash(key)]
-		return ok
 	}
 }
 
@@ -206,7 +275,7 @@ func Auth(validHashes map[string]struct{}, next http.Handler) http.Handler {
 			return
 		}
 
-		if _, ok := validHashes[hmacKeyHash(key)]; !ok {
+		if !ConstantTimeContains(validHashes, hmacKeyHash(key)) {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "Unauthorized")
 			return
 		}

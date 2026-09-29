@@ -1,0 +1,68 @@
+---
+import type { PanelAction, PanelState } from '../lib/state-panel';
+
+interface Props {
+  state: PanelState;
+  title: string;
+  message: string;
+  actions?: PanelAction[];
+}
+
+const { state, title, message, actions = [] } = Astro.props;
+
+const icons: Record<PanelState, string> = {
+  no_events:
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" class="w-9 h-9 mx-auto" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>',
+  not_indexed:
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" class="w-9 h-9 mx-auto" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M12 6v6m0 0v6m0-6h6m-6 0H6" /></svg>',
+  invalid_contract:
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" class="w-9 h-9 mx-auto" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M12 6v6m0 0v6m0-6h6m-6 0H6" /></svg>',
+  api_unreachable:
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" class="w-9 h-9 mx-auto" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M3 7v6a4 4 0 014 4h10a4 4 0 014-4V7a4 4 0 00-4-4H7a4 4 0 00-4 4z" /><path stroke-linecap="round" stroke-linejoin="round" d="M12 11v4m0 0h.01" /></svg>',
+  not_found:
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" class="w-9 h-9 mx-auto" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-4.35-4.35M17 11a6 6 0 11-12 0 6 6 0 0112 0z" /></svg>',
+  info:
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" class="w-9 h-9 mx-auto" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M12 11v5m0-9h.01M12 21a9 9 0 110-18 9 9 0 010 18z" /></svg>',
+};
+---
+
+<div
+  class="rounded-xl border border-gray-800 bg-gray-900/60 px-6 py-12 text-center"
+  role="status"
+  data-state={state}
+>
+  <div class="text-indigo-300" set:html={icons[state]}></div>
+  <h3 class="text-base font-semibold text-white mt-4">{title}</h3>
+  <p class="text-sm text-gray-400 max-w-xl mx-auto mt-2 leading-relaxed">{message}</p>
+  {
+    actions.length > 0 && (
+      <div class="mt-7 flex flex-wrap items-center justify-center gap-3">
+        {
+          actions.map((action) =>
+            action.variant === 'primary' ? (
+              <a
+                href={action.href}
+                class="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium transition-colors"
+                {...(action.external
+                  ? { target: '_blank', rel: 'noopener noreferrer' }
+                  : {})}
+              >
+                {action.label}
+              </a>
+            ) : (
+              <a
+                href={action.href}
+                class="px-4 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white text-sm font-medium transition-colors"
+                {...(action.external
+                  ? { target: '_blank', rel: 'noopener noreferrer' }
+                  : {})}
+              >
+                {action.label}
+              </a>
+            ),
+          )
+        }
+      </div>
+    )
+  }
+</div>

@@ -1,3 +1,19 @@
+-- lint:allow-destructive  Step 8's DROP TABLE is the point of this migration:
+--   the legacy table's rows were copied to the partitioned table in step 5.
+--   NOTE: this exact statement caused #437 — it cascaded away six indexes that
+--   the CREATE INDEX IF NOT EXISTS statements above had silently failed to
+--   recreate, because those index names still belonged to the legacy table.
+--   Migration 0026 restores them. Kept as a waiver rather than a fix because
+--   editing an applied migration changes its checksum and breaks
+--   `sqlx migrate run` on every existing database.
+-- lint:allow-no-guard    The shadow table and its partitions are created once,
+--   inside the transaction below; a bare CREATE is what makes a re-run fail
+--   loudly rather than silently adopting a half-built table.
+-- lint:allow-long-lock   This whole migration runs inside BEGIN/COMMIT, and
+--   CREATE INDEX CONCURRENTLY cannot run inside a transaction block. The
+--   partitioned table is empty when these indexes are built, so the lock is
+--   held over no rows.
+--
 -- 0017: Convert soroban_events to RANGE-partitioned table (#244).
 --
 -- Partition key: ledger_sequence

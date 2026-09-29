@@ -67,10 +67,12 @@ func newMiniredisClient(t *testing.T) *redis.Client {
 // contractsStatsExplicitRangeReq builds a request with an explicit ledger
 // range so ContractsStats takes the single-query live-aggregation path
 // (queryContractStats) rather than the rollup fallback — keeps the DB mock
-// trivial (issue #242).
+// trivial (issue #242). network is not a query parameter (issue #612): it is
+// derived server-side from context, which defaults to "testnet" absent an
+// authenticated key here, matching this helper's prior explicit value.
 func contractsStatsExplicitRangeReq(t *testing.T) *http.Request {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodGet, "/v1/stats/contracts?from_ledger=0&to_ledger=1000000&network=testnet&limit=10", nil)
+	req := httptest.NewRequest(http.MethodGet, "/v1/stats/contracts?from_ledger=0&to_ledger=1000000&limit=10", nil)
 	req.URL.Scheme = "http"
 	req.URL.Host = "localhost:3000"
 	req.Host = "localhost:3000"
@@ -107,8 +109,8 @@ func TestContractsStats_XCache_Hit(t *testing.T) {
 	rdb := newMiniredisClient(t)
 	req := contractsStatsExplicitRangeReq(t)
 
-	cacheKey := "stats:contracts:testnet:0:1000000:10"
-	cachedBody := `{"contracts":[],"from_ledger":0,"to_ledger":1000000,"network":"testnet","generated_at":"` +
+	cacheKey := "stats:contracts:testnet:0:1000000:10:"
+	cachedBody := `{"contracts":[],"from_ledger":0,"to_ledger":1000000,"network":"testnet","has_more":false,"next_cursor":null,"generated_at":"` +
 		time.Now().UTC().Format(time.RFC3339) + `"}`
 	if err := rdb.Set(context.Background(), cacheKey, cachedBody, time.Minute).Err(); err != nil {
 		t.Fatalf("seed cache: %v", err)

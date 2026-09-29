@@ -101,3 +101,37 @@ Full rule definitions live in `observability/rpc-alerts.yml`:
 A Grafana dashboard covering latency percentiles, per-method/endpoint call
 volume, error rate by type, and active-endpoint/failover status is in
 `observability/dashboards/rpc-health.json`.
+
+## Public Webhook Delivery Guarantee
+
+Webhook delivery targets at-least-once semantics, with one known gap in the
+final hop.
+
+The indexer-to-stream hop is genuinely at-least-once: the event row and its
+`event_outbox` row are committed in the same Postgres transaction, and a relay
+publishes unpublished rows afterwards (`crates/indexer/src/db/outbox.rs`). A
+crash between commit and publish is recoverable, because the outbox row is still
+there to be relayed.
+
+The stream-to-subscriber hop is weaker. Delivery workers consume with
+`XReadGroup` and retry in-process (`services/api/webhooks.go`). A worker that
+crashes partway through the retry ladder leaves its entry in the consumer
+group's pending list, and nothing reclaims it: there is no `XAutoClaim`,
+`XClaim`, or `XPending` recovery on the webhook path today. Until that is
+implemented, at-least-once holds for subscriber errors and timeouts, but **not**
+for a delivery-worker crash. Do not present webhook delivery to users as an
+unconditional guarantee.
+
+Retries can reorder callbacks for the same subscription: if event A is retrying
+and event B succeeds immediately, consumers may observe B before A. Webhook
+consumers must deduplicate by event id and use ledger sequence plus event index
+when they need deterministic ordering.
+
+Operators should alert on three launch SLOs: delivery success ratio,
+dead-letter count, and outbox-to-delivered latency.
+
+**Replay is time-bounded.** A dead-lettered event is not silently dropped, but
+`webhook_deliveries` rows are pruned hourly by
+`DELETE FROM webhook_deliveries WHERE delivered_at < NOW() - INTERVAL '7 days'`
+(`services/api/webhooks.go`). Replay and manual investigation are therefore
+available for 7 days, after which the delivery record is gone.

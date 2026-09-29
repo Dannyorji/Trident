@@ -137,6 +137,19 @@ for await (const event of client.iterEvents(
 
 ---
 
+## Troubleshooting
+
+| Problem | Fix |
+|---------|-----|
+| `401 Unauthorized` | Your API key is missing or invalid. Check the `X-API-Key` header. |
+| `400 INVALID_ARGUMENT: limit must be...` | The `limit` parameter must be between 1 and 200. |
+| `429 Too Many Requests` | You've hit the rate limit. Wait for the `Retry-After` header value, then retry. |
+| `503 Service Unavailable` | The backend is starting up or temporarily overloaded. Retry after a few seconds. |
+| `TypeError: Cannot find module` | Run `npm install` (or `yarn` / `pnpm install`) after adding the package. |
+| Empty `events` array | The indexer may still be catching up. Check `GET /v1/ready` to confirm the backend is healthy. |
+
+---
+
 ## What's next?
 
 <CardGroup cols={2}>

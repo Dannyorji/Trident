@@ -1,0 +1,125 @@
+name: Launch readiness
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 6 * * *"
+  pull_request:
+    branches: [dev]
+    paths:
+      - "docs/runbooks/launch-readiness.md"
+      - "docs/site/api-reference/**"
+      - ".github/workflows/launch-readiness.yml"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Check that the staging launch variables are configured before running any
+  # real check against them. There is currently no staging environment for
+  # this repo, so STAGING_URL / STAGING_EXPLORER_URL / STAGING_CONTRACT_ID are
+  # unset and every run failed at the first step (issue #623).
+  #
+  # Missing configuration reports a deliberate, visibly distinct skip instead
+  # of a failure, mirroring check-staging-config in staging-deploy.yml: a
+  # permanently red required-adjacent check trains everyone to ignore it,
+  # which is worse than no signal. Once staging exists and the three
+  # variables are set under Settings -> Secrets and variables -> Actions,
+  # this job reports configured=true and the real checks below run.
+  # ---------------------------------------------------------------------------
+  check-launch-config:
+    name: Check launch variables are configured
+    runs-on: ubuntu-latest
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    steps:
+      - id: check
+        env:
+          STAGING_URL: ${{ vars.STAGING_URL }}
+          STAGING_EXPLORER_URL: ${{ vars.STAGING_EXPLORER_URL }}
+          STAGING_CONTRACT_ID: ${{ vars.STAGING_CONTRACT_ID }}
+        run: |
+          missing=()
+          [ -n "$STAGING_URL" ] || missing+=(STAGING_URL)
+          [ -n "$STAGING_EXPLORER_URL" ] || missing+=(STAGING_EXPLORER_URL)
+          [ -n "$STAGING_CONTRACT_ID" ] || missing+=(STAGING_CONTRACT_ID)
+
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::notice::Launch readiness SKIPPED: staging not configured. Missing: ${missing[*]}."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "Launch readiness SKIPPED: missing ${missing[*]}. See docs/deployment.md#staging." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+            echo "✓ All required launch variables are configured"
+            echo "Launch readiness PROCEEDING: all required variables present" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  launch-readiness:
+    name: Launch readiness
+    runs-on: ubuntu-latest
+    needs: check-launch-config
+    # Fork pull requests do not receive repository secrets, so the staging
+    # checks below cannot run for external contributors. Skip rather than
+    # fail them: a permanently red required check is worse than no signal.
+    # Also skip cleanly (rather than fail) when staging itself isn't
+    # configured yet (issue #623) - see check-launch-config above.
+    if: needs.check-launch-config.outputs.configured == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    env:
+      STAGING_URL: ${{ vars.STAGING_URL }}
+      STAGING_EXPLORER_URL: ${{ vars.STAGING_EXPLORER_URL }}
+      STAGING_CONTRACT_ID: ${{ vars.STAGING_CONTRACT_ID }}
+      MAX_HTML_BYTES: ${{ vars.LAUNCH_MAX_HTML_BYTES || '350000' }}
+      MAX_RESPONSE_MS: ${{ vars.LAUNCH_MAX_RESPONSE_MS || '2500' }}
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Explorer accessibility and page-weight smoke
+        run: |
+          html=$(mktemp)
+          # Without this guard a timeout or DNS failure aborts the step under
+          # set -e with a bare exit code and no annotation explaining why.
+          rc=0
+          metrics=$(curl --silent --show-error --location --max-time 20 --write-out '%{http_code} %{time_total} %{size_download}' --output "$html" "$STAGING_EXPLORER_URL") || rc=$?
+          if [ "$rc" != "0" ]; then
+            echo "::error::Explorer request to $STAGING_EXPLORER_URL failed (curl exit ${rc})"
+            exit 1
+          fi
+          read -r status seconds bytes <<< "$metrics"
+          [ "$status" = "200" ] || { echo "::error::Explorer returned HTTP $status"; exit 1; }
+          python3 - "$html" "$seconds" "$bytes" "$MAX_RESPONSE_MS" "$MAX_HTML_BYTES" <<'PY'
+          import re, sys
+          html_path, seconds, bytes_, max_ms, max_bytes = sys.argv[1:]
+          doc = open(html_path, encoding='utf-8', errors='ignore').read().lower()
+          ms = float(seconds) * 1000
+          size = int(bytes_)
+          errors = []
+          if '<title' not in doc: errors.append('missing <title>')
+          if not re.search(r'<html[^>]+lang=', doc): errors.append('missing html lang attribute')
+          if '<main' not in doc and 'role="main"' not in doc: errors.append('missing main landmark')
+          if ms > float(max_ms): errors.append(f'response time {ms:.0f}ms exceeds {max_ms}ms')
+          if size > int(max_bytes): errors.append(f'HTML size {size} exceeds {max_bytes} bytes')
+          if errors:
+              print('::error::' + '; '.join(errors))
+              sys.exit(1)
+          print(f'Explorer smoke passed: {size} bytes in {ms:.0f}ms')
+          PY
+
+      - name: Staging API user journey smoke
+        env:
+          STAGING_API_KEY: ${{ secrets.STAGING_API_KEY }}
+        run: |
+          [ -n "$STAGING_API_KEY" ] || { echo "::error::Missing STAGING_API_KEY secret"; exit 1; }
+          curl --silent --show-error --fail --max-time 10 "$STAGING_URL/v1/health" >/dev/null
+          curl --silent --show-error --fail --max-time 10 "$STAGING_URL/v1/ready" >/dev/null
+          curl --silent --show-error --fail --max-time 10 -H "X-API-Key: $STAGING_API_KEY" "$STAGING_URL/v1/events?contractId=$STAGING_CONTRACT_ID&limit=1" | python3 -m json.tool >/dev/null
+          # A healthy SSE stream holds the connection open, so curl must hit its
+          # --max-time and exit 28. Exit 0 means the server closed immediately,
+          # which is a broken stream, not a passing check.
+          code=0
+          curl --silent --show-error --fail --max-time 8 -H "X-API-Key: $STAGING_API_KEY" "$STAGING_URL/v1/events/stream?contractId=$STAGING_CONTRACT_ID" >/dev/null || code=$?
+          if [ "$code" = "0" ]; then
+            echo "::error::SSE stream closed immediately instead of staying open"
+            exit 1
+          fi
+          if [ "$code" != "28" ]; then
+            echo "::error::SSE stream failed with curl exit ${code}"
+            exit 1
+          fi

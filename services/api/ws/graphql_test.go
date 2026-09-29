@@ -2,6 +2,7 @@ package ws
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"io"
@@ -217,16 +218,38 @@ func TestGQLNextMsg_FieldRemap(t *testing.T) {
 
 // testGQLPipe sets up a server-side serveGQL goroutine over a net.Pipe pair
 // and returns the client-side connection and a buffered reader for it.
+//
+// It still takes a plain func(string) bool and adapts it to GraphQLDeps, so
+// every subscription test written before the query transport landed (#223)
+// exercises the same protocol loop unchanged. Tests that need a backend, a
+// rate limiter, or a specific network use testGQLPipeDeps instead.
 func testGQLPipe(t *testing.T, hub *Hub, validateKey func(string) bool) (net.Conn, *bufio.Reader) {
+	t.Helper()
+	return testGQLPipeDeps(t, hub, GraphQLDeps{Auth: authFromValidator(validateKey)})
+}
+
+// testGQLPipeDeps is testGQLPipe with the full dependency set.
+func testGQLPipeDeps(t *testing.T, hub *Hub, deps GraphQLDeps) (net.Conn, *bufio.Reader) {
 	t.Helper()
 	serverConn, clientConn := net.Pipe()
 	bufrw := bufio.NewReadWriter(bufio.NewReader(serverConn), bufio.NewWriter(serverConn))
-	go serveGQL(serverConn, bufrw, hub, validateKey)
+	go serveGQL(serverConn, bufrw, hub, deps)
 	t.Cleanup(func() {
 		_ = clientConn.Close()
 		_ = serverConn.Close()
 	})
 	return clientConn, bufio.NewReader(clientConn)
+}
+
+// authFromValidator adapts a boolean key check to a GraphQLAuthFunc, giving
+// every accepted key a fixed identity on the default network.
+func authFromValidator(validateKey func(string) bool) GraphQLAuthFunc {
+	return func(_ context.Context, key string) (string, string, bool) {
+		if !validateKey(key) {
+			return "", "", false
+		}
+		return "test-key-id", "testnet", true
+	}
 }
 
 // writeGQLFrame writes a masked text frame carrying a JSON-encoded gqlMessage.

@@ -21,3 +21,8 @@ https://api\.trident\.telocel\.com/?$
 # false), so this 404s. Delete this line if Discussions is turned on, or drop
 # the link from the docs.
 https://github\.com/Telocel-Labs/Trident/discussions
+
+# npmjs.com returns 403 to the link checker's user agent rather than serving
+# the page, so a correct link to the npm registry fails the run. The link is
+# valid in a browser; this is bot filtering, not a broken link.
+https://www\.npmjs\.com

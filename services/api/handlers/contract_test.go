@@ -2,19 +2,15 @@ package handlers_test
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
-	"strings"
 	"testing"
+	"time"
 
 	"github.com/Depo-dev/trident/services/api/gen"
 	"github.com/Depo-dev/trident/services/api/handlers"
-	"github.com/getkin/kin-openapi/openapi3"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
+	"github.com/Depo-dev/trident/services/api/internal/contracttest"
+	"github.com/Depo-dev/trident/services/api/middleware"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -44,92 +40,58 @@ func (m *ContractTestMockEventsClient) StreamEvents(ctx context.Context, req *ge
 	return nil, nil
 }
 
-// loadOpenAPISpec loads and parses the OpenAPI specification
-func loadOpenAPISpec(t *testing.T) *openapi3.T {
-	t.Helper()
-
-	// Navigate to the repository root from the handlers test directory
-	repoRoot := findRepoRoot(t)
-	specPath := filepath.Join(repoRoot, "api", "openapi.yaml")
-
-	loader := openapi3.NewLoader()
-	doc, err := loader.LoadFromFile(specPath)
-	require.NoError(t, err, "failed to load OpenAPI spec from %s", specPath)
-
-	require.NoError(t, doc.Validate(loader.Context), "OpenAPI spec is invalid")
-	return doc
+// withRouterMatchableHost sets the scheme/host fields contracttest's
+// gorillamux-based router needs to resolve a request to a documented route
+// (httptest.NewRequest alone leaves these unset), matching the pattern
+// already established in contract_xcache_test.go.
+func withRouterMatchableHost(req *http.Request) *http.Request {
+	req.URL.Scheme = "http"
+	req.URL.Host = "localhost:3000"
+	req.Host = "localhost:3000"
+	return req
 }
 
-// findRepoRoot finds the repository root by looking for .git directory
-func findRepoRoot(t *testing.T) string {
-	t.Helper()
-	dir, err := os.Getwd()
-	require.NoError(t, err)
-
-	for {
-		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
-			return dir
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			t.Fatal("could not find repository root (no .git directory found)")
-		}
-		dir = parent
+// wrapRateLimited mirrors main.go's real middleware chain closely enough for
+// contract testing: several documented 200 responses require the
+// X-RateLimit-* headers TieredRateLimit adds, which the bare handler under
+// test doesn't set on its own (issue #242). Local to this file since
+// contract_xcache_test.go's identical helper lives in package handlers, not
+// handlers_test.
+func wrapRateLimited(h http.Handler) http.Handler {
+	cfg := middleware.RateLimitConfig{
+		SliderFn: func(_ context.Context, _ string, limit, _ int64) (bool, int64, error) {
+			return true, 1, nil
+		},
+		Tiers: map[string]middleware.TierConfig{"free": {RPS: 1000, Window: time.Second}},
 	}
+	return middleware.TieredRateLimit(cfg)(h)
 }
 
-// validateResponseAgainstSchema validates an HTTP response against the OpenAPI schema
-func validateResponseAgainstSchema(t *testing.T, doc *openapi3.T, method, path string, statusCode int, responseBody []byte) {
-	t.Helper()
-
-	// For now, just validate that the response is valid JSON and the path/method exists in the spec
-	// Full schema validation can be added later if needed
-	pathItem := doc.Paths.Find(path)
-	require.NotNil(t, pathItem, "path %s not found in OpenAPI spec", path)
-
-	var operation *openapi3.Operation
-	switch strings.ToUpper(method) {
-	case http.MethodGet:
-		operation = pathItem.Get
-	case http.MethodPost:
-		operation = pathItem.Post
-	case http.MethodPut:
-		operation = pathItem.Put
-	case http.MethodPatch:
-		operation = pathItem.Patch
-	case http.MethodDelete:
-		operation = pathItem.Delete
-	default:
-		t.Fatalf("unsupported HTTP method: %s", method)
-	}
-
-	require.NotNil(t, operation, "method %s not found for path %s in OpenAPI spec", method, path)
-
-	// Validate response has the expected status code documented
-	responseRef := operation.Responses.Status(statusCode)
-	require.NotNil(t, responseRef, "status code %d not found for %s %s in OpenAPI spec", statusCode, method, path)
-
-	// Validate response body is valid JSON
-	var bodyJSON interface{}
-	err := json.Unmarshal(responseBody, &bodyJSON)
-	require.NoError(t, err, "response body is not valid JSON")
-}
-
-// TestContract_OpenAPIResponseValidation validates that real handler responses
-// match the OpenAPI specification schema
+// TestContract_OpenAPIResponseValidation validates that real handler
+// responses match the OpenAPI specification (issue #611). Previously this
+// only checked that the body was valid JSON and that the path/method/status
+// existed in the spec, never the actual response *shape* — which is exactly
+// how three incompatible error envelopes (the canonical
+// httputil.WriteErrorCtx one, a local {"error":{"message"}} helper with no
+// code/request_id, and several raw http.Error/http.NotFound plain-text
+// bodies) shipped against one documented API undetected. Now uses the
+// shared contracttest package (already the house convention in
+// contract_xcache_test.go, health_test.go, routes_inventory_test.go), which
+// runs the real kin-openapi request/response validator against the live
+// spec — full schema conformance, not just "valid JSON and the path
+// exists".
 func TestContract_OpenAPIResponseValidation(t *testing.T) {
-	doc := loadOpenAPISpec(t)
+	doc := contracttest.LoadSpec(t)
+	router := contracttest.NewRouter(t, doc)
 
 	// Test GET /v1/health response
 	t.Run("GET /v1/health", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/v1/health", nil)
+		req := withRouterMatchableHost(httptest.NewRequest(http.MethodGet, "/v1/health", nil))
 		rr := httptest.NewRecorder()
 
 		handlers.Health()(rr, req)
 
-		if rr.Code == http.StatusOK {
-			validateResponseAgainstSchema(t, doc, http.MethodGet, "/v1/health", rr.Code, rr.Body.Bytes())
-		}
+		contracttest.ValidateResponse(t, router, req, rr.Code, rr.Header(), rr.Body.Bytes())
 	})
 
 	// Test GET /v1/events response with mock gRPC client
@@ -140,7 +102,7 @@ func TestContract_OpenAPIResponseValidation(t *testing.T) {
 					Events: []*gen.Event{
 						{
 							Id:              "550e8400-e29b-41d4-a716-446655440000",
-							ContractId:      "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+							ContractId:      "CA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVSGZ",
 							LedgerSequence:  1000,
 							LedgerTimestamp: "2024-01-01T00:00:00Z",
 							TransactionHash: "abcd1234",
@@ -158,26 +120,25 @@ func TestContract_OpenAPIResponseValidation(t *testing.T) {
 		}
 		handlers.SetEventsClient(mock)
 
-		req := httptest.NewRequest(http.MethodGet, "/v1/events?limit=1", nil)
+		req := withRouterMatchableHost(httptest.NewRequest(http.MethodGet, "/v1/events?limit=1", nil))
+		req.Header.Set("X-API-Key", "contract-test-key")
 		rr := httptest.NewRecorder()
 
-		handlers.ListEvents(rr, req)
+		wrapRateLimited(http.HandlerFunc(handlers.ListEvents)).ServeHTTP(rr, req)
 
-		if rr.Code == http.StatusOK {
-			validateResponseAgainstSchema(t, doc, http.MethodGet, "/v1/events", rr.Code, rr.Body.Bytes())
-		}
+		contracttest.ValidateResponse(t, router, req, rr.Code, rr.Header(), rr.Body.Bytes())
 	})
 
 	// Test GET /v1/stats/contracts response
 	t.Run("GET /v1/stats/contracts", func(t *testing.T) {
 		// This endpoint requires DB and Redis, so we'll skip if not available
-		req := httptest.NewRequest(http.MethodGet, "/v1/stats/contracts?limit=1", nil)
+		req := withRouterMatchableHost(httptest.NewRequest(http.MethodGet, "/v1/stats/contracts?limit=1", nil))
 		rr := httptest.NewRecorder()
 
 		handlers.ContractsStats(nil, nil)(rr, req)
 
 		if rr.Code == http.StatusOK {
-			validateResponseAgainstSchema(t, doc, http.MethodGet, "/v1/stats/contracts", rr.Code, rr.Body.Bytes())
+			contracttest.ValidateResponse(t, router, req, rr.Code, rr.Header(), rr.Body.Bytes())
 		}
 	})
 }
@@ -185,7 +146,8 @@ func TestContract_OpenAPIResponseValidation(t *testing.T) {
 // TestContract_ErrorResponseValidation validates that error responses match
 // the OpenAPI specification
 func TestContract_ErrorResponseValidation(t *testing.T) {
-	doc := loadOpenAPISpec(t)
+	doc := contracttest.LoadSpec(t)
+	router := contracttest.NewRouter(t, doc)
 
 	t.Run("GET /v1/events/{id} - 404 error", func(t *testing.T) {
 		mock := &ContractTestMockEventsClient{
@@ -198,132 +160,18 @@ func TestContract_ErrorResponseValidation(t *testing.T) {
 		mux := http.NewServeMux()
 		mux.HandleFunc("GET /v1/events/{id}", handlers.GetEvent)
 
-		req := httptest.NewRequest(http.MethodGet, "/v1/events/550e8400-e29b-41d4-a716-446655440000", nil)
+		req := withRouterMatchableHost(httptest.NewRequest(http.MethodGet, "/v1/events/550e8400-e29b-41d4-a716-446655440000", nil))
 		rr := httptest.NewRecorder()
 		mux.ServeHTTP(rr, req)
 
-		if rr.Code == http.StatusNotFound {
-			validateResponseAgainstSchema(t, doc, http.MethodGet, "/v1/events/{id}", rr.Code, rr.Body.Bytes())
-		}
+		contracttest.ValidateResponse(t, router, req, rr.Code, rr.Header(), rr.Body.Bytes())
 	})
 }
 
-// TestContract_RouteParity verifies that every route registered in main.go
-// is documented in the OpenAPI spec and vice versa
-func TestContract_RouteParity(t *testing.T) {
-	doc := loadOpenAPISpec(t)
-
-	// Extract documented routes from OpenAPI spec
-	documentedRoutes := make(map[string]bool)
-	for path, pathItem := range doc.Paths.Map() {
-		if pathItem.Get != nil {
-			documentedRoutes["GET "+path] = true
-		}
-		if pathItem.Post != nil {
-			documentedRoutes["POST "+path] = true
-		}
-		if pathItem.Put != nil {
-			documentedRoutes["PUT "+path] = true
-		}
-		if pathItem.Patch != nil {
-			documentedRoutes["PATCH "+path] = true
-		}
-		if pathItem.Delete != nil {
-			documentedRoutes["DELETE "+path] = true
-		}
-	}
-
-	// Expected routes from main.go (this list should be kept in sync with main.go)
-	// Note: Some routes like /metrics, /internal/status, /ws, /graphql are intentionally
-	// excluded from the OpenAPI spec as they are internal or use different protocols
-	// Note: Admin routes and webhook routes are also currently not documented in OpenAPI
-	expectedRoutes := map[string]bool{
-		"GET /v1/health": true,
-		"GET /v1/ready":  true,
-		"GET /v1/events": true,
-		"POST /v1/events/batch": true,
-		"GET /v1/events/{id}": true,
-		"GET /v1/events/stream": true,
-		"GET /v1/admin/db": true,
-		"GET /v1/admin/keys/{id}/usage": true,
-		"POST /v1/admin/contracts": true,
-		"GET /v1/admin/contracts": true,
-		"DELETE /v1/admin/contracts/{id}": true,
-		"POST /v1/api-keys": true,
-		"GET /v1/api-keys": true,
-		"PATCH /v1/api-keys/{id}": true,
-		"DELETE /v1/api-keys/{id}": true,
-		"GET /v1/stats/indexer": true,
-		"GET /v1/contracts/{id}/events/schema": true,
-		"GET /v1/contracts/{id}/spec": true,
-		"GET /v1/contracts/{id}/storage": true,
-		"GET /v1/contracts/{id}/storage/history": true,
-		"GET /v1/stats/contracts": true,
-		"POST /v1/contracts/{id}/call": true,
-		// Webhook routes (not yet documented in OpenAPI)
-		"GET /v1/webhooks": true,
-		"POST /v1/webhooks": true,
-		"DELETE /v1/webhooks/{id}": true,
-		"PATCH /v1/webhooks/{id}/pause": true,
-		"PATCH /v1/webhooks/{id}/resume": true,
-		"GET /v1/webhooks/{id}/deliveries": true,
-		"GET /v1/webhooks/{id}/dead-letters": true,
-		"POST /v1/webhooks/{id}/dead-letters/{deliveryId}/replay": true,
-	}
-
-	// Routes that are intentionally excluded from OpenAPI documentation
-	// (internal routes, admin routes, webhook routes, etc.)
-	excludedFromOpenAPI := map[string]bool{
-		"GET /metrics": true,
-		"GET /internal/status": true,
-		"GET /ws": true,
-		"GET /graphql": true,
-		"GET /v1/admin/db": true,
-		"GET /v1/admin/keys/{id}/usage": true,
-		"POST /v1/admin/contracts": true,
-		"GET /v1/admin/contracts": true,
-		"DELETE /v1/admin/contracts/{id}": true,
-		"POST /v1/api-keys": true,
-		"GET /v1/api-keys": true,
-		"PATCH /v1/api-keys/{id}": true,
-		"DELETE /v1/api-keys/{id}": true,
-		"POST /v1/contracts/{id}/call": true, // Contract call endpoint (not yet documented)
-		"GET /v1/webhooks": true,
-		"POST /v1/webhooks": true,
-		"DELETE /v1/webhooks/{id}": true,
-		"PATCH /v1/webhooks/{id}/pause": true,
-		"PATCH /v1/webhooks/{id}/resume": true,
-		"GET /v1/webhooks/{id}/deliveries": true,
-		"GET /v1/webhooks/{id}/dead-letters": true,
-		"POST /v1/webhooks/{id}/dead-letters/{deliveryId}/replay": true,
-	}
-
-	// Check for undocumented routes (excluding intentionally excluded ones)
-	var undocumented []string
-	for route := range expectedRoutes {
-		if !documentedRoutes[route] && !excludedFromOpenAPI[route] {
-			undocumented = append(undocumented, route)
-		}
-	}
-
-	// Check for documented but not implemented routes (excluding intentionally excluded ones)
-	var unimplemented []string
-	for route := range documentedRoutes {
-		if !expectedRoutes[route] && !excludedFromOpenAPI[route] {
-			unimplemented = append(unimplemented, route)
-		}
-	}
-
-	if len(undocumented) > 0 {
-		t.Errorf("Routes registered in main.go but not documented in OpenAPI spec:\n%s",
-			strings.Join(undocumented, "\n"))
-	}
-
-	if len(unimplemented) > 0 {
-		t.Errorf("Routes documented in OpenAPI spec but not registered in main.go:\n%s",
-			strings.Join(unimplemented, "\n"))
-	}
-
-	assert.Empty(t, undocumented, "all registered routes should be documented (or intentionally excluded)")
-	assert.Empty(t, unimplemented, "all documented routes should be registered (or intentionally excluded)")
-}
+// Route<->spec parity is enforced by TestEveryRouteIsDocumentedOrExempted and
+// TestSpecHasNoPhantomOperations (services/api/routes_inventory_test.go),
+// which derive the implemented-route set from the live registration table in
+// routes.go rather than from a hand-maintained list. The previous
+// TestContract_RouteParity kept exactly such a list here ("should be kept in
+// sync with main.go") — the drift this suite exists to make structurally
+// impossible — and is superseded by the table-driven tests (issue #513).

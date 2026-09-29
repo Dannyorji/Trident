@@ -1,0 +1,27 @@
+{
+  "ci": {
+    "collect": {
+      "numberOfRuns": 3,
+      "settings": {
+        "configPath": "./explorer/.lighthouse.config.js"
+      },
+      "url": [
+        "http://localhost:3000/",
+        "http://localhost:3000/contract/CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+      ]
+    },
+    "upload": {
+      "target": "temporary-public-storage"
+    },
+    "assert": {
+      "preset": "lighthouse:recommended",
+      "assertions": {
+        "first-contentful-paint": ["error", { "maxNumericValue": 2000 }],
+        "largest-contentful-paint": ["error", { "maxNumericValue": 3000 }],
+        "cumulative-layout-shift": ["error", { "maxNumericValue": 0.1 }],
+        "speed-index": ["error", { "maxNumericValue": 4000 }],
+        "interactive": ["error", { "maxNumericValue": 3500 }]
+      }
+    }
+  }
+}

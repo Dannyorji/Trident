@@ -37,7 +37,9 @@ Trident uses the `existingSecret` pattern — sensitive values are read from a K
 kubectl create secret generic trident-secrets \
   --from-literal=DATABASE_URL="postgres://trident:password@postgres-host:5432/trident" \
   --from-literal=REDIS_URL="redis://redis-host:6379" \
-  --from-literal=ADMIN_API_KEY="$(openssl rand -hex 32)"
+  --from-literal=ADMIN_API_KEY="$(openssl rand -hex 32)" \
+  --from-literal=API_KEY_SALT="$(openssl rand -hex 32)" \
+  --from-literal=STELLAR_RPC_URL="https://soroban-testnet.stellar.org"
 ```
 
 ### 3. Install the chart
@@ -45,11 +47,15 @@ kubectl create secret generic trident-secrets \
 ```bash
 helm install trident ./helm/trident \
   --namespace trident \
-  --create-namespace \
-  --set goApi.image.tag=v0.1.0 \
-  --set indexer.image.tag=v0.1.0 \
-  --set grpcApi.image.tag=v0.1.0
+  --create-namespace
 ```
+
+With no `--set`/`-f` overrides, every workload image defaults to
+`Chart.yaml`'s `appVersion` (issue #622) — the version this chart release
+ships with, not a floating `latest` tag. Add `-f helm/trident/values-prod.yaml`
+for a production install (see [Production configuration](#production)
+below), or override an individual service's tag directly, e.g.
+`--set goApi.image.tag=v1.0.1` to run a specific hotfix.
 
 This first runs a migration Job to bring the schema up to date, then rolls
 out the app Deployments only once it succeeds — see
@@ -153,6 +159,38 @@ When disabled, the migration Job template renders nothing — no other
 chart behavior changes.
 
 ## Configuration
+
+### Production configuration {#production}
+
+`helm/trident/values-prod.yaml` (issue #622) is a starting overlay for a
+production install, applied on top of the chart defaults:
+
+```bash
+helm upgrade --install trident helm/trident \
+  -f helm/trident/values.yaml \
+  -f helm/trident/values-prod.yaml \
+  --namespace trident-prod \
+  --create-namespace
+```
+
+It strengthens the bundled Nginx's `PodDisruptionBudget` and documents the
+Ingress-based alternative (commented out — flip `nginx.enabled: false` and
+`ingress.enabled: true` to use it instead), and otherwise runs at
+`values.yaml`'s own defaults: `goApi` at 2 replicas with an HPA up to 10,
+`indexer`/`grpcApi` at 1 replica each. It deliberately does not override any
+`image.tag` — a production install should run the version-pinned image
+`Chart.yaml`'s `appVersion` resolves to, the same one this chart release
+was tested against, not a floating tag or a per-commit SHA (that per-commit
+SHA pattern is what `values-staging.yaml` and `staging-deploy.yml` use
+instead, appropriately for a CI-driven staging environment that redeploys on
+every commit to `dev`).
+
+Review `values-prod.yaml`'s own header comment before using it as-is: the
+TLS host and resource sizing in it are reasonable starting defaults, not
+your actual infrastructure, which only you can supply — replace
+`ingress.host` and the cert-manager annotation if you use the Ingress
+alternative, and size `resources.requests`/`resources.limits` per service
+against your real traffic before launch.
 
 ### Using an Ingress controller instead of Nginx
 
@@ -289,6 +327,7 @@ done
 
 kubectl create secret generic trident-secrets \
   --from-literal=DATABASE_URL=... --from-literal=REDIS_URL=... --from-literal=ADMIN_API_KEY=... \
+  --from-literal=API_KEY_SALT=... --from-literal=STELLAR_RPC_URL=... \
   --from-file=INTERNAL_CA_CERT=ca.crt \
   --from-file=INTERNAL_SERVER_CERT=server.crt --from-file=INTERNAL_SERVER_KEY=server.key \
   --from-file=INTERNAL_CLIENT_CERT=client.crt --from-file=INTERNAL_CLIENT_KEY=client.key
@@ -351,6 +390,9 @@ goApi:
 
 ### Multiple API key support
 
+For production issuance, overlap rotation, and compromise handling, follow
+the [API key lifecycle runbook](runbooks/api-key-lifecycle.md).
+
 Create API keys via the admin endpoint after deployment:
 
 ```bash
@@ -366,8 +408,9 @@ curl -X POST "$TRIDENT_HOST/v1/api-keys" \
 ## Secrets management {#secrets}
 
 Every deployment (and the migration hook Job — see
-[Database migrations](#migrations) above) reads `DATABASE_URL`, `REDIS_URL`,
-and `ADMIN_API_KEY` from a single Kubernetes Secret named by
+[Database migrations](#migrations) above) reads its sensitive configuration,
+including `DATABASE_URL`, `REDIS_URL`, `ADMIN_API_KEY`, `API_KEY_SALT`, and
+`STELLAR_RPC_URL`, from a single Kubernetes Secret named by
 `global.existingSecret` (default `trident-secrets`) via `secretKeyRef` —
 never from `values.yaml`, and never `COPY`'d into an image layer (see
 [crates/api/Dockerfile](../crates/api/Dockerfile),
@@ -422,7 +465,8 @@ value is ever typed into `kubectl` or committed anywhere.
    ```
 
    By default this expects a single backend secret at `trident/prod` with
-   `DATABASE_URL`/`REDIS_URL`/`ADMIN_API_KEY` keys — override
+   `DATABASE_URL`/`REDIS_URL`/`ADMIN_API_KEY`/`API_KEY_SALT`/`STELLAR_RPC_URL`
+   keys — override
    `global.externalSecret.data[].remoteRef` per key if your backend layout
    differs (see `helm/trident/values.yaml`).
 
@@ -459,6 +503,10 @@ spec:
         objectType: "secretsmanager"
       - objectName: "trident/prod/ADMIN_API_KEY"
         objectType: "secretsmanager"
+      - objectName: "trident/prod/API_KEY_SALT"
+        objectType: "secretsmanager"
+      - objectName: "trident/prod/STELLAR_RPC_URL"
+        objectType: "secretsmanager"
   secretObjects:
     - secretName: trident-secrets   # global.existingSecret
       type: Opaque
@@ -469,6 +517,10 @@ spec:
           key: REDIS_URL
         - objectName: "trident/prod/ADMIN_API_KEY"
           key: ADMIN_API_KEY
+        - objectName: "trident/prod/API_KEY_SALT"
+          key: API_KEY_SALT
+        - objectName: "trident/prod/STELLAR_RPC_URL"
+          key: STELLAR_RPC_URL
 ```
 
 Then mount the CSI volume on at least one pod referencing this

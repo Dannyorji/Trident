@@ -13,8 +13,11 @@ Public event explorer for Soroban contracts on Stellar. Read-only, no API key re
 | Path | Description |
 |------|-------------|
 | `/` | Landing page — search + live recent events ticker |
-| `/contract/:address` | All events for a contract, paginated, server-rendered |
+| `/contract/:address` | All events for a contract, server-rendered with pagination + filters. Distinct error/empty states, plus a live SSE feed (status pill + auto-reconnect) |
 | `/contract/:address/event/:id` | Single event detail, shareable, og:tags |
+| `/api/events.json` | Events API with classified result states (see below) |
+| `/api/events/stream` | Server-side SSE proxy for the live feed (keeps `EXPLORER_API_KEY` and the `Last-Event-ID` handshake private) |
+| `/api/recent-events.json` | Recent events feed for the homepage ticker |
 
 ## Setup
 
@@ -35,8 +38,22 @@ npm run lint       # type-check with astro check
 | `TRIDENT_TESTNET_API_URL` | Yes | Base URL for the testnet Trident REST API |
 | `TRIDENT_MAINNET_API_URL` | Yes | Base URL for the mainnet Trident REST API |
 | `EXPLORER_API_KEY` | Yes | Internal API key (free tier, created at deploy time) |
+| `TRIDENT_TESTNET_SOROBAN_RPC_URL` | No | Soroban RPC used to probe contracts on-chain (testnet default: `https://soroban-testnet.stellar.org`) |
+| `TRIDENT_MAINNET_SOROBAN_RPC_URL` | No | Soroban RPC used to probe contracts on-chain (mainnet default: `https://mainnet.sorobanrpc.com`) |
 
 The `EXPLORER_API_KEY` is used server-side only and is never sent to the browser.
+
+## Result states
+
+The explorer distinguishes failures deliberately instead of showing blank pages or raw errors:
+
+- **Loading**: the homepage ticker shows a content skeleton while the recent-events feed loads, never an empty wait.
+- **No events yet**: the contract is quiet (and being watched live), so nothing is missed.
+- **Not indexed yet**: the contract is emitting on-chain events but Trident hasn't indexed them — shown only after a best-effort Soroban RPC probe confirms the contract is live.
+- **Invalid contract**: the searched address fails the Stellar strkey format + checksum check, answered locally in milliseconds.
+- **Not found**: the event or contract isn't in the index (e.g. rotated out of retention).
+- **Indexer unavailable**: any upstream failure maps to a human-readable reason (`network`, `rate_limited`, `unauthorized`, `timeout`, `down`) with a retry path.
+- **Live feed status**: the contract page shows a persistent connection pill (connecting / live / reconnecting / off) and auto-resumes the SSE stream via `Last-Event-ID`, so no events are skipped during a drop.
 
 ## Rate limiting
 

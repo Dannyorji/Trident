@@ -53,7 +53,7 @@ def rewrite_refs(value):
 
 
 def build_schema_wrapper() -> dict:
-    document = yaml.safe_load(OPENAPI_PATH.read_text())
+    document = yaml.safe_load(OPENAPI_PATH.read_text(encoding="utf-8"))
     components = rewrite_refs(document["components"]["schemas"])
     for name, schema in components.items():
         if isinstance(schema, dict) and "title" not in schema:
@@ -70,15 +70,23 @@ def build_schema_wrapper() -> dict:
 
 def write_wrapper_schema() -> None:
     TMP_SCHEMA_PATH.parent.mkdir(parents=True, exist_ok=True)
-    TMP_SCHEMA_PATH.write_text(json.dumps(build_schema_wrapper(), indent=2, sort_keys=True) + "\n")
+    TMP_SCHEMA_PATH.write_text(
+        json.dumps(build_schema_wrapper(), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 def run_checked(command: list[str], *, capture_output: bool = False) -> str:
+    # encoding is pinned rather than left to the platform default: quicktype
+    # emits em-dashes from the spec's descriptions, and on a cp1252 default
+    # those round-trip as mojibake, so the generated files differ from what
+    # CI produces and the drift check below fails with no real change.
     result = subprocess.run(
         command,
         cwd=REPO_ROOT,
         check=True,
         text=True,
+        encoding="utf-8",
         capture_output=capture_output,
     )
     return result.stdout if capture_output else ""
@@ -103,7 +111,7 @@ def generate_go() -> None:
         capture_output=True,
     )
     TARGETS["go"].parent.mkdir(parents=True, exist_ok=True)
-    TARGETS["go"].write_text(output)
+    TARGETS["go"].write_text(output, encoding="utf-8", newline="\n")
 
 
 def generate_python() -> None:
@@ -123,7 +131,7 @@ def generate_python() -> None:
         ],
         capture_output=True,
     )
-    TARGETS["python"].write_text(output)
+    TARGETS["python"].write_text(output, encoding="utf-8", newline="\n")
 
 
 def generate_rust() -> None:
@@ -142,7 +150,7 @@ def generate_rust() -> None:
         ],
         capture_output=True,
     )
-    TARGETS["rust"].write_text(output)
+    TARGETS["rust"].write_text(output, encoding="utf-8", newline="\n")
 
     # Run rustfmt over the result so this file is byte-identical to what
     # `cargo fmt --all` produces. Without it the two CI jobs contradict each

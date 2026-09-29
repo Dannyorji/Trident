@@ -1,0 +1,80 @@
+name: Testnet Ingest Correctness
+
+# Issue #419: a correctness proof over a wide real ledger range, run against
+# live testnet RPC on a schedule rather than per-PR.
+#
+# Scheduled rather than per-PR on purpose:
+#   - It depends on public testnet RPC, so it is neither hermetic nor fast, and
+#     a testnet outage would otherwise block every unrelated PR.
+#   - Its value is catching *upstream* change — an RPC response-format shift or
+#     a protocol upgrade that a pinned fixture can never notice. That risk
+#     accrues with wall-clock time, not with our commits.
+on:
+  schedule:
+    # 06:00 UTC daily, offset from the top of the hour to avoid the cron spike.
+    - cron: "17 6 * * *"
+  # Manual runs for verifying a change to the suite itself, or for confirming a
+  # suspected upstream break out of cycle.
+  workflow_dispatch:
+    inputs:
+      ledger_span:
+        description: "Ledger span to verify (default 400)"
+        required: false
+        default: "400"
+      contract_id:
+        description: "Optional contract ID to scope the check to"
+        required: false
+        default: ""
+
+concurrency:
+  group: testnet-correctness
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  correctness:
+    name: Testnet ingest correctness
+    runs-on: ubuntu-latest
+    # Live RPC over a wide range is slow; the default 360-minute timeout would
+    # let a hung run sit for hours before anyone noticed.
+    timeout-minutes: 30
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+
+      - name: Cache Rust build artefacts
+        uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84 # v2.7.3
+        with:
+          shared-key: rust-workspace
+
+      - name: Run testnet correctness suite
+        env:
+          # Public endpoint — no credentials needed, so this runs on forks and
+          # in a repo with no secrets configured. Override with the
+          # TESTNET_RPC_URL repository variable to point at a private node.
+          TESTNET_RPC_URL: ${{ vars.TESTNET_RPC_URL || 'https://soroban-testnet.stellar.org' }}
+          # Optional: scope the proof to one known contract. Empty means verify
+          # every event in the range, which is the stronger check.
+          TESTNET_CONTRACT_ID: ${{ github.event.inputs.contract_id || vars.TESTNET_CONTRACT_ID }}
+          TESTNET_LEDGER_SPAN: ${{ github.event.inputs.ledger_span || '400' }}
+          # Turns a missing TESTNET_RPC_URL into a hard failure instead of a
+          # silent skip, so this job cannot report green without having tested.
+          REQUIRE_TESTNET_CORRECTNESS: "1"
+        run: |
+          cargo test -p trident-indexer testnet_correctness -- \
+            --nocapture --test-threads=1
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats

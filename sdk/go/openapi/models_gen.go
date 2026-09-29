@@ -21,23 +21,94 @@ func (r *OpenAPIModels) Marshal() ([]byte, error) {
 }
 
 type OpenAPIModels struct {
-	ContractEventFieldSchema    *ContractEventFieldSchema    `json:"ContractEventFieldSchema,omitempty"`
-	ContractEventSchema         *ContractEventSchema         `json:"ContractEventSchema,omitempty"`
-	ContractEventSchemaResponse *ContractEventSchemaResponse `json:"ContractEventSchemaResponse,omitempty"`
-	ContractSpecFunction        *ContractSpecFunction        `json:"ContractSpecFunction,omitempty"`
-	ContractSpecResponse        *ContractSpecResponse        `json:"ContractSpecResponse,omitempty"`
-	ContractStats               *ContractStats               `json:"ContractStats,omitempty"`
-	ContractStatsResponse       *ContractStatsResponse       `json:"ContractStatsResponse,omitempty"`
-	ContractStorageResponse     *ContractStorageResponse     `json:"ContractStorageResponse,omitempty"`
-	ContractStorageValue        *ContractStorageValue        `json:"ContractStorageValue,omitempty"`
-	ErrorResponse               *ErrorResponse               `json:"ErrorResponse,omitempty"`
-	EventListResponse           *EventListResponse           `json:"EventListResponse,omitempty"`
-	IndexerStatsResponse        *IndexerStatsResponse        `json:"IndexerStatsResponse,omitempty"`
-	LivenessResponse            *LivenessResponse            `json:"LivenessResponse,omitempty"`
-	ReadyChecks                 *ReadyChecks                 `json:"ReadyChecks,omitempty"`
-	ReadyResponse               *ReadyResponse               `json:"ReadyResponse,omitempty"`
-	SorobanEvent                *SorobanEvent                `json:"SorobanEvent,omitempty"`
-	TokenMetadataResponse       *TokenMetadataResponse       `json:"TokenMetadataResponse,omitempty"`
+	AdminKeyUsageResponse          *AdminKeyUsageResponse          `json:"AdminKeyUsageResponse,omitempty"`
+	APIKeyResponse                 *APIKeyResponse                 `json:"APIKeyResponse,omitempty"`
+	ContractCallRequest            *ContractCallRequest            `json:"ContractCallRequest,omitempty"`
+	ContractCallResponse           *ContractCallResponse           `json:"ContractCallResponse,omitempty"`
+	ContractEventFieldSchema       *ContractEventFieldSchema       `json:"ContractEventFieldSchema,omitempty"`
+	ContractEventSchema            *ContractEventSchema            `json:"ContractEventSchema,omitempty"`
+	ContractEventSchemaResponse    *ContractEventSchemaResponse    `json:"ContractEventSchemaResponse,omitempty"`
+	ContractRegistrationRequest    *ContractRegistrationRequest    `json:"ContractRegistrationRequest,omitempty"`
+	ContractResponse               *ContractResponse               `json:"ContractResponse,omitempty"`
+	ContractSpecFunction           *ContractSpecFunction           `json:"ContractSpecFunction,omitempty"`
+	ContractSpecResponse           *ContractSpecResponse           `json:"ContractSpecResponse,omitempty"`
+	ContractStats                  *ContractStats                  `json:"ContractStats,omitempty"`
+	ContractStatsResponse          *ContractStatsResponse          `json:"ContractStatsResponse,omitempty"`
+	ContractStorageHistoryResponse *ContractStorageHistoryResponse `json:"ContractStorageHistoryResponse,omitempty"`
+	ContractStorageResponse        *ContractStorageResponse        `json:"ContractStorageResponse,omitempty"`
+	ContractStorageValue           *ContractStorageValue           `json:"ContractStorageValue,omitempty"`
+	EndpointUsage                  *EndpointUsage                  `json:"EndpointUsage,omitempty"`
+	ErrorResponse                  *ErrorResponse                  `json:"ErrorResponse,omitempty"`
+	EventListResponse              *EventListResponse              `json:"EventListResponse,omitempty"`
+	IndexerStatsResponse           *IndexerStatsResponse           `json:"IndexerStatsResponse,omitempty"`
+	ListAPIKeysResponse            *ListAPIKeysResponse            `json:"ListAPIKeysResponse,omitempty"`
+	ListContractsResponse          *ListContractsResponse          `json:"ListContractsResponse,omitempty"`
+	ListWebhooksResponse           *ListWebhooksResponse           `json:"ListWebhooksResponse,omitempty"`
+	LivenessResponse               *LivenessResponse               `json:"LivenessResponse,omitempty"`
+	ReadyChecks                    *ReadyChecks                    `json:"ReadyChecks,omitempty"`
+	ReadyResponse                  *ReadyResponse                  `json:"ReadyResponse,omitempty"`
+	SorobanEvent                   *SorobanEvent                   `json:"SorobanEvent,omitempty"`
+	TokenMetadataResponse          *TokenMetadataResponse          `json:"TokenMetadataResponse,omitempty"`
+	UsageResponse                  *UsageResponse                  `json:"UsageResponse,omitempty"`
+	UsageRollupRow                 *UsageRollupRow                 `json:"UsageRollupRow,omitempty"`
+	VersionResponse                *VersionResponse                `json:"VersionResponse,omitempty"`
+	WebhookCreateRequest           *WebhookCreateRequest           `json:"WebhookCreateRequest,omitempty"`
+	WebhookCreateResponse          *WebhookCreateResponse          `json:"WebhookCreateResponse,omitempty"`
+	WebhookDelivery                *WebhookDelivery                `json:"WebhookDelivery,omitempty"`
+	WebhookReplayResponse          *WebhookReplayResponse          `json:"WebhookReplayResponse,omitempty"`
+	WebhookRotateSecretResponse    *WebhookRotateSecretResponse    `json:"WebhookRotateSecretResponse,omitempty"`
+	WebhookStatusResponse          *WebhookStatusResponse          `json:"WebhookStatusResponse,omitempty"`
+	WebhookSubscription            *WebhookSubscription            `json:"WebhookSubscription,omitempty"`
+}
+
+type APIKeyResponse struct {
+	CreatedAt                                  time.Time  `json:"created_at"`
+	CreatedBy                                  *string    `json:"created_by,omitempty"`
+	ID                                         string     `json:"id"`
+	// Raw key, returned only at creation time.           
+	Key                                        *string    `json:"key,omitempty"`
+	KeyPrefix                                  string     `json:"key_prefix"`
+	Label                                      string     `json:"label"`
+	LastUsedAt                                 time.Time  `json:"last_used_at"`
+	Network                                    Network    `json:"network"`
+	RateLimitTier                              string     `json:"rate_limit_tier"`
+	RequestCount                               int64      `json:"request_count"`
+	RevokedAt                                  *time.Time `json:"revoked_at,omitempty"`
+}
+
+type AdminKeyUsageResponse struct {
+	APIKeyID                                                        string          `json:"api_key_id"`
+	// Per-endpoint breakdown; empty when the window has no requests                
+	ByEndpoint                                                      []EndpointUsage `json:"by_endpoint"`
+	From                                                            time.Time       `json:"from"`
+	// Requests with status code < 400                                              
+	SuccessfulRequests                                              int64           `json:"successful_requests"`
+	To                                                              time.Time       `json:"to"`
+	TotalRequests                                                   int64           `json:"total_requests"`
+}
+
+type EndpointUsage struct {
+	AvgDurationMS float64 `json:"avg_duration_ms"`
+	Endpoint      string  `json:"endpoint"`
+	Requests      int64   `json:"requests"`
+}
+
+type ContractCallRequest struct {
+	// Base64-encoded XDR ScVal arguments, in order         
+	Args                                           []string `json:"args,omitempty"`
+	// Contract function name to invoke                     
+	Function                                       string   `json:"function"`
+}
+
+type ContractCallResponse struct {
+	// Simulation error message; present only when success=false                       
+	Error                                                                  *string     `json:"error,omitempty"`
+	// Raw base64 XDR of the return value; omitted on failure                          
+	RawXdr                                                                 *string     `json:"raw_xdr,omitempty"`
+	// Decoded return value; omitted when undecodable or failed                        
+	Result                                                                 interface{} `json:"result"`
+	// False when the simulation itself reported a failure (still HTTP 200)            
+	Success                                                                bool        `json:"success"`
 }
 
 type ContractEventFieldSchema struct {
@@ -65,6 +136,28 @@ type ContractEventSchemaResponse struct {
 	Network                                              Network               `json:"network"`
 }
 
+type ContractRegistrationRequest struct {
+	// Contract address (C... strkey, 56 characters)             
+	ContractID                                           string  `json:"contract_id"`
+	// Ledger sequence to start indexing from                    
+	IndexFrom                                            *int64  `json:"index_from,omitempty"`
+	// Human-readable label                                      
+	Label                                                *string `json:"label,omitempty"`
+	// Network scope; omitted or empty means all networks        
+	Network                                              *string `json:"network,omitempty"`
+}
+
+type ContractResponse struct {
+	// Stellar contract id (C... strkey).            
+	ContractID                             string    `json:"contract_id"`
+	CreatedAt                              time.Time `json:"created_at"`
+	ID                                     string    `json:"id"`
+	// Ledger sequence indexing began from.          
+	IndexFrom                              int64     `json:"index_from"`
+	Label                                  *string   `json:"label,omitempty"`
+	Network                                *string   `json:"network,omitempty"`
+}
+
 type ContractSpecFunction struct {
 	// Exported function name       
 	Name                     string `json:"name"`
@@ -88,36 +181,52 @@ type ContractSpecResponse struct {
 }
 
 type ContractStats struct {
+	AvgCPUInstructions                          float64   `json:"avg_cpu_instructions"`
+	AvgFeeCharged                               float64   `json:"avg_fee_charged"`
+	AvgReadBytes                                float64   `json:"avg_read_bytes"`
+	AvgWriteBytes                               float64   `json:"avg_write_bytes"`
 	// Soroban contract address                           
 	ContractID                                  string    `json:"contract_id"`
 	// Total events for this contract in range            
 	EventCount                                  int64     `json:"event_count"`
+	InvocationCount                             int64     `json:"invocation_count"`
 	// Timestamp of last event for this contract          
 	LastSeenAt                                  time.Time `json:"last_seen_at"`
 	// Latest ledger sequence for this contract           
 	LastSeenLedger                              int64     `json:"last_seen_ledger"`
+	TotalFeeCharged                             int64     `json:"total_fee_charged"`
 }
 
 type ContractStatsResponse struct {
-	// Contracts sorted by event count (descending)                
-	Contracts                                      []ContractStats `json:"contracts"`
-	// Lower bound of queried ledger range                         
-	FromLedger                                     int64           `json:"from_ledger"`
-	// Timestamp when response was generated                       
-	GeneratedAt                                    time.Time       `json:"generated_at"`
-	// Network queried                                             
-	Network                                        Network         `json:"network"`
-	// Upper bound of queried ledger range                         
-	ToLedger                                       int64           `json:"to_ledger"`
+	// Contracts sorted by event count (descending)                                   
+	Contracts                                                         []ContractStats `json:"contracts"`
+	// Lower bound of queried ledger range                                            
+	FromLedger                                                        int64           `json:"from_ledger"`
+	// Timestamp when response was generated                                          
+	GeneratedAt                                                       time.Time       `json:"generated_at"`
+	// Whether more pages are available                                               
+	HasMore                                                           bool            `json:"has_more"`
+	// Network queried                                                                
+	Network                                                           Network         `json:"network"`
+	// Opaque cursor to pass as the cursor parameter for the next page                
+	NextCursor                                                        *string         `json:"next_cursor,omitempty"`
+	// Upper bound of queried ledger range                                            
+	ToLedger                                                          int64           `json:"to_ledger"`
 }
 
-type ContractStorageResponse struct {
-	// Soroban contract address                                                                                  
-	ContractID                                                                            string                 `json:"contract_id"`
-	// Network queried                                                                                           
-	Network                                                                               Network                `json:"network"`
-	// Storage snapshot values (latest, or full history when queried via /storage/history)                       
-	Values                                                                                []ContractStorageValue `json:"values"`
+type ContractStorageHistoryResponse struct {
+	// The contract whose storage history was queried                                        
+	ContractID                                                        string                 `json:"contract_id"`
+	// Whether more pages are available                                                      
+	HasMore                                                           bool                   `json:"has_more"`
+	// Network the contract is indexed on                                                    
+	Network                                                           string                 `json:"network"`
+	// Opaque cursor to pass as the cursor parameter for the next page                       
+	NextCursor                                                        *string                `json:"next_cursor,omitempty"`
+	// The storage key whose history was queried                                             
+	StorageKey                                                        string                 `json:"storage_key"`
+	// Storage history entries, oldest first                                                 
+	Values                                                            []ContractStorageValue `json:"values"`
 }
 
 type ContractStorageValue struct {
@@ -133,17 +242,27 @@ type ContractStorageValue struct {
 	Value                                                              interface{} `json:"value"`
 }
 
+type ContractStorageResponse struct {
+	// Soroban contract address                                                                                  
+	ContractID                                                                            string                 `json:"contract_id"`
+	// Network queried                                                                                           
+	Network                                                                               Network                `json:"network"`
+	// Storage snapshot values (latest, or full history when queried via /storage/history)                       
+	Values                                                                                []ContractStorageValue `json:"values"`
+}
+
 type ErrorResponse struct {
 	Error Error `json:"error"`
 }
 
 type Error struct {
-	// Error code (e.g., INVALID_ARGUMENT, INTERNAL, UNAVAILABLE)        
-	Code                                                         string  `json:"code"`
-	// Human-readable error message                                      
-	Message                                                      string  `json:"message"`
-	// Request ID for debugging                                          
-	RequestID                                                    *string `json:"request_id,omitempty"`
+	// Machine-readable error code. Matches httputil.ErrorCode exactly        
+	// (services/api/internal/httputil/errors.go).                            
+	Code                                                              Code    `json:"code"`
+	// Human-readable error message                                           
+	Message                                                           string  `json:"message"`
+	// Request ID for debugging                                               
+	RequestID                                                         *string `json:"request_id,omitempty"`
 }
 
 type EventListResponse struct {
@@ -152,7 +271,7 @@ type EventListResponse struct {
 	// Whether more results are available                                    
 	HasMore                                                   bool           `json:"has_more"`
 	// Opaque cursor for next page (null if has_more is false)               
-	NextCursor                                                *string        `json:"next_cursor,omitempty"`
+	NextCursor                                                string         `json:"next_cursor"`
 }
 
 type SorobanEvent struct {
@@ -180,28 +299,68 @@ type SorobanEvent struct {
 
 type IndexerStatsResponse struct {
 	// Average poll duration in milliseconds                                                                             
-	AvgPollDurationMS                                                                         *int64                     `json:"avg_poll_duration_ms,omitempty"`
+	AvgPollDurationMS                                                                         int64                      `json:"avg_poll_duration_ms"`
 	// Current chain tip ledger (from RPC)                                                                               
-	ChainTipLedger                                                                            *int64                     `json:"chain_tip_ledger,omitempty"`
+	ChainTipLedger                                                                            int64                      `json:"chain_tip_ledger"`
 	// Cumulative events indexed                                                                                         
-	EventsIndexedTotal                                                                        *int64                     `json:"events_indexed_total,omitempty"`
+	EventsIndexedTotal                                                                        int64                      `json:"events_indexed_total"`
 	// Events processed in last poll                                                                                     
-	EventsLastPoll                                                                            *int64                     `json:"events_last_poll,omitempty"`
+	EventsLastPoll                                                                            int64                      `json:"events_last_poll"`
 	// Number of ledgers behind chain tip                                                                                
-	LagLedgers                                                                                *int64                     `json:"lag_ledgers,omitempty"`
+	LagLedgers                                                                                int64                      `json:"lag_ledgers"`
 	// Estimated wall-clock staleness in seconds: lag_ledgers times Stellar's protocol-target                            
 	// ledger close time (~5s). Null whenever lag_ledgers is null. See                                                   
 	// docs/observability/data-freshness.md for the full freshness contract this field is part                           
 	// of.                                                                                                               
-	LagSecondsEstimated                                                                       *float64                   `json:"lag_seconds_estimated,omitempty"`
+	LagSecondsEstimated                                                                       float64                    `json:"lag_seconds_estimated"`
 	// Latest indexed ledger sequence                                                                                    
-	LastLedgerIndexed                                                                         *int64                     `json:"last_ledger_indexed,omitempty"`
+	LastLedgerIndexed                                                                         int64                      `json:"last_ledger_indexed"`
 	// Timestamp of last successful poll                                                                                 
-	LastPollAt                                                                                *time.Time                 `json:"last_poll_at,omitempty"`
+	LastPollAt                                                                                time.Time                  `json:"last_poll_at"`
 	// Network name from NETWORK environment variable                                                                    
 	Network                                                                                   string                     `json:"network"`
 	// Indexer health status                                                                                             
 	Status                                                                                    IndexerStatsResponseStatus `json:"status"`
+}
+
+type ListAPIKeysResponse struct {
+	APIKeys                                                        []APIKeyResponse `json:"api_keys"`
+	// Whether another page is available.                                           
+	HasMore                                                        bool             `json:"has_more"`
+	// Opaque cursor for the next page (null if has_more is false).                 
+	NextCursor                                                     string           `json:"next_cursor"`
+}
+
+type ListContractsResponse struct {
+	Contracts                                                      []ContractResponse `json:"contracts"`
+	// Whether another page is available.                                             
+	HasMore                                                        bool               `json:"has_more"`
+	// Opaque cursor for the next page (null if has_more is false).                   
+	NextCursor                                                     string             `json:"next_cursor"`
+}
+
+type ListWebhooksResponse struct {
+	// Whether another page is available.                                                
+	HasMore                                                        bool                  `json:"has_more"`
+	// Opaque cursor for the next page (null if has_more is false).                      
+	NextCursor                                                     string                `json:"next_cursor"`
+	Webhooks                                                       []WebhookSubscription `json:"webhooks"`
+}
+
+type WebhookSubscription struct {
+	// Omitted when empty                                               
+	APIKeyID                                                 *string    `json:"apiKeyId,omitempty"`
+	ContractID                                               string     `json:"contractId"`
+	CreatedAt                                                time.Time  `json:"createdAt"`
+	ID                                                       string     `json:"id"`
+	Network                                                  string     `json:"network"`
+	// Present while deliveries are paused                              
+	PausedAt                                                 *time.Time `json:"pausedAt,omitempty"`
+	// HMAC signing secret for deliveries; omitted when empty           
+	Secret                                                   *string    `json:"secret,omitempty"`
+	TargetURL                                                string     `json:"targetUrl"`
+	// Topic filter; omitted when unfiltered                            
+	Topic0                                                   *string    `json:"topic0,omitempty"`
 }
 
 type LivenessResponse struct {
@@ -245,12 +404,118 @@ type TokenMetadataResponse struct {
 	Symbol                                                                                    *string    `json:"symbol,omitempty"`
 }
 
+type UsageResponse struct {
+	APIKeyID                                                                                    string           `json:"api_key_id"`
+	// Daily buckets from the maintained usage_rollup table, oldest first; empty when the window                 
+	// has no rollup rows.                                                                                       
+	Days                                                                                        []UsageRollupRow `json:"days"`
+	From                                                                                        time.Time        `json:"from"`
+	To                                                                                          time.Time        `json:"to"`
+	TotalErrors                                                                                 int64            `json:"total_errors"`
+	TotalRequests                                                                               int64            `json:"total_requests"`
+}
+
+type UsageRollupRow struct {
+	AvgDurationMS float64   `json:"avg_duration_ms"`
+	ErrorCount    int64     `json:"error_count"`
+	PeriodEnd     time.Time `json:"period_end"`
+	PeriodStart   time.Time `json:"period_start"`
+	RequestCount  int64     `json:"request_count"`
+}
+
+type VersionResponse struct {
+	// RFC 3339 build time, or "unknown" when not injected at build time. Not typed as date-time       
+	// because of that sentinel.                                                                       
+	BuildTimestamp                                                                              string `json:"build_timestamp"`
+	// Full git commit SHA the binary was built from, or "unknown" when not injected at build          
+	// time.                                                                                           
+	CommitSHA                                                                                   string `json:"commit_sha"`
+	// Highest applied migration version from _sqlx_migrations, as a string. Null when no              
+	// migrations have been applied yet or when Postgres is unreachable — the endpoint still           
+	// returns 200 in that case so build metadata stays available during an outage.                    
+	SchemaVersion                                                                               string `json:"schema_version"`
+	// Semantic version tag of the running build, or "dev" for a binary built without release          
+	// ldflags.                                                                                        
+	Version                                                                                     string `json:"version"`
+}
+
+type WebhookCreateRequest struct {
+	ContractID                                                                    string  `json:"contractId"`
+	Network                                                                       *string `json:"network,omitempty"`
+	// Delivery target; must be https with a publicly resolvable, non-private host        
+	TargetURL                                                                     string  `json:"targetUrl"`
+	// Optional topic filter                                                              
+	Topic0                                                                        *string `json:"topic0,omitempty"`
+}
+
+type WebhookCreateResponse struct {
+	ContractID                                            string `json:"contractId"`
+	ID                                                    string `json:"id"`
+	Network                                               string `json:"network"`
+	// HMAC signing secret — shown here and in the listing       
+	Secret                                                string `json:"secret"`
+	TargetURL                                             string `json:"targetUrl"`
+}
+
+type WebhookDelivery struct {
+	Attempt                                                           int64     `json:"attempt"`
+	Attempts                                                          int64     `json:"attempts"`
+	DeliveredAt                                                       time.Time `json:"deliveredAt"`
+	EventID                                                           string    `json:"eventId"`
+	ID                                                                int64     `json:"id"`
+	// Omitted when empty                                                       
+	ResponseBody                                                      *string   `json:"responseBody,omitempty"`
+	Status                                                            string    `json:"status"`
+	// HTTP status of the delivery attempt; omitted when none occurred          
+	StatusCode                                                        *int64    `json:"statusCode,omitempty"`
+	SubscriptionID                                                    string    `json:"subscriptionId"`
+	Success                                                           bool      `json:"success"`
+}
+
+type WebhookReplayResponse struct {
+	Attempt                            int64                       `json:"attempt"`
+	// Truncated to 500 characters                                 
+	ResponseBody                       string                      `json:"response_body"`
+	Status                             WebhookReplayResponseStatus `json:"status"`
+	// 0 when no HTTP response occurred                            
+	StatusCode                         int64                       `json:"status_code"`
+	Success                            bool                        `json:"success"`
+}
+
+type WebhookRotateSecretResponse struct {
+	ID                                                                       string `json:"id"`
+	// The demoted secret, now serving as secondary during the overlap window       
+	PreviousSecret                                                           string `json:"previousSecret"`
+	// The new primary signing secret (whsec_ prefixed)                             
+	Secret                                                                   string `json:"secret"`
+}
+
+type WebhookStatusResponse struct {
+	Status WebhookStatusResponseStatus `json:"status"`
+}
+
 // Network queried
 type Network string
 
 const (
 	Mainnet Network = "mainnet"
 	Testnet Network = "testnet"
+)
+
+// Machine-readable error code. Matches httputil.ErrorCode exactly
+// (services/api/internal/httputil/errors.go).
+type Code string
+
+const (
+	Conflict        Code = "CONFLICT"
+	Forbidden       Code = "FORBIDDEN"
+	Internal        Code = "INTERNAL"
+	InvalidArgument Code = "INVALID_ARGUMENT"
+	NotFound        Code = "NOT_FOUND"
+	PayloadTooLarge Code = "PAYLOAD_TOO_LARGE"
+	RateLimited     Code = "RATE_LIMITED"
+	Unauthorized    Code = "UNAUTHORIZED"
+	Unavailable     Code = "UNAVAILABLE"
 )
 
 // Type of event
@@ -284,4 +549,18 @@ type ReadyResponseStatus string
 const (
 	Degraded ReadyResponseStatus = "degraded"
 	FluffyOk ReadyResponseStatus = "ok"
+)
+
+type WebhookReplayResponseStatus string
+
+const (
+	Failed  WebhookReplayResponseStatus = "failed"
+	Success WebhookReplayResponseStatus = "success"
+)
+
+type WebhookStatusResponseStatus string
+
+const (
+	Paused  WebhookStatusResponseStatus = "paused"
+	Resumed WebhookStatusResponseStatus = "resumed"
 )

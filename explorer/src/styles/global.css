@@ -1,0 +1,7 @@
+@import "tailwindcss";
+
+/* Preserves the font-mono stack previously declared in tailwind.config.mjs,
+   which Tailwind 4 configures in CSS rather than a JS config file. */
+@theme {
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+}

@@ -33,7 +33,22 @@ func TestVerifyWebhookSignature(t *testing.T) {
 	}
 }
 
+// allowLoopbackWebhookTargets exempts a single test from the SSRF rules in
+// validateWebhookTargetURL (issue #453). The delivery tests drive httptest
+// servers, which are plain http:// on 127.0.0.1 and so fail both the https
+// requirement and the loopback block.
+//
+// Scoped per-test with Cleanup rather than set globally, so the validator's
+// own tests still exercise the real rules in the same binary.
+func allowLoopbackWebhookTargets(t *testing.T) {
+	t.Helper()
+	previous := allowInsecureWebhookTargets
+	allowInsecureWebhookTargets = true
+	t.Cleanup(func() { allowInsecureWebhookTargets = previous })
+}
+
 func TestDeliverWebhookSendsTimestampAndSignedPayload(t *testing.T) {
+	allowLoopbackWebhookTargets(t)
 	var (
 		gotBody      []byte
 		gotSignature string
@@ -109,6 +124,7 @@ func TestDeliverWebhookSendsTimestampAndSignedPayload(t *testing.T) {
 }
 
 func TestDeliverWebhookRetrySucceedsAfterTransientFailures(t *testing.T) {
+	allowLoopbackWebhookTargets(t)
 	var callCount atomic.Int32
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -139,6 +155,7 @@ func TestDeliverWebhookRetrySucceedsAfterTransientFailures(t *testing.T) {
 }
 
 func TestDeliverWebhookDeadLetterAfterMaxAttempts(t *testing.T) {
+	allowLoopbackWebhookTargets(t)
 	// Capture the log output to verify the dead-letter warning is emitted.
 	var callCount atomic.Int32
 
@@ -166,6 +183,7 @@ func TestDeliverWebhookDeadLetterAfterMaxAttempts(t *testing.T) {
 }
 
 func TestDeliverWebhookDeadLetterOnNetworkError(t *testing.T) {
+	allowLoopbackWebhookTargets(t)
 	// Point to a server that never responds.
 	sub := webhookSubscription{
 		ID:        "sub-net-dlq",

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
 
 	"github.com/getkin/kin-openapi/openapi3"
@@ -18,6 +19,8 @@ import (
 	"github.com/getkin/kin-openapi/routers"
 	"github.com/getkin/kin-openapi/routers/gorillamux"
 )
+
+var registerSSEDecoder sync.Once
 
 // specPath resolves api/openapi.yaml relative to this source file (not the
 // test's working directory), so callers in any package under services/api
@@ -31,6 +34,12 @@ func specPath() string {
 // on a malformed spec, since every contract test depends on it.
 func LoadSpec(t *testing.T) *openapi3.T {
 	t.Helper()
+	registerSSEDecoder.Do(func() {
+		openapi3filter.RegisterBodyDecoder("text/event-stream", func(body io.Reader, _ http.Header, _ *openapi3.SchemaRef, _ openapi3filter.EncodingFn) (any, error) {
+			data, err := io.ReadAll(body)
+			return string(data), err
+		})
+	})
 	loader := &openapi3.Loader{IsExternalRefsAllowed: false}
 	doc, err := loader.LoadFromFile(specPath())
 	if err != nil {

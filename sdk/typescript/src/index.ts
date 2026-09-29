@@ -21,6 +21,12 @@ export type { IterEventsOptions, QueryEventsFn } from "./iterator.js";
 export type { components, operations, paths } from "./api-types.gen.js";
 export { DEFAULT_RETRY_CONFIG } from "./retry.js";
 export type { RetryConfig } from "./retry.js";
+export {
+  computeSignature,
+  DEFAULT_TOLERANCE_SECONDS,
+  verifySignature,
+  WebhookVerificationError,
+} from "./webhook.js";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -28,6 +34,31 @@ export type { RetryConfig } from "./retry.js";
 
 export type Network = "mainnet" | "testnet" | "futurenet";
 export type TransportType = "rest" | "graphql";
+
+/**
+ * Default per-attempt REST timeout. Without one, a stalled server holds the
+ * caller open indefinitely: `fetch` has no built-in timeout, and the retry
+ * layer only reacts to a settled rejection, so a hung socket is never retried.
+ */
+export const DEFAULT_TIMEOUT_MS = 30_000;
+
+/**
+ * Resolves the effective per-attempt timeout: an explicit per-call value wins,
+ * then the client-level value, then {@link DEFAULT_TIMEOUT_MS}. `false` at
+ * either level disables the timeout. Non-finite or non-positive values are
+ * rejected rather than silently producing an immediate abort.
+ */
+function resolveTimeoutMs(
+  override: number | false | undefined,
+  clientValue: number | false | undefined,
+): number | false {
+  const chosen = override ?? clientValue ?? DEFAULT_TIMEOUT_MS;
+  if (chosen === false) return false;
+  if (!Number.isFinite(chosen) || chosen <= 0) {
+    throw new TridentError("INTERNAL", `timeoutMs must be a positive number or false, got ${chosen}`);
+  }
+  return chosen;
+}
 
 export interface TridentClientConfig {
   /** Falls back to the TRIDENT_BASE_URL environment variable when omitted. */
@@ -44,12 +75,21 @@ export interface TridentClientConfig {
    * Defaults to {@link DEFAULT_RETRY_CONFIG}.
    */
   retry?: RetryConfig | false;
+  /**
+   * Per-attempt timeout in milliseconds for REST requests. Each retry attempt
+   * gets a fresh budget, so this bounds how long any single request can hang
+   * rather than the retry sequence as a whole. Pass `false` to wait
+   * indefinitely. Defaults to {@link DEFAULT_TIMEOUT_MS}.
+   */
+  timeoutMs?: number | false;
 }
 
 /** Per-call options accepted by {@link TridentClient.queryEvents} and {@link TridentClient.getEventById}. */
 export interface RequestOptions {
   /** Overrides the client-level `retry` config for this call only. */
   retry?: RetryConfig | false;
+  /** Overrides the client-level `timeoutMs` for this call only. */
+  timeoutMs?: number | false;
 }
 
 // ---------------------------------------------------------------------------
@@ -194,16 +234,26 @@ export class TridentClient {
     url: string,
     schema: z.ZodType<T>,
     retryOverride?: RetryConfig | false,
+    timeoutOverride?: number | false,
   ): Promise<T> {
     const retryCfg = resolveRetryConfig(retryOverride, this.config.retry);
     const maxAttempts = retryCfg ? retryCfg.maxAttempts : 1;
+    const timeoutMs = resolveTimeoutMs(timeoutOverride, this.config.timeoutMs);
     let totalWaitedMs = 0;
 
     for (let attempt = 1; ; attempt++) {
       let res: Response;
+      // A fresh controller per attempt: an aborted signal stays aborted, so
+      // reusing one would make every retry fail instantly.
+      const controller = timeoutMs === false ? undefined : new AbortController();
+      const timer =
+        controller === undefined
+          ? undefined
+          : setTimeout(() => controller.abort(), timeoutMs as number);
       try {
-        res = await fetch(url, { headers: this.headers });
+        res = await fetch(url, { headers: this.headers, signal: controller?.signal });
       } catch (cause) {
+        const timedOut = controller?.signal.aborted === true;
         if (retryCfg && attempt < maxAttempts) {
           const waitMs = computeBackoffMs(attempt, retryCfg);
           if (totalWaitedMs + waitMs <= retryCfg.maxTotalWaitMs) {
@@ -212,15 +262,23 @@ export class TridentClient {
             continue;
           }
         }
-        const err = new TridentError(
-          attempt > 1 ? "RETRY_EXHAUSTED" : "INTERNAL",
-          attempt > 1
-            ? `Network request failed after ${attempt} attempts`
-            : "Network request failed",
-          cause,
-        );
+        const err = timedOut
+          ? new TridentError(
+              "TIMEOUT",
+              `Request timed out after ${timeoutMs}ms${attempt > 1 ? ` on each of ${attempt} attempts` : ""}`,
+              cause,
+            )
+          : new TridentError(
+              attempt > 1 ? "RETRY_EXHAUSTED" : "INTERNAL",
+              attempt > 1
+                ? `Network request failed after ${attempt} attempts`
+                : "Network request failed",
+              cause,
+            );
         err.attempts = attempt;
         throw err;
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
       }
 
       if (!res.ok) {
@@ -294,7 +352,12 @@ export class TridentClient {
     if (params.eventType) qs.set("event_type", params.eventType);
 
     const url = `${this.config.apiUrl}/v1/events?${qs.toString()}`;
-    const resp = await this.fetchJSON(url, ApiListEventsResponseSchema, options?.retry);
+    const resp = await this.fetchJSON(
+      url,
+      ApiListEventsResponseSchema,
+      options?.retry,
+      options?.timeoutMs,
+    );
 
     return {
       events: resp.events.map(apiEventToSorobanEvent),
@@ -343,7 +406,7 @@ export class TridentClient {
 
     // REST transport (default)
     const url = `${this.config.apiUrl}/v1/events/${encodeURIComponent(params.id)}`;
-    const apiEvent = await this.fetchJSON(url, ApiEventSchema, options?.retry);
+    const apiEvent = await this.fetchJSON(url, ApiEventSchema, options?.retry, options?.timeoutMs);
     return apiEventToSorobanEvent(apiEvent);
   }
 

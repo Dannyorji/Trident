@@ -9,6 +9,7 @@ How SBOM/vulnerability findings from `.github/workflows/security-scan.yml`
 |---|---|---|---|
 | SBOM | [syft](https://github.com/anchore/syft) via `anchore/sbom-action` | Each of the 3 built images (go-api, grpc-api, indexer) | push/PR to `dev`/`main`, weekly |
 | Image scan | [trivy](https://github.com/aquasecurity/trivy) | Same 3 images | push/PR to `dev`/`main`, weekly |
+| Image secret audit | `docker history` plus image config inspection | Same 4 images | push/PR to `dev`/`main`, weekly |
 | Rust deps | `cargo audit` (`rustsec/audit-check`) | Workspace `Cargo.lock` | push/PR to `dev`/`main`, weekly |
 | Go deps | `govulncheck` | `services/api`, `sdk/go` | push/PR to `dev`/`main`, weekly |
 | npm deps | `npm audit` | `explorer`, `sdk/typescript`, `sdk/react` | push/PR to `dev`/`main`, weekly |
@@ -83,7 +84,9 @@ when notified of a new advisory for an allowlisted package.
 
 This section documents how `services/api` authenticates callers, so future
 changes to the auth path (see also issues #314, #316) start from the same
-mental model.
+mental model. Operators should use the
+[API key lifecycle runbook](runbooks/api-key-lifecycle.md) for issuance,
+overlap rotation, revocation, and compromise response.
 
 ### Two key formats, two hashing schemes
 

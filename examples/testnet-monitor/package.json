@@ -1,0 +1,22 @@
+{
+  "name": "testnet-event-monitor",
+  "version": "1.0.0",
+  "description": "End-to-end example application demonstrating Soroban event indexing and live streaming on Stellar Testnet with Trident TypeScript SDK.",
+  "main": "dist/index.js",
+  "scripts": {
+    "start": "ts-node src/index.ts",
+    "build": "tsc",
+    "test": "ts-node src/index.ts --dry-run"
+  },
+  "dependencies": {
+    "@trident/sdk": "file:../../sdk/typescript",
+    "dotenv": "^16.4.5",
+    "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.24",
+    "@types/ws": "^8.5.10",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3"
+  }
+}

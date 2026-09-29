@@ -3,6 +3,24 @@ title: "Changelog"
 description: "Version history and release notes for Trident API, SDK, and Indexer releases."
 ---
 
+## Unreleased
+
+### Changed
+
+- **`next_cursor` now serialises identically on every list endpoint** (wire-format change to `GET /v1/admin/contracts`).
+
+  `GET /v1/admin/contracts` previously tagged `next_cursor` with `omitempty`, so the field **disappeared** from the response object on the last page. Every other list endpoint (`GET /v1/events`, `GET /v1/api-keys`, `GET /v1/webhooks`) emitted an explicit `null`. The `omitempty` has been dropped, so all list endpoints now agree:
+
+  ```json
+  {"contracts": [], "has_more": false, "next_cursor": null}
+  ```
+
+  The field's **meaning is unchanged** — it was, and still is, "the cursor for the next page, or nothing if this is the last page". Only its representation on the last page changed, from *absent* to `null`.
+
+  Explicit `null` is normative and is now documented as such in `api/openapi.yaml`. It is the better default because absence and `null` are not equivalent to a strictly-typed client: an absent key cannot be distinguished from a server too old to send the field, whereas `null` unambiguously means "no next page". Fixing one representation across all endpoints is what lets an SDK auto-pager loop on a single rule instead of special-casing per endpoint.
+
+  **Who is affected:** callers of `GET /v1/admin/contracts` that branch on the *presence* of the `next_cursor` key (for example `if ("next_cursor" in body)`, or a strict schema that rejects unexpected `null`). Callers that already test `next_cursor` for null/undefined — including all Trident SDKs — need no change.
+
 ## v0.1.0 (Phase 1 — MVP Release)
 
 *Released: Q1 2026*

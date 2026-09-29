@@ -1,4 +1,6 @@
 ---
+import '../styles/global.css';
+
 interface Props {
   title: string;
   description?: string;
@@ -35,6 +37,7 @@ const fullTitle = title ? `${title} | Trident Explorer` : 'Trident Explorer';
       </a>
       <nav class="flex gap-5 text-sm text-gray-400">
         <a href="/" class="hover:text-white transition-colors">Explorer</a>
+        <a href="/status" class="hover:text-white transition-colors">Status</a>
         <a
           href="https://docs.trident.dev"
           class="hover:text-white transition-colors"
@@ -54,8 +57,9 @@ const fullTitle = title ? `${title} | Trident Explorer` : 'Trident Explorer';
       <slot />
     </main>
 
-    <footer class="border-t border-gray-800 px-4 py-4 text-center text-xs text-gray-500">
-      Trident &mdash; Soroban Event Indexer for Stellar
+    <footer class="border-t border-gray-800 px-4 py-4 text-center text-xs text-gray-500 flex justify-between items-center max-w-6xl mx-auto">
+      <span>Trident &mdash; Soroban Event Indexer for Stellar</span>
+      <a href="/status" class="hover:text-gray-300 transition-colors">System Status</a>
     </footer>
   </body>
 </html>

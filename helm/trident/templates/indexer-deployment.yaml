@@ -1,3 +1,21 @@
+{{/*
+Single-writer indexer (issue #418).
+
+The indexer has no leader election or distributed cursor coordination. Two
+replicas against one database are *safe* — the natural-key UNIQUE constraint
+(migration 0025) makes event persistence exactly-once, and the cursor advance is
+monotonic, so neither duplicates rows nor rewinds progress — but they are not
+*useful*: both poll the same ranges and do the same work twice, paying double
+the RPC quota for no additional throughput.
+
+The chart enforces this rather than trusting the value, so a
+`--set indexer.replicaCount=3` cannot quietly create that situation. The
+concurrency guarantees exist to make an accidental double-deploy survivable,
+not to support scale-out.
+*/}}
+{{- if gt (int .Values.indexer.replicaCount) 1 -}}
+{{- fail (printf "indexer.replicaCount is %d: the indexer is single-writer (issue #418). Scaling it out doubles RPC cost without adding throughput. See docs/deployment.md." (int .Values.indexer.replicaCount)) -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -6,8 +24,14 @@ metadata:
     {{- include "trident.labels" . | nindent 4 }}
     app.kubernetes.io/component: indexer
 spec:
-  # Distributed cursor management is not yet supported — keep at 1 replica.
+  # Single-writer by design — see the note at the top of this file (issue #418).
   replicas: {{ .Values.indexer.replicaCount }}
+  # Recreate, not RollingUpdate: a rolling deploy would run the old and new pods
+  # concurrently, which is the accidental double-write the note above describes.
+  # A brief gap in indexing is cheaper and self-healing — the cursor resumes
+  # exactly where it stopped.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "trident.selectorLabels" (dict "root" . "component" "indexer") | nindent 6 }}
@@ -21,7 +45,7 @@ spec:
         {{- include "trident.podSecurityContext" (dict "uid" .Values.indexer.securityContextUid) | nindent 8 }}
       containers:
         - name: indexer
-          image: "{{ .Values.indexer.image.repository }}:{{ .Values.indexer.image.tag }}"
+          image: "{{ .Values.indexer.image.repository }}:{{ .Values.indexer.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           securityContext:
             {{- include "trident.containerSecurityContext" . | nindent 12 }}
@@ -43,6 +67,11 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.global.existingSecret }}
                   key: REDIS_URL
+            - name: STELLAR_RPC_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.global.existingSecret }}
+                  key: STELLAR_RPC_URL
             {{- range $k, $v := .Values.indexer.env }}
             - name: {{ $k }}
               value: {{ $v | quote }}

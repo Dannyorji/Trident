@@ -7,6 +7,19 @@ All Trident list endpoints use **cursor-based pagination**. Each response includ
 
 ---
 
+## Endpoints with pagination
+
+| Endpoint | Cursor parameter | Response fields |
+|----------|-----------------|-----------------|
+| `GET /v1/events` | `cursor` | `has_more`, `next_cursor` |
+| `GET /v1/api-keys` | `cursor` | `has_more`, `next_cursor` |
+| `GET /v1/stats/contracts` | `cursor` | `has_more`, `next_cursor` |
+| `GET /v1/contracts/{id}/storage/history` | `cursor` | `has_more`, `next_cursor` |
+
+Every list endpoint returns the same pagination envelope: an opaque `next_cursor` string, and a `has_more` boolean.
+
+---
+
 ## How it works
 
 A typical paginated response looks like:

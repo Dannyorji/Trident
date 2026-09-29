@@ -62,6 +62,8 @@ type metricsResponseWriter struct {
 	statusCode int
 }
 
+func (w *metricsResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
 func (w *metricsResponseWriter) WriteHeader(code int) {
 	w.statusCode = code
 	w.ResponseWriter.WriteHeader(code)

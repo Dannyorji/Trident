@@ -1,0 +1,278 @@
+audit_log analytics + cleanup: EXPLAIN evidence for issue #247
+================================================================================
+
+Environment
+-----------
+PostgreSQL 16.13 (postgres:16-alpine), default configuration.
+Schema built from database/schema.sql.
+
+Seed: 50 api_keys, 2,000,000 audit_log rows spread over 120 days, six
+distinct endpoints, a realistic status_code mix (~73% 2xx, the rest
+400/429/500), duration_ms 1..400. Table size after seeding: 312 MB.
+ANALYZE run before every measurement; VACUUM ANALYZE run after the migration
+so the visibility map permits index-only scans.
+
+Queries measured (verbatim shapes from the source)
+--------------------------------------------------
+Q1  services/api/handlers/admin.go:143   total requests for a key over a range
+Q2  services/api/handlers/admin.go:154   successful (status_code < 400) subset
+Q3  services/api/handlers/admin.go:165   per-endpoint count + avg duration
+Q4  services/api/main.go:650             retention cleanup (DELETE ... LIMIT 1000)
+Q5  services/api/handlers/usage.go       RollupUsage per-key/per-day aggregate
+
+Indexes before: idx_audit_log_key_ts (api_key_id, ts DESC)   [migration 0006]
+                idx_audit_log_ts     (ts DESC)               [migration 0006]
+
+Indexes after:  idx_audit_log_key_ts_covering
+                    (api_key_id, ts DESC) INCLUDE (status_code, endpoint, duration_ms)
+                idx_audit_log_rollup
+                    (ts) INCLUDE (api_key_id, status_code, duration_ms)
+                    WHERE api_key_id IS NOT NULL
+                idx_audit_log_ts     (ts DESC)               [kept]
+                idx_audit_log_key_ts                         [dropped: strict prefix
+                                                              of the covering index]
+
+Index sizes after: idx_audit_log_key_ts_covering  135 MB
+                   idx_audit_log_rollup             95 MB
+                   idx_audit_log_ts                 20 MB
+
+
+Summary
+-------
+                     buffers          buffers        exec ms     exec ms
+  query              before           after          before      after
+  ---------------------------------------------------------------------
+  Q1  total          10,013           123            99.210      5.834
+  Q2  success        10,013           123            47.594      3.832
+  Q3  by-endpoint    10,016           126            24.185      ~2
+  Q4  cleanup        2,060            2,124          19.326      14.799
+  Q5  rollup         16,711           457            128.038     23.963
+
+No query seq-scanned before except Q4's inner scan, which is analysed at the
+bottom and is the correct plan for its predicate. The cost being removed here
+is heap I/O, not a missing lookup: the 0006 indexes carried only their key
+columns, so every matching row had to be visited in the heap to read
+status_code / endpoint / duration_ms. The covering indexes make those scans
+index-only.
+
+
+================================================================================
+BEFORE
+================================================================================
+
+### Q1 total requests (admin.go:143)
+ Aggregate (actual rows=1 loops=1)
+   Buffers: shared hit=3774 read=6239 written=5008
+   ->  Bitmap Heap Scan on audit_log (actual rows=9999 loops=1)
+         Recheck Cond: ((api_key_id = '...'::uuid) AND (ts >= (now() - '30 days'::interval)) AND (ts < now()))
+         Heap Blocks: exact=9999
+         Buffers: shared hit=3774 read=6239 written=5008
+         ->  Bitmap Index Scan on idx_audit_log_key_ts (actual rows=9999 loops=1)
+               Index Cond: ((api_key_id = '...'::uuid) AND (ts >= (now() - '30 days'::interval)) AND (ts < now()))
+               Buffers: shared read=14
+ Planning Time: 1.382 ms
+ Execution Time: 99.210 ms
+
+### Q2 successful requests, status_code < 400 (admin.go:154)
+ Aggregate (actual rows=1 loops=1)
+   Buffers: shared hit=4843 read=5170 written=1000
+   ->  Bitmap Heap Scan on audit_log (actual rows=7272 loops=1)
+         Recheck Cond: ((api_key_id = '...'::uuid) AND (ts >= (now() - '30 days'::interval)) AND (ts < now()))
+         Filter: (status_code < 400)
+         Rows Removed by Filter: 2727
+         Heap Blocks: exact=9999
+         Buffers: shared hit=4843 read=5170 written=1000
+         ->  Bitmap Index Scan on idx_audit_log_key_ts (actual rows=9999 loops=1)
+               Buffers: shared read=14
+ Planning Time: 0.282 ms
+ Execution Time: 47.594 ms
+
+  Note the wasted work: all 9,999 rows are fetched from the heap and 2,727
+  are then discarded by the status_code filter, after their heap I/O is paid.
+
+### Q3 by-endpoint breakdown (admin.go:165)
+ Sort (actual rows=3 loops=1)
+   Sort Key: (count(*)) DESC
+   Buffers: shared hit=10016
+   ->  HashAggregate (actual rows=3 loops=1)
+         Group Key: endpoint
+         Buffers: shared hit=10013
+         ->  Bitmap Heap Scan on audit_log (actual rows=9999 loops=1)
+               Recheck Cond: ((api_key_id = '...'::uuid) AND (ts >= ...) AND (ts < now()))
+               Heap Blocks: exact=9999
+               Buffers: shared hit=10013
+               ->  Bitmap Index Scan on idx_audit_log_key_ts (actual rows=9999 loops=1)
+                     Buffers: shared hit=14
+ Planning Time: 0.895 ms
+ Execution Time: 24.185 ms
+
+### Q4 retention cleanup (main.go:650)
+ Delete on audit_log (actual rows=0 loops=1)
+   Buffers: shared hit=2013 read=47 dirtied=48 written=32
+   ->  Nested Loop (actual rows=1000 loops=1)
+         ->  HashAggregate (actual rows=1000 loops=1)
+               Group Key: "ANY_subquery".ctid
+               ->  Subquery Scan on "ANY_subquery" (actual rows=1000 loops=1)
+                     ->  Limit (actual rows=1000 loops=1)
+                           ->  Seq Scan on audit_log audit_log_1 (actual rows=1000 loops=1)
+                                 Filter: (ts < (now() - ('90 days'::cstring)::interval))
+                                 Rows Removed by Filter: 3059
+                                 Buffers: shared hit=20 read=40 written=32
+         ->  Tid Scan on audit_log (actual rows=1 loops=1000)
+               TID Cond: (ctid = "ANY_subquery".ctid)
+ Planning Time: 2.951 ms
+ Execution Time: 19.326 ms
+
+### Q5 usage rollup (usage.go RollupUsage)
+ HashAggregate (actual rows=20 loops=1)
+   Group Key: api_key_id, date_trunc('day'::text, ts)
+   Buffers: shared hit=8661 read=8050 written=1
+   ->  Bitmap Heap Scan on audit_log (actual rows=33287 loops=1)
+         Recheck Cond: (ts >= (now() - '2 days'::interval))
+         Filter: (api_key_id IS NOT NULL)
+         Heap Blocks: exact=16667
+         Buffers: shared hit=8661 read=8050 written=1
+         ->  Bitmap Index Scan on idx_audit_log_ts (actual rows=33287 loops=1)
+               Buffers: shared hit=3 read=41
+ Planning Time: 0.324 ms
+ Execution Time: 128.038 ms
+
+
+================================================================================
+AFTER (migration 0029 applied)
+================================================================================
+
+### Q1 total requests (admin.go:143)
+ Aggregate (actual rows=1 loops=1)
+   Buffers: shared hit=32 read=91
+   ->  Index Only Scan using idx_audit_log_key_ts_covering on audit_log (actual rows=9999 loops=1)
+         Index Cond: ((api_key_id = '...'::uuid) AND (ts >= (now() - '30 days'::interval)) AND (ts < now()))
+         Heap Fetches: 32
+         Buffers: shared hit=32 read=91
+ Planning Time: 3.795 ms
+ Execution Time: 5.834 ms
+
+  10,013 buffers -> 123, and 9,999 heap blocks -> 32 heap fetches.
+
+### Q2 successful requests, status_code < 400 (admin.go:154)
+ Aggregate (actual rows=1 loops=1)
+   Buffers: shared hit=123
+   ->  Index Only Scan using idx_audit_log_key_ts_covering on audit_log (actual rows=7272 loops=1)
+         Index Cond: ((api_key_id = '...'::uuid) AND (ts >= ...) AND (ts < now()))
+         Filter: (status_code < 400)
+         Rows Removed by Filter: 2727
+         Heap Fetches: 32
+         Buffers: shared hit=123
+ Planning Time: 0.597 ms
+ Execution Time: 3.832 ms
+
+  The 2,727 rows are still filtered out, but status_code is now read from the
+  index leaf, so they cost no heap I/O.
+
+### Q3 by-endpoint breakdown (admin.go:165)
+ Sort (actual rows=3 loops=1)
+   Sort Key: (count(*)) DESC
+   Buffers: shared hit=126
+   ->  HashAggregate (actual rows=3 loops=1)
+         Group Key: endpoint
+         Buffers: shared hit=123
+         ->  Index Only Scan using idx_audit_log_key_ts_covering on audit_log (actual rows=9999 loops=1)
+               Index Cond: ((api_key_id = '...'::uuid) AND (ts >= ...) AND (ts < now()))
+               Heap Fetches: 32
+               Buffers: shared hit=123
+ Planning Time: 1.687 ms
+
+  endpoint and duration_ms both come from the index, so the aggregate never
+  touches the heap.
+
+### Q4 retention cleanup (main.go:650)
+ Delete on audit_log (actual rows=0 loops=1)
+   Buffers: shared hit=2075 read=49 dirtied=48
+   ->  Nested Loop (actual rows=1000 loops=1)
+         ->  HashAggregate (actual rows=1000 loops=1)
+               ->  Subquery Scan on "ANY_subquery" (actual rows=1000 loops=1)
+                     ->  Limit (actual rows=1000 loops=1)
+                           ->  Seq Scan on audit_log audit_log_1 (actual rows=1000 loops=1)
+                                 Filter: (ts < (now() - ('90 days'::cstring)::interval))
+                                 Rows Removed by Filter: 3866
+                                 Buffers: shared hit=35 read=41
+         ->  Tid Scan on audit_log (actual rows=1 loops=1000)
+ Planning Time: 3.090 ms
+ Execution Time: 14.799 ms
+
+  Unchanged, and deliberately so — see the analysis below.
+
+### Q5 usage rollup (usage.go RollupUsage)
+ HashAggregate (actual rows=20 loops=1)
+   Group Key: api_key_id, date_trunc('day'::text, ts)
+   Buffers: shared hit=457
+   ->  Index Only Scan using idx_audit_log_rollup on audit_log (actual rows=33264 loops=1)
+         Index Cond: (ts >= (now() - '2 days'::interval))
+         Heap Fetches: 252
+         Buffers: shared hit=457
+ Planning Time: 0.343 ms
+ Execution Time: 23.963 ms
+
+  16,711 buffers -> 457. The partial predicate (api_key_id IS NOT NULL)
+  matches the job's WHERE clause exactly, so it also disappears as a recheck.
+
+
+================================================================================
+Q4: why the cleanup's Seq Scan is the correct plan
+================================================================================
+
+The retention cleanup's inner scan is a Seq Scan both before and after this
+migration. That is not a missing index — it is the cheapest plan available,
+and forcing an index scan onto it would make it slower.
+
+The predicate is not selective. With a 90-day retention window against 120
+days of seeded data:
+
+  older_than_90d |  total
+ ----------------+---------
+          496072 | 1996000
+
+25% of the table qualifies. The query then takes `LIMIT 1000`, so the
+executor needs only the first 1,000 matching rows. A sequential scan reaches
+them almost immediately; descending idx_audit_log_ts and then fetching 1,000
+scattered ctids would cost more.
+
+The obvious suspicion about this query is its predicate shape — building the
+interval by concatenating a bind parameter,
+`ts < NOW() - ($1 || ' days')::INTERVAL`, looks like it should defeat the
+planner's selectivity estimate. It does not. Measured three ways:
+
+  Q4a  ts < NOW() - ('90' || ' days')::INTERVAL   (current shape)
+       Seq Scan, Rows Removed by Filter: 3564, Buffers: hit=32 read=38, 3.899 ms
+
+  Q4b  ts < NOW() - make_interval(days => 90)
+       Seq Scan, Rows Removed by Filter: 2992, Buffers: hit=24 read=35, 2.299 ms
+
+  Q4c  ts < (NOW() - INTERVAL '90 days')          (precomputed)
+       Seq Scan, Rows Removed by Filter: 2970, Buffers: hit=28 read=31, 1.685 ms
+
+Same plan, same order of cost, in all three. The concatenation is not what
+drives the choice; the predicate's low selectivity is. So the cleanup query
+is left exactly as it is.
+
+idx_audit_log_ts is nevertheless kept. If the data shape changes — a backlog
+cleared down to a small tail, or a longer retention window — the predicate
+becomes selective, the planner switches to the index on its own, and it is
+there to be used. It is also the only index able to serve a time-range
+predicate over rows where api_key_id IS NULL, which idx_audit_log_rollup
+excludes by construction.
+
+
+================================================================================
+Reproducing
+================================================================================
+
+  docker run -d --name trident-audit-explain \
+    -e POSTGRES_PASSWORD=trident -e POSTGRES_DB=trident -p 55432:5432 postgres:16-alpine
+
+  psql -f database/schema.sql
+  # seed 50 keys and 2M rows over 120 days, then ANALYZE audit_log
+  # capture the five plans with EXPLAIN (ANALYZE, BUFFERS)
+  psql -f database/migrations/0029_audit_log_analytics_indexes.sql
+  psql -c 'VACUUM ANALYZE audit_log'
+  # capture the five plans again

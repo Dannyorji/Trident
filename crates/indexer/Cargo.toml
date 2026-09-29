@@ -14,6 +14,10 @@ tokio-console = ["dep:console-subscriber"]
 trident-common = { path = "../common" }
 anyhow = "1"
 
+# CLI subcommands (issue #574: `trident-indexer replay ...`). The daemon
+# entrypoint (no subcommand) is unaffected.
+clap = { version = "4", features = ["derive"] }
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
@@ -84,3 +88,5 @@ wiremock = "0.6"
 # Database integration tests
 sqlx = { version = "0.7", features = ["postgres", "runtime-tokio-native-tls", "uuid", "chrono", "json", "macros"] }
 metrics-util = { version = "0.20.4", default-features = false, features = ["debugging"] }
+# Property-based testing for XDR parser fuzz coverage (issue #416)
+proptest = "1"

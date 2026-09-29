@@ -155,7 +155,7 @@ func ValidateRFC3339(field, value string) (time.Time, *ValidationError) {
 }
 
 // ValidateTimeRange parses a required [from, to) timestamp window.
-func ValidateTimeRange(fromField, toField, fromValue, toValue string) (time.Time, time.Time, *ValidationError) {
+func ValidateTimeRange(fromField, toField, fromValue, toValue string, maxDuration time.Duration) (time.Time, time.Time, *ValidationError) {
 	from, verr := ValidateRFC3339(fromField, fromValue)
 	if verr != nil {
 		return time.Time{}, time.Time{}, verr
@@ -166,6 +166,9 @@ func ValidateTimeRange(fromField, toField, fromValue, toValue string) (time.Time
 	}
 	if to.Before(from) {
 		return time.Time{}, time.Time{}, Errorf(toField, "must be >= %s", fromField)
+	}
+	if maxDuration > 0 && to.Sub(from) > maxDuration {
+		return time.Time{}, time.Time{}, Errorf(toField, "range cannot exceed %v", maxDuration)
 	}
 	return from, to, nil
 }

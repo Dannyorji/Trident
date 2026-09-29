@@ -65,7 +65,7 @@ except TridentApiError as e:
 
 ## Regenerating OpenAPI models
 
-Install the generator dependency once with `python3 -m pip install PyYAML`, then run:
+See [docs/sdk-regeneration.md](../../docs/sdk-regeneration.md) for the full cross-SDK procedure (regenerating all SDKs together, version consistency, testing after regeneration). Quick version — install the generator dependency once with `python3 -m pip install PyYAML`, then run:
 
 ```bash
 python3 scripts/generate_sdk_models.py --language python

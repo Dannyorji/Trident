@@ -44,7 +44,7 @@ spec:
         {{- include "trident.podSecurityContext" (dict "uid" .Values.migrations.securityContextUid) | nindent 8 }}
       containers:
         - name: migrate
-          image: "{{ .Values.migrations.image.repository }}:{{ .Values.migrations.image.tag }}"
+          image: "{{ .Values.migrations.image.repository }}:{{ .Values.migrations.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           securityContext:
             {{- include "trident.containerSecurityContext" . | nindent 12 }}

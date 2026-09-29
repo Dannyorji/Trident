@@ -98,6 +98,8 @@ type bodySizeResponseWriter struct {
 	wroteHeader bool
 }
 
+func (w *bodySizeResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
 func (w *bodySizeResponseWriter) WriteHeader(code int) {
 	if w.wroteHeader {
 		return

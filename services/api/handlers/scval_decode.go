@@ -52,6 +52,35 @@ func decodeScValJSON(v xdr.ScVal) any {
 		if v.I128 != nil {
 			return i128ToString(*v.I128)
 		}
+	case xdr.ScValTypeScvU256:
+		if v.U256 != nil {
+			return u256ToString(*v.U256)
+		}
+	case xdr.ScValTypeScvI256:
+		if v.I256 != nil {
+			return i256ToString(*v.I256)
+		}
+	case xdr.ScValTypeScvTimepoint:
+		if v.Timepoint != nil {
+			return fmt.Sprintf("%d", *v.Timepoint)
+		}
+	case xdr.ScValTypeScvDuration:
+		if v.Duration != nil {
+			return fmt.Sprintf("%d", *v.Duration)
+		}
+	case xdr.ScValTypeScvError:
+		// xdr.ScError is a union with no String method of its own. Render the
+		// arm the discriminant selects: contract errors carry a numeric code,
+		// every other type carries an ScErrorCode.
+		if v.Error != nil {
+			if v.Error.Type == xdr.ScErrorTypeSceContract && v.Error.ContractCode != nil {
+				return fmt.Sprintf("%s(%d)", v.Error.Type.String(), *v.Error.ContractCode)
+			}
+			if v.Error.Code != nil {
+				return fmt.Sprintf("%s(%s)", v.Error.Type.String(), v.Error.Code.String())
+			}
+			return v.Error.Type.String()
+		}
 	case xdr.ScValTypeScvBytes:
 		if v.Bytes != nil {
 			return base64.StdEncoding.EncodeToString(*v.Bytes)
@@ -114,6 +143,30 @@ func i128ToString(v xdr.Int128Parts) string {
 	full := new(big.Int).Lsh(big.NewInt(int64(v.Hi)), 64)
 	full.Add(full, new(big.Int).SetUint64(uint64(v.Lo)))
 	return full.String()
+}
+
+// u256ToString renders an unsigned 256-bit ScVal as a base-10 string.
+func u256ToString(v xdr.UInt256Parts) string {
+	res := new(big.Int).SetUint64(uint64(v.HiHi))
+	res.Lsh(res, 64)
+	res.Add(res, new(big.Int).SetUint64(uint64(v.HiLo)))
+	res.Lsh(res, 64)
+	res.Add(res, new(big.Int).SetUint64(uint64(v.LoHi)))
+	res.Lsh(res, 64)
+	res.Add(res, new(big.Int).SetUint64(uint64(v.LoLo)))
+	return res.String()
+}
+
+// i256ToString renders a signed 256-bit ScVal as a base-10 string.
+func i256ToString(v xdr.Int256Parts) string {
+	res := big.NewInt(int64(v.HiHi))
+	res.Lsh(res, 64)
+	res.Add(res, new(big.Int).SetUint64(uint64(v.HiLo)))
+	res.Lsh(res, 64)
+	res.Add(res, new(big.Int).SetUint64(uint64(v.LoHi)))
+	res.Lsh(res, 64)
+	res.Add(res, new(big.Int).SetUint64(uint64(v.LoLo)))
+	return res.String()
 }
 
 // scAddressToString renders an ScAddress (account or contract) as its

@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Depo-dev/trident/services/api/cursor"
+	"github.com/Depo-dev/trident/services/api/internal/httputil"
 	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -16,12 +18,6 @@ import (
 type ContractConfig struct {
 	AdminKey string
 	DB       *pgxpool.Pool
-}
-
-// errorBody builds the {"error":{"message":...}} envelope used by this
-// file's writeJSON error responses.
-func errorBody(message string) map[string]any {
-	return map[string]any{"error": map[string]any{"message": message}}
 }
 
 // ContractResponse is the JSON representation of an indexed_contracts row.
@@ -42,10 +38,21 @@ type CreateContractRequest struct {
 	IndexFrom  int64  `json:"index_from,omitempty"`
 }
 
-// ListContractsResponse is the response for GET /v1/admin/contracts.
+// ListContractsResponse is the response for GET /v1/admin/contracts — the
+// same has_more/next_cursor envelope as ListEventsResponse and
+// ListAPIKeysResponse (issue #220).
+//
+// next_cursor deliberately carries no `omitempty` (issue #575): on the last
+// page it serialises as an explicit `null` rather than disappearing from the
+// object. Absence and null are different signals to a strictly-typed SDK —
+// an absent field cannot be told apart from a server too old to send it,
+// whereas null unambiguously means "no next page". Every list endpoint in
+// this API uses the explicit-null form, so the SDKs' auto-pagers need no
+// per-endpoint special-casing.
 type ListContractsResponse struct {
 	Contracts  []ContractResponse `json:"contracts"`
-	NextCursor *string            `json:"next_cursor,omitempty"`
+	HasMore    bool               `json:"has_more"`
+	NextCursor *string            `json:"next_cursor"`
 }
 
 // CreateContract handles POST /v1/admin/contracts.
@@ -53,12 +60,12 @@ type ListContractsResponse struct {
 func CreateContract(cfg ContractConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if cfg.AdminKey == "" || cfg.DB == nil {
-			writeJSON(w, http.StatusServiceUnavailable, errorBody("admin contracts endpoint is not configured"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "admin contracts endpoint is not configured")
 			return
 		}
 
 		if !validAdminKey(cfg.AdminKey, r.Header.Get("X-Admin-Key")) {
-			writeJSON(w, http.StatusUnauthorized, errorBody("invalid or missing admin key"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "invalid or missing admin key")
 			return
 		}
 
@@ -68,18 +75,18 @@ func CreateContract(cfg ContractConfig) http.HandlerFunc {
 				middleware.WriteBodyTooLarge(w, r)
 				return
 			}
-			writeJSON(w, http.StatusBadRequest, errorBody("invalid request body"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "invalid request body")
 			return
 		}
 
 		if req.ContractID == "" {
-			writeJSON(w, http.StatusBadRequest, errorBody("contract_id is required"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "contract_id is required")
 			return
 		}
 
 		// Validate strkey format: must start with C and be 56 chars.
 		if len(req.ContractID) != 56 || req.ContractID[0] != 'C' {
-			writeJSON(w, http.StatusBadRequest, errorBody("contract_id must be a valid 56-character strkey starting with C"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "contract_id must be a valid 56-character strkey starting with C")
 			return
 		}
 
@@ -100,7 +107,7 @@ func CreateContract(cfg ContractConfig) http.HandlerFunc {
 
 		if err != nil {
 			slog.ErrorContext(r.Context(), "failed to create contract", "err", err)
-			writeJSON(w, http.StatusInternalServerError, errorBody("failed to register contract"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to register contract")
 			return
 		}
 
@@ -120,12 +127,12 @@ func CreateContract(cfg ContractConfig) http.HandlerFunc {
 func ListContracts(cfg ContractConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if cfg.AdminKey == "" || cfg.DB == nil {
-			writeJSON(w, http.StatusServiceUnavailable, errorBody("admin contracts endpoint is not configured"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "admin contracts endpoint is not configured")
 			return
 		}
 
 		if !validAdminKey(cfg.AdminKey, r.Header.Get("X-Admin-Key")) {
-			writeJSON(w, http.StatusUnauthorized, errorBody("invalid or missing admin key"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "invalid or missing admin key")
 			return
 		}
 
@@ -136,7 +143,20 @@ func ListContracts(cfg ContractConfig) http.HandlerFunc {
 			}
 		}
 
-		cursor := r.URL.Query().Get("cursor")
+		// Opaque cursor (issue #220): id alone is the keyset (indexed_contracts.id
+		// is a UUID primary key, already unique — no composite tiebreaker
+		// needed, unlike the created_at-ordered listings). Previously this
+		// bound the raw cursor query param directly as the id, so a client
+		// could construct or tamper with a cursor by hand.
+		var cursorID *string
+		if raw := r.URL.Query().Get("cursor"); raw != "" {
+			decoded, err := cursor.Decode(raw)
+			if err != nil {
+				httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "cursor is not a valid pagination cursor")
+				return
+			}
+			cursorID = &decoded
+		}
 
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
@@ -147,15 +167,10 @@ func ListContracts(cfg ContractConfig) http.HandlerFunc {
 				  ORDER BY id ASC
 				  LIMIT $2`
 
-		var cursorID *string
-		if cursor != "" {
-			cursorID = &cursor
-		}
-
 		rows, err := cfg.DB.Query(ctx, query, cursorID, limit+1)
 		if err != nil {
 			slog.ErrorContext(r.Context(), "failed to list contracts", "err", err)
-			writeJSON(w, http.StatusInternalServerError, errorBody("failed to list contracts"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to list contracts")
 			return
 		}
 		defer rows.Close()
@@ -163,22 +178,32 @@ func ListContracts(cfg ContractConfig) http.HandlerFunc {
 		contracts := make([]ContractResponse, 0, limit)
 		for rows.Next() {
 			var c ContractResponse
-			if err := rows.Scan(&c.ID, &c.ContractID, &c.Network, &c.Label, &c.IndexFrom, &c.CreatedAt); err != nil {
+			// created_at is timestamptz; pgx v5's default binary protocol
+			// cannot scan it directly into *string (issue #220 — this
+			// endpoint had no tests before, so a request here always 500'd).
+			// Scan into time.Time and format explicitly, matching every
+			// other handler's created_at handling (apikeys.go, admin.go).
+			var createdAt time.Time
+			if err := rows.Scan(&c.ID, &c.ContractID, &c.Network, &c.Label, &c.IndexFrom, &createdAt); err != nil {
 				slog.ErrorContext(r.Context(), "failed to scan contract row", "err", err)
-				writeJSON(w, http.StatusInternalServerError, errorBody("scan error"))
+				httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "scan error")
 				return
 			}
+			c.CreatedAt = createdAt.UTC().Format(time.RFC3339)
 			contracts = append(contracts, c)
 		}
 
+		hasMore := len(contracts) > limit
 		var nextCursor *string
-		if len(contracts) > limit {
-			nextCursor = &contracts[limit-1].ID
+		if hasMore {
+			encoded := cursor.Encode(contracts[limit-1].ID)
+			nextCursor = &encoded
 			contracts = contracts[:limit]
 		}
 
 		writeJSON(w, http.StatusOK, ListContractsResponse{
 			Contracts:  contracts,
+			HasMore:    hasMore,
 			NextCursor: nextCursor,
 		})
 	}
@@ -189,18 +214,18 @@ func ListContracts(cfg ContractConfig) http.HandlerFunc {
 func DeleteContract(cfg ContractConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if cfg.AdminKey == "" || cfg.DB == nil {
-			writeJSON(w, http.StatusServiceUnavailable, errorBody("admin contracts endpoint is not configured"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "admin contracts endpoint is not configured")
 			return
 		}
 
 		if !validAdminKey(cfg.AdminKey, r.Header.Get("X-Admin-Key")) {
-			writeJSON(w, http.StatusUnauthorized, errorBody("invalid or missing admin key"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "invalid or missing admin key")
 			return
 		}
 
 		id := r.PathValue("id")
 		if id == "" {
-			writeJSON(w, http.StatusBadRequest, errorBody("missing contract id"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "missing contract id")
 			return
 		}
 
@@ -210,7 +235,7 @@ func DeleteContract(cfg ContractConfig) http.HandlerFunc {
 		tag, err := cfg.DB.Exec(ctx, `DELETE FROM indexed_contracts WHERE id = $1`, id)
 		if err != nil {
 			slog.ErrorContext(r.Context(), "failed to delete contract", "err", err)
-			writeJSON(w, http.StatusInternalServerError, errorBody("failed to delete contract"))
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to delete contract")
 			return
 		}
 

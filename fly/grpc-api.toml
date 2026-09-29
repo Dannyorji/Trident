@@ -12,7 +12,8 @@ primary_region = "iad"
   # [[services]] internal_port below.
   GRPC_ADDR = "0.0.0.0:50051"
 
-# Secrets (set via: fly secrets set -a trident-grpc-api KEY=value)
+# Secrets are sourced exclusively from Fly's encrypted secrets store
+# (set via: fly secrets set -a trident-grpc-api KEY=value), never from [env].
 # Required: DATABASE_URL (set automatically by `fly postgres attach`),
 # REDIS_URL (crates/api/src/main.rs calls .expect("REDIS_URL is required")
 # and panics on startup if unset)

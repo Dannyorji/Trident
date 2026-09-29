@@ -2,6 +2,7 @@ package ws
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -13,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Depo-dev/trident/services/api/internal/httputil"
 )
 
 const (
@@ -97,16 +100,63 @@ func (c *gqlConn) writePong(payload []byte) error {
 	return writeFrame(c.bufrw, 0x8A, payload) // FIN + opcode 0xA (pong)
 }
 
-// GraphQLHandler returns an http.HandlerFunc that serves the
-// graphql-transport-ws protocol for real-time contract event subscriptions.
+// GraphQLDeps carries what the GraphQL transport needs beyond the event hub
+// (issue #223). Every field is optional so an incompletely-wired process
+// degrades rather than panicking: with no Backend the query operations answer
+// UNAVAILABLE while subscriptions keep working, and with no Auth or
+// RateLimiter the corresponding check is skipped exactly as the REST chain
+// skips it when its own dependency is absent.
+type GraphQLDeps struct {
+	// Auth resolves a raw API key to the key's identity. It replaces the
+	// bare func(string) bool this handler used to take, because a boolean
+	// cannot carry the two things parity needs: which key is connected (to
+	// rate-limit it) and which network it is scoped to (to scope its reads).
+	Auth GraphQLAuthFunc
+
+	// RateLimiter is consulted per operation, not per connection. A
+	// WebSocket client sends no X-API-Key header, so the HTTP-level
+	// TieredRateLimit middleware sees no key and lets the upgrade through
+	// unmetered; without this, a GraphQL connection could issue unlimited
+	// operations while a REST caller with the same key is throttled.
+	RateLimiter GraphQLRateLimiter
+
+	// Backend resolves the query operations. Subscriptions do not use it.
+	Backend EventsBackend
+}
+
+// GraphQLAuthFunc validates an API key presented in connection_init and
+// returns the key's identity. ok is false for a missing, unknown or revoked
+// key. keyID identifies the key for rate limiting; network is the key's
+// network, which scopes every read on the connection.
+type GraphQLAuthFunc func(ctx context.Context, key string) (keyID, network string, ok bool)
+
+// GraphQLRateLimiter reports whether one more operation is allowed for keyID.
+// It returns the same allow/deny decision the REST tiered limiter makes for
+// the same key, so a client cannot escape its tier by switching transport.
+type GraphQLRateLimiter func(ctx context.Context, keyID string) (allowed bool, err error)
+
+// gqlSession is the authenticated state of one connection: established at
+// connection_init and read by every operation afterwards.
+type gqlSession struct {
+	keyID   string
+	network string
+}
+
+// GraphQLHandler returns an http.HandlerFunc serving the
+// graphql-transport-ws protocol for contract event queries and subscriptions
+// (issues #223, #317).
+//
 // The handler shares the same Hub as the REST WebSocket endpoint — only one
-// Redis XREADGROUP reader runs per process, regardless of how many connections
-// are open.
+// Redis XREADGROUP reader runs per process, regardless of how many
+// connections are open.
 //
 // Authentication happens in the connection_init phase via an Authorization
 // field in the payload. Invalid or missing keys receive connection_error and
-// the connection is closed.
-func GraphQLHandler(hub *Hub, validateKey func(string) bool) http.HandlerFunc {
+// the connection is closed. The key's network is captured at that point and
+// applied to every subsequent operation, so a caller cannot read another
+// network's data by naming it in a query — the same server-side enforcement
+// the REST handlers apply via the API key context.
+func GraphQLHandler(hub *Hub, deps GraphQLDeps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 			http.Error(w, "WebSocket upgrade required", http.StatusUpgradeRequired)
@@ -123,13 +173,13 @@ func GraphQLHandler(hub *Hub, validateKey func(string) bool) http.HandlerFunc {
 			return
 		}
 
-		serveGQL(conn, bufrw, hub, validateKey)
+		serveGQL(conn, bufrw, hub, deps)
 	}
 }
 
 // serveGQL runs the graphql-transport-ws protocol loop on an already-upgraded
 // connection. Extracted for testability.
-func serveGQL(conn net.Conn, bufrw *bufio.ReadWriter, hub *Hub, validateKey func(string) bool) {
+func serveGQL(conn net.Conn, bufrw *bufio.ReadWriter, hub *Hub, deps GraphQLDeps) {
 	gc := &gqlConn{bufrw: bufrw}
 
 	type frameMsg struct {
@@ -179,6 +229,10 @@ func serveGQL(conn net.Conn, bufrw *bufio.ReadWriter, hub *Hub, validateKey func
 	defer pingTicker.Stop()
 
 	authenticated := false
+	// Captured at connection_init and applied to every later operation, so
+	// the key's network scopes its reads and its id identifies it to the
+	// rate limiter.
+	var session gqlSession
 
 	for {
 		select {
@@ -229,11 +283,13 @@ func serveGQL(conn net.Conn, bufrw *bufio.ReadWriter, hub *Hub, validateKey func
 			switch msg.Type {
 			case "connection_init":
 				key := gqlExtractKey(msg.Payload)
-				if !validateKey(key) {
+				keyID, network, ok := gqlAuthenticate(context.Background(), deps.Auth, key)
+				if !ok {
 					_ = gc.write(gqlMessage{Type: "connection_error"})
 					return
 				}
 				authenticated = true
+				session = gqlSession{keyID: keyID, network: network}
 				initTimer.Stop()
 				if err := gc.write(gqlMessage{Type: "connection_ack"}); err != nil {
 					return
@@ -244,6 +300,52 @@ func serveGQL(conn net.Conn, bufrw *bufio.ReadWriter, hub *Hub, validateKey func
 					_ = gc.write(gqlMessage{Type: "connection_error"})
 					return
 				}
+
+				// Rate limit every operation against the connected key's own
+				// tier (issue #223). The HTTP-level TieredRateLimit
+				// middleware cannot do this: it keys off the X-API-Key
+				// header, which a WebSocket client does not send — it
+				// authenticates in the connection_init payload instead — so
+				// without this check a GraphQL connection would issue
+				// unlimited operations while a REST caller holding the same
+				// key is throttled.
+				if allowed, err := gqlCheckRateLimit(context.Background(), deps.RateLimiter, session.keyID); !allowed {
+					_ = gc.write(gqlCodedErrorMsg(msg.ID, err))
+					continue
+				}
+
+				// A "subscribe" message carries either a subscription or a
+				// query — the graphql-transport-ws protocol uses the same
+				// message type for both, and the operation's own document
+				// says which it is. Queries resolve once and complete;
+				// subscriptions register with the hub and stream.
+				if !gqlIsSubscription(msg.Payload) {
+					if _, exists := subs[msg.ID]; exists {
+						_ = gc.write(gqlErrorMsg(msg.ID, "subscription id already in use"))
+						continue
+					}
+					op, err := gqlParseQuery(msg.Payload)
+					if err != nil {
+						_ = gc.write(gqlCodedErrorMsg(msg.ID, gqlErrf(httputil.INVALID_ARGUMENT, "%s", err.Error())))
+						continue
+					}
+					data, rerr := gqlResolveQuery(context.Background(), deps.Backend, op, session.network)
+					if rerr != nil {
+						_ = gc.write(gqlCodedErrorMsg(msg.ID, rerr))
+						continue
+					}
+					if err := gc.write(gqlDataMsg(msg.ID, data)); err != nil {
+						return
+					}
+					// A query is a single-result operation: one next, then
+					// complete. Nothing is registered with the hub, so there
+					// is nothing to unregister on the client's behalf.
+					if err := gc.write(gqlMessage{Type: "complete", ID: msg.ID}); err != nil {
+						return
+					}
+					continue
+				}
+
 				contractID, topic0, err := gqlParseSubscribe(msg.Payload)
 				if err != nil {
 					_ = gc.write(gqlErrorMsg(msg.ID, err.Error()))

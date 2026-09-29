@@ -52,7 +52,7 @@ func TestStreamIntegration(t *testing.T) {
 	defer server.Close()
 
 	t.Run("forwards three events with SSE headers", func(t *testing.T) {
-		contractID := fmt.Sprintf("C-INTEGRATION-%d", time.Now().UnixNano())
+		contractID := uniqueTestContractID(t)
 		response, stop := connectSSE(t, server.URL, apiKey, contractID, "")
 		defer stop()
 
@@ -84,7 +84,7 @@ func TestStreamIntegration(t *testing.T) {
 	})
 
 	t.Run("filters topic0", func(t *testing.T) {
-		contractID := fmt.Sprintf("C-FILTER-%d", time.Now().UnixNano())
+		contractID := uniqueTestContractID(t)
 		response, stop := connectSSE(t, server.URL, apiKey, contractID, "wanted")
 		defer stop()
 
@@ -96,6 +96,37 @@ func TestStreamIntegration(t *testing.T) {
 			t.Fatalf("filtered event data: got %q, want right", got)
 		}
 	})
+}
+
+// uniqueTestContractID builds a contract id that is both unique per subtest
+// (so concurrent runs don't read each other's Redis stream) and a structurally
+// valid Stellar strkey: "C" followed by 55 base32 [A-Z2-7] characters.
+//
+// The previous "C-INTEGRATION-<nanos>" form predates the strict input
+// validation on this endpoint and is rejected with 400 — which went unnoticed
+// because this whole test skips unless TEST_REDIS_URL is set, and no CI job
+// set it.
+func uniqueTestContractID(t *testing.T) string {
+	t.Helper()
+
+	const base32Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+	var sb strings.Builder
+	sb.WriteByte('C')
+	n := uint64(time.Now().UnixNano())
+	for i := 0; i < 55; i++ {
+		sb.WriteByte(base32Alphabet[n%32])
+		// Re-seed once the entropy runs out so the tail isn't a constant run.
+		if n < 32 {
+			n = uint64(time.Now().UnixNano()) + uint64(i)
+		}
+		n /= 32
+	}
+
+	id := sb.String()
+	if len(id) != 56 {
+		t.Fatalf("generated contract id has length %d, want 56: %q", len(id), id)
+	}
+	return id
 }
 
 func connectSSE(t *testing.T, baseURL, apiKey, contractID, topic0 string) (*http.Response, context.CancelFunc) {

@@ -109,10 +109,15 @@ const (
 	StatsLimitMin     = 1
 	StatsLimitMax     = 100
 	StatsLimitDefault = 50
-)
 
-// DefaultNetwork is applied when a request does not specify one.
-const DefaultNetwork = "testnet"
+	// StatsMaxLedgerRange caps the width of an explicit from_ledger/to_ledger
+	// window on GET /v1/stats/contracts. Any explicit range bypasses the
+	// maintained rollup and falls back to a live aggregation over
+	// soroban_events (issue #654); without a cap that live scan grows
+	// unbounded with total historical event count. ~7 days at Stellar's
+	// ~5s ledger close time.
+	StatsMaxLedgerRange = 120_000
+)
 
 // validNetworks holds the accepted values for the ?network filter.
 var validNetworks = map[string]bool{
@@ -121,6 +126,11 @@ var validNetworks = map[string]bool{
 }
 
 // QueryStatsParams holds validated parameters for GET /v1/stats/contracts.
+//
+// Network is deliberately not populated by ValidateQueryStats (issue #612):
+// unlike every other field here, it is never client-supplied. The caller
+// must set it from middleware.NetworkFromContext after validation succeeds,
+// matching how every other data endpoint enforces the key's network scope.
 type QueryStatsParams struct {
 	FromLedger    int64
 	FromLedgerPtr *int64 // nil if not specified (for SQL NULL handling)
@@ -137,10 +147,12 @@ type QueryStatsParams struct {
 // Validation rules:
 //   - from_ledger: non-negative integer if present; default 0 (all time)
 //   - to_ledger:   non-negative integer if present; default latest indexed
-//   - network:     one of "testnet", "mainnet"; default "testnet"
 //   - limit:       integer in [1, 100]; default 50
+//
+// network is not a parameter here: it is derived server-side from the
+// authenticated key's context, not from the query string (issue #612).
 func ValidateQueryStats(
-	fromLedgerStr, toLedgerStr, networkStr, limitStr string,
+	fromLedgerStr, toLedgerStr, limitStr string,
 ) (*QueryStatsParams, *ValidationError) {
 	p := &QueryStatsParams{}
 
@@ -156,11 +168,20 @@ func ValidateQueryStats(
 		p.ToLedger = *to
 	}
 
-	network, verr := ValidateNetwork("network", networkStr, DefaultNetwork)
-	if verr != nil {
-		return nil, verr
+	// An explicit range on either side bypasses the maintained rollup and
+	// falls back to live aggregation (issue #654's queryContractStats), so a
+	// one-sided or overly wide range must be rejected rather than left to
+	// scan an unbounded slice of soroban_events. Only the fully-default,
+	// unfiltered case (both nil) is exempt — that path is served entirely
+	// from the rollup.
+	if from != nil || to != nil {
+		if from == nil || to == nil {
+			return nil, Errorf("from_ledger", "from_ledger and to_ledger must both be set when either is provided")
+		}
+		if *to-*from > StatsMaxLedgerRange {
+			return nil, Errorf("to_ledger", "range (to_ledger - from_ledger) must not exceed %d ledgers", StatsMaxLedgerRange)
+		}
 	}
-	p.Network = network
 
 	limit, verr := ValidateLimit("limit", limitStr, StatsLimitMin, StatsLimitMax, StatsLimitDefault)
 	if verr != nil {

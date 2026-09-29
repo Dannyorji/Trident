@@ -1,3 +1,6 @@
+-- lint:allow-long-lock Historical migration, already applied. audit_log is
+-- created empty in this same file, so these index builds lock nothing.
+--
 -- Audit log for API key usage (issue #139 / #162)
 -- Records every /v1/* request with metadata for security auditing and billing.
 

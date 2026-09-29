@@ -1,0 +1,102 @@
+---
+title: "SDK Versioning & Release Policy"
+description: "How Trident SDK versions relate to the API version, and the release process across all ecosystems."
+---
+
+## Versioning Scheme
+
+All Trident SDKs follow **[Semantic Versioning 2.0.0](https://semver.org/)**. Versions follow the pattern `MAJOR.MINOR.PATCH`:
+
+| Bump | When | Example |
+|------|------|---------|
+| **MAJOR** | Breaking API change — a field is removed, renamed, or its type changes in a way that requires client code updates. | `0.1.0` → `1.0.0` |
+| **MINOR** | Backward-compatible new functionality — a new optional parameter, a new method, or a new type. | `0.1.0` → `0.2.0` |
+| **PATCH** | Backward-compatible bug fix — a corrected serializer, a tighter retry window, a documentation fix released with a code change. | `0.1.0` → `0.1.1` |
+
+### API version alignment
+
+Every SDK release documents which **API version** (from the `X-API-Version` header or the OpenAPI spec `info.version` field) it is tested against. During the `0.x` pre-release phase, the SDK major version is **not** tied to the API version — both are expected to change. After `1.0.0`, a breaking API change bumps both the SDK major and the API version in lockstep.
+
+### Pre-release versions
+
+During `0.x`, MINOR bumps may include breaking changes when the API is still evolving. Each pre-release includes a `BREAKING CHANGES` section in its changelog so downstream consumers can evaluate upgrade cost.
+
+---
+
+## Release Process
+
+Every SDK follows the same release steps regardless of ecosystem.
+
+### 1. Prepare
+
+- All CI checks pass on `main` (lint, typecheck, tests).
+- `CHANGELOG.md` is updated with the new version, date, and a bullet list of changes.
+- Version field is bumped in the ecosystem-specific manifest:
+
+| Ecosystem | File | Field |
+|-----------|------|-------|
+| Rust | `sdk/rust/Cargo.toml` | `version` |
+| Go | `sdk/go/go.mod` | module path (tags only) |
+| Python | `sdk/python/pyproject.toml` | `version` |
+| TypeScript | `sdk/typescript/package.json` | `version` |
+| React | `sdk/react/package.json` | `version` |
+
+### 2. Tag
+
+Create a signed Git tag for the SDK:
+
+```bash
+git tag -s sdk/<ecosystem>/v<version> -m "Release <ecosystem> SDK v<version>"
+git push origin sdk/<ecosystem>/v<version>
+```
+
+Tag format: `sdk/<ecosystem>/v<version>` — for example, `sdk/typescript/v0.2.0`.
+
+### 3. Publish
+
+| Ecosystem | Command | Registry |
+|-----------|---------|----------|
+| Rust | `cargo publish --manifest-path sdk/rust/Cargo.toml` | [crates.io](https://crates.io) |
+| Go | Push the tag — Go modules resolve via `go get` | [pkg.go.dev](https://pkg.go.dev) |
+| Python | `cd sdk/python && python -m build && twine upload dist/*` | [PyPI](https://pypi.org) |
+| TypeScript | `cd sdk/typescript && npm publish --access public` | [npm](https://www.npmjs.com) |
+| React | `cd sdk/react && npm publish --access public` | [npm](https://www.npmjs.com) |
+
+### 4. Announce
+
+- Create a GitHub Release from the tag with a link to the changelog entry.
+- Mention the API version the SDK was tested against.
+
+---
+
+## Changelog Expectations
+
+Every release gets a `CHANGELOG.md` entry (one per SDK). Each entry must include:
+
+1. **Version and date** — `## [0.2.0] — 2026-09-01`
+2. **Changed / Added / Fixed / Removed** sections — populated from the commit log.
+3. **Breaking changes** — called out explicitly with migration instructions when possible.
+4. **API compatibility** — which API version the release was tested against.
+
+---
+
+## Breaking Change Propagation
+
+When the REST or gRPC API makes a breaking change:
+
+1. The API version is bumped (OpenAPI `info.version` and proto package version).
+2. Each SDK is updated in a separate PR per ecosystem.
+3. Each SDK PR bumps its own version and adds a `BREAKING CHANGES` entry.
+4. All SDK releases are published together in a single release window so consumers can upgrade atomically.
+
+---
+
+## Current SDK Versions
+
+| SDK | Package | Current Version | Registry |
+|-----|---------|----------------|----------|
+| Rust | `trident-sdk` | 0.1.0 | crates.io |
+| Go | `github.com/Depo-dev/trident/sdk/go` | 0.1.0 | pkg.go.dev |
+| Python | `trident-indexer` | 0.1.0 | PyPI |
+| TypeScript | `@trident-indexer/sdk` | 0.1.0 | npm |
+| React | `@trident-indexer/react` | 0.1.0 | npm |

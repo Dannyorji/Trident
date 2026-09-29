@@ -16,7 +16,8 @@ primary_region = "iad"
   HEALTH_PORT       = "8080"
   LOG_LEVEL         = "info"
 
-# Secrets (set via: fly secrets set -a trident-indexer KEY=value)
+# Secrets are sourced exclusively from Fly's encrypted secrets store
+# (set via: fly secrets set -a trident-indexer KEY=value), never from [env].
 # Required: DATABASE_URL, REDIS_URL, STELLAR_RPC_URL (or STELLAR_RPC_URLS)
 # Optional (defaults to "testnet" if unset — crates/indexer/src/config.rs):
 # NETWORK

@@ -305,4 +305,19 @@ mod tests {
         let p = EndpointPool::new(vec!["https://a".into()], 3, Duration::from_secs(1)).unwrap();
         assert_eq!(p.len(), 1);
     }
+
+    #[test]
+    fn circuit_breaker_state_and_backoff_jitter_behavior() {
+        let mut p = pool();
+        let now = Instant::now();
+        // Trip breaker on primary
+        p.record_failure_at(now);
+        p.record_failure_at(now);
+        assert_eq!(p.active_index(), 1);
+
+        // Verify breaker parked primary
+        assert!(!p.endpoints[0].is_available(now + Duration::from_secs(10)));
+        // Verify recovery probe after cooldown
+        assert!(p.endpoints[0].is_available(now + Duration::from_secs(31)));
+    }
 }

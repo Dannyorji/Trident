@@ -1,6 +1,9 @@
 ---
 import Base from '../../../../layouts/Base.astro';
-import { getEvent } from '../../../../lib/api';
+import StatePanel from '../../../../components/StatePanel.astro';
+import type { PanelAction, PanelState } from '../../../../lib/state-panel';
+import { ApiError, getEvent } from '../../../../lib/api';
+import { isValidContractId } from '../../../../lib/contracts';
 import { truncate, stellarExpertBase, tryFormatJson } from '../../../../lib/format';
 import type { Network } from '../../../../lib/types';
 
@@ -8,17 +11,77 @@ const { address, id } = Astro.params as { address: string; id: string };
 const rawNetwork = Astro.url.searchParams.get('network');
 const network: Network = rawNetwork === 'mainnet' ? 'mainnet' : 'testnet';
 
-let event: Awaited<ReturnType<typeof getEvent>> | null = null;
-let fetchError = '';
-try {
-  event = await getEvent(id, network);
-} catch (err) {
-  fetchError = err instanceof Error ? err.message : 'Event not found';
-}
-
+const expertBase = stellarExpertBase(network);
 const shortAddr = truncate(address);
 const shortId = truncate(id, 8, 8);
-const expertBase = stellarExpertBase(network);
+const backHref = `/contract/${encodeURIComponent(address)}?network=${network}`;
+const createActions = (primary: PanelAction): PanelAction[] => [
+  primary,
+  { label: 'Back to events', href: backHref, variant: 'ghost' },
+  { label: 'Home', href: `/?network=${network}`, variant: 'ghost' },
+];
+
+let event: Awaited<ReturnType<typeof getEvent>> | null = null;
+let errorState: { state: PanelState; title: string; message: string } | null = null;
+
+try {
+  if (!isValidContractId(address)) {
+    errorState = {
+      state: 'invalid_contract',
+      title: "That doesn't look like a Stellar contract address",
+      message:
+        'The events page you are on uses an address that is not a valid Soroban contract. Copy the full address from Stellar Expert and search again.',
+    };
+  } else {
+    event = await getEvent(id, network);
+  }
+} catch (err) {
+  if (err instanceof ApiError) {
+    if (err.status === 404) {
+      errorState = {
+        state: 'not_found',
+        title: 'This event is not in the index',
+        message:
+          "Trident could not find this event. It may have been indexed after this ID was collected, or it has rotated out of the index's retention window. Go back to the contract and check its recent events.",
+      };
+    } else if (err.status === 400) {
+      errorState = {
+        state: 'not_found',
+        title: 'That does not look like an event ID',
+        message:
+          'Event IDs look like 58d2bb36-… — a string of hex digits and dashes. The ID in this link does not match, so this event could not be loaded.',
+      };
+    } else if (err.status === 429) {
+      errorState = {
+        state: 'api_unreachable',
+        title: 'Slow down — rate limit reached',
+        message:
+          'You are browsing faster than the explorer allows. This resets on its own in a moment, no action needed.',
+      };
+    } else if (err.status === 401 || err.status === 403) {
+      errorState = {
+        state: 'api_unreachable',
+        title: 'Explorer is not configured',
+        message:
+          'The explorer data key is missing. This is a configuration problem on our side, not your connection.',
+      };
+    } else {
+      errorState = {
+        state: 'api_unreachable',
+        title: 'The indexer is unavailable right now',
+        message:
+          'We could not load this event from the Trident indexer. This is temporary — reload in a moment.',
+      };
+    }
+  } else {
+    errorState = {
+      state: 'api_unreachable',
+      title: 'Could not reach the indexer',
+      message:
+        'We could not reach the Trident indexer from the explorer. Check your connection, then reload.',
+    };
+  }
+}
 
 const ogTitle = event
   ? `Event ${shortId} — ${event.topics[0] ?? event.event_type} on ${network}`
@@ -38,17 +101,24 @@ const ogDescription = event
   <nav class="text-xs text-gray-500 mb-6 flex items-center gap-1.5 flex-wrap" aria-label="Breadcrumb">
     <a href={`/?network=${network}`} class="hover:text-white">Home</a>
     <span>/</span>
-    <a href={`/contract/${address}?network=${network}`} class="hover:text-white font-mono" title={address}>
+    <a href={backHref} class="hover:text-white font-mono" title={address}>
       {shortAddr}
     </a>
     <span>/</span>
     <span class="text-gray-300 font-mono" title={id}>{shortId}</span>
   </nav>
 
-  {fetchError ? (
-    <div class="rounded-lg bg-red-900/30 border border-red-800 px-4 py-3 text-sm text-red-300">
-      {fetchError}
-    </div>
+  {errorState ? (
+    <StatePanel
+      state={errorState.state}
+      title={errorState.title}
+      message={errorState.message}
+      actions={createActions(
+        errorState.state === 'not_found' || errorState.state === 'invalid_contract'
+          ? { label: 'Back to events', href: backHref, variant: 'primary' }
+          : { label: 'Reload', href: Astro.url.pathname + Astro.url.search, variant: 'primary' },
+      )}
+    />
   ) : event ? (
     <div class="space-y-6">
       <!-- Header -->

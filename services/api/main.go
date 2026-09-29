@@ -117,10 +117,15 @@ func initTracer(ctx context.Context) func() {
 		res = resource.Default()
 	}
 
+	// Issue #457: a fixed low ratio alone means the one failing/slow
+	// request is almost never the one sampled. newAlwaysRecordSampler +
+	// newAlwaysKeepExporter together guarantee every error and every
+	// slow (>2s) request is exported regardless of the ratio, while the
+	// rest of traffic still samples at samplingRatio.
 	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exporter),
+		sdktrace.WithBatcher(newAlwaysKeepExporter(exporter)),
 		sdktrace.WithResource(res),
-		sdktrace.WithSampler(sdktrace.TraceIDRatioBased(samplingRatio)),
+		sdktrace.WithSampler(newAlwaysRecordSampler(samplingRatio)),
 	)
 	otel.SetTracerProvider(tp)
 	otel.SetTextMapPropagator(propagation.TraceContext{})
@@ -129,6 +134,7 @@ func initTracer(ctx context.Context) func() {
 }
 
 func main() {
+	initLogger()
 	shutdownTracer := initTracer(context.Background())
 	defer shutdownTracer()
 
@@ -190,6 +196,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	go ws.StartConsumer(ctx, redisClient, hub)
+	// Best-effort cache invalidation (issue #221): bumps a contract's cache
+	// version the moment a new event for it arrives, so ResponseCache-wrapped
+	// endpoints (contract spec below) stop serving stale responses
+	// immediately rather than waiting out their TTL.
+	go middleware.StartCacheInvalidator(ctx, redisClient, ws.StreamKey)
 
 	// Start API-key usage tracker (issue #139). Flushes request_count /
 	// last_used_at to postgres in batches every 5s so auth never blocks.
@@ -279,30 +290,10 @@ func main() {
 	handlers.SetInternalStatusDeps(pool, redisClient, hub)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/health", handlers.Health())
-	mux.HandleFunc("GET /v1/ready", handlers.Ready(healthDB, redisClient, grpcClient))
-	mux.HandleFunc("GET /v1/events", handlers.ListEvents)
-	mux.HandleFunc("POST /v1/events/batch", handlers.BatchGetEvents)
-	mux.HandleFunc("GET /v1/events/{id}", handlers.GetEvent)
-	mux.HandleFunc("GET /v1/events/stream", handlers.Stream(redisClient))
-	mux.HandleFunc("GET /v1/admin/db", handlers.AdminDB(adminCfg))
-	mux.HandleFunc("GET /v1/admin/keys/{id}/usage", handlers.AdminKeyUsage(adminCfg))
-	// Admin contract registration CRUD (issue #230)
-	contractCfg := handlers.ContractConfig{AdminKey: os.Getenv("ADMIN_API_KEY"), DB: pool}
-	mux.HandleFunc("POST /v1/admin/contracts", handlers.CreateContract(contractCfg))
-	mux.HandleFunc("GET /v1/admin/contracts", handlers.ListContracts(contractCfg))
-	mux.HandleFunc("DELETE /v1/admin/contracts/{id}", handlers.DeleteContract(contractCfg))
-	// API key management (admin-only via X-Admin-Key header)
-	mux.HandleFunc("POST /v1/api-keys", handlers.CreateAPIKey(apiKeyCfg))
-	mux.HandleFunc("GET /v1/api-keys", handlers.ListAPIKeys(apiKeyCfg))
-	mux.HandleFunc("PATCH /v1/api-keys/{id}", handlers.UpdateAPIKey(apiKeyCfg))
-	mux.HandleFunc("DELETE /v1/api-keys/{id}", handlers.DeleteAPIKey(apiKeyCfg))
-	mux.HandleFunc("GET /v1/stats/indexer", handlers.IndexerStats(healthDB))
-	mux.HandleFunc("GET /v1/contracts/{id}/events/schema", handlers.ContractEventSchemas(schemaRegistryDB))
-	mux.HandleFunc("GET /v1/contracts/{id}/spec", handlers.ContractSpec(schemaRegistryDB))
-	mux.HandleFunc("GET /v1/contracts/{id}/storage", handlers.ContractStorageLatest(schemaRegistryDB))
-	mux.HandleFunc("GET /v1/contracts/{id}/storage/history", handlers.ContractStorageHistory(schemaRegistryDB))
-	mux.HandleFunc("GET /v1/stats/contracts", handlers.ContractsStats(pool, redisClient))
+	// Route registration lives in routes.go as a single table shared with the
+	// OpenAPI inventory contract test (issue #513): every route is either
+	// documented in api/openapi.yaml or carries an explicit exemption, and the
+	// test fails on any drift in either direction.
 	// nil (untyped) when STELLAR_RPC_URL is unset, so CallContract's `rpc ==
 	// nil` check reports 503 rather than a typed-nil interface slipping
 	// through and panicking on first use.
@@ -310,23 +301,6 @@ func main() {
 	if rpcURL := os.Getenv("STELLAR_RPC_URL"); rpcURL != "" {
 		sorobanCaller = sorobanrpc.NewClient(rpcURL)
 	}
-	mux.HandleFunc("POST /v1/contracts/{id}/call", handlers.CallContract(sorobanCaller))
-	mux.HandleFunc("GET /v1/webhooks", listWebhooksHandler(webhookDB))
-	mux.HandleFunc("POST /v1/webhooks", createWebhookHandler(webhookDB))
-	mux.HandleFunc("DELETE /v1/webhooks/{id}", deleteWebhookHandler(webhookDB))
-	mux.HandleFunc("PATCH /v1/webhooks/{id}/pause", pauseWebhookHandler(webhookDB))
-	mux.HandleFunc("PATCH /v1/webhooks/{id}/resume", resumeWebhookHandler(webhookDB))
-	mux.HandleFunc("GET /v1/webhooks/{id}/deliveries", deliveriesWebhookHandler(webhookDB))
-	mux.HandleFunc("GET /v1/webhooks/{id}/dead-letters", deadLettersWebhookHandler(webhookDB))
-	mux.HandleFunc("POST /v1/webhooks/{id}/dead-letters/{deliveryId}/replay", replayDeadLetterHandler(webhookDB))
-	mux.HandleFunc("GET /metrics", handlers.MetricsHandler(pool, redisClient))
-	mux.HandleFunc("GET /internal/status", handlers.InternalStatus())
-	mux.Handle("/ws", middleware.WSConnectionLimit(ws.Handler(hub)))
-	keyValidator := middleware.Validator(middleware.ParseKeyHashes(os.Getenv("API_KEY_HASHES")))
-	mux.Handle("/graphql", middleware.WSConnectionLimit(ws.GraphQLHandler(hub, keyValidator)))
-
-	_ = usageTrack // passed to middleware in future; declared for shutdown ordering
-
 	var rlDB middleware.TierDB
 	if pool != nil {
 		rlDB = pool
@@ -339,13 +313,36 @@ func main() {
 		authDB.DB = pool
 	}
 	authDB.Redis = redisClient
+	authDB.UsageTrack = usageTrack
+
+	registerRoutes(mux, routeDeps{
+		rlCfg:            rlCfg,
+		authDB:           authDB,
+		pool:             pool,
+		healthDB:         healthDB,
+		schemaRegistryDB: schemaRegistryDB,
+		redisClient:      redisClient,
+		grpcClient:       grpcClient,
+		adminCfg:         adminCfg,
+		contractCfg:      handlers.ContractConfig{AdminKey: os.Getenv("ADMIN_API_KEY"), DB: pool},
+		apiKeyCfg:        apiKeyCfg,
+		sorobanCaller:    sorobanCaller,
+		webhookDB:        webhookDB,
+		hub:              hub,
+	})
 
 	handler := middleware.NewBodySizeLimitFromEnv()(mux)
 	handler = middleware.TieredRateLimit(rlCfg)(handler)
+	handler = middleware.NewDBAuth(authDB)(handler)
+	// AuditMiddleware wraps NewDBAuth (issue #609), not the other way around:
+	// it must run on every request regardless of auth outcome, so a rejected
+	// 401 is still written to audit_log. With AuditMiddleware inside NewDBAuth,
+	// NewDBAuth's early return on a missing/invalid key never reached
+	// next.ServeHTTP, so AuditMiddleware's write never ran and failed auth
+	// attempts left no audit trail at all.
 	if auditWriter != nil {
 		handler = middleware.AuditMiddleware(auditWriter)(handler)
 	}
-	handler = middleware.NewDBAuth(authDB)(handler)
 	handler = middleware.NewCompression()(handler)
 	// Per-IP rate limit runs BEFORE auth (issue #318): it wraps the handler
 	// chain built so far, so it executes ahead of NewDBAuth for every
@@ -360,16 +357,21 @@ func main() {
 	// X-Request-ID, and is captured in structured logs (issue #226). RequestID
 	// must precede StructuredLogging so the id is in context when the log line
 	// is emitted.
-	handler = middleware.Chain(handler, middleware.RequestID, middleware.StructuredLogging)
+	handler = middleware.Chain(handler, middleware.RequestID, middleware.StructuredLogging(mux))
 	// Global concurrency cap is the outermost middleware of all (issue #318):
 	// it must shed load before any other work — auth lookups, rate-limit
 	// Redis calls, logging — is spent on a request that's going to be
 	// rejected anyway.
 	handler = middleware.NewGlobalConcurrencyLimitFromEnv()(handler)
-	// Metrics middleware is the absolute outermost wrap (issue #58): it must
-	// see every response, including ones shed by GlobalConcurrencyLimit, to
-	// report accurate per-endpoint counts/latency.
+	// Metrics middleware wraps everything up to this point (issue #58): it
+	// must see every response, including ones shed by GlobalConcurrencyLimit,
+	// to report accurate per-endpoint counts/latency.
 	handler = middleware.NewMetrics(mux)(handler)
+	// Recover is the true outermost wrap (issue #610): it must sit ahead of
+	// every other middleware, including Metrics, so a panic anywhere in the
+	// chain — not just in a leaf handler — is caught, logged, counted, and
+	// answered with a 500 instead of dropping the connection uncontained.
+	handler = middleware.Recover(handler)
 	// Opt-in, internal-only pprof server (off unless PPROF_ENABLED=true). It is
 	// never mounted on the public mux above (#299).
 	pprofSrv := profiling.Start()
@@ -580,6 +582,7 @@ type retentionConfig struct {
 	ParseErrorsDays       int
 	WebhookDeliveriesDays int
 	SorobanEventsDays     int
+	EventOutboxDays       int
 }
 
 func loadRetentionConfig() retentionConfig {
@@ -587,7 +590,18 @@ func loadRetentionConfig() retentionConfig {
 		AuditLogDays:          envInt("RETENTION_AUDIT_LOG_DAYS", 90),
 		ParseErrorsDays:       envInt("RETENTION_PARSE_ERRORS_DAYS", 30),
 		WebhookDeliveriesDays: envInt("RETENTION_WEBHOOK_DELIVERIES_DAYS", 30),
-		SorobanEventsDays:     envInt("RETENTION_SOROBAN_EVENTS_DAYS", 0), // 0 = disabled
+		// Highest-volume table; unlike audit_log/parse_errors/webhook_deliveries
+		// it previously defaulted to 0 (disabled), letting it grow unbounded
+		// with growing indexes/WAL/vacuum pressure unless an operator opted in
+		// explicitly (#645). 90 days matches the audit log's window.
+		SorobanEventsDays: envInt("RETENTION_SOROBAN_EVENTS_DAYS", 90),
+		// event_outbox is the fastest-growing unbounded table (issue #604):
+		// rows are only ever flipped published = TRUE, never deleted, and
+		// each carries a full JSONB copy of the event. 7 days is generous
+		// relative to the relay's normal publish latency (seconds), while
+		// still giving an operator a window to notice and recover a stuck
+		// relay before its backlog is pruned out from under it.
+		EventOutboxDays: envInt("RETENTION_EVENT_OUTBOX_DAYS", 7),
 	}
 }
 
@@ -635,6 +649,13 @@ func startRetentionJob(ctx context.Context, pool *pgxpool.Pool) {
 					`DELETE FROM soroban_events WHERE created_at < NOW() - ($1 || ' days')::INTERVAL AND ctid IN (
 						SELECT ctid FROM soroban_events WHERE created_at < NOW() - ($1 || ' days')::INTERVAL LIMIT 1000
 					)`},
+				// event_outbox additionally requires published = TRUE: an
+				// unpublished row must never be deleted regardless of age,
+				// since the relay has not yet delivered it (issue #604).
+				{"event_outbox", cfg.EventOutboxDays,
+					`DELETE FROM event_outbox WHERE published = TRUE AND published_at < NOW() - ($1 || ' days')::INTERVAL AND ctid IN (
+						SELECT ctid FROM event_outbox WHERE published = TRUE AND published_at < NOW() - ($1 || ' days')::INTERVAL LIMIT 1000
+					)`},
 			}
 
 			for _, t := range tables {
@@ -646,6 +667,9 @@ func startRetentionJob(ctx context.Context, pool *pgxpool.Pool) {
 					if err != nil {
 						slog.Warn("retention: cleanup failed", "table", t.name, "err", err)
 						break
+					}
+					if tag.RowsAffected() > 0 {
+						metrics.RetentionRowsDeletedTotal.WithLabelValues(t.name).Add(float64(tag.RowsAffected()))
 					}
 					if tag.RowsAffected() == 0 {
 						break

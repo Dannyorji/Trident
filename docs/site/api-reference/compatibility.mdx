@@ -1,0 +1,125 @@
+---
+title: "Compatibility Promise"
+description: "What Trident's v1 API guarantees, what is explicitly not stable yet, the deprecation policy, and how a breaking change would be versioned."
+---
+
+Once SDKs and integrations ship against testnet, breaking changes cost other
+people work. This page is the stated promise about what `v1` guarantees —
+and, just as importantly, what it deliberately does not guarantee yet.
+
+The OpenAPI specification at
+[`api/openapi.yaml`](https://github.com/Telocel-Labs/Trident/blob/dev/api/openapi.yaml)
+is the contract of record: a CI contract test fails whenever a route exists
+without a spec entry or a spec entry without a route, so the spec cannot
+silently drift from the implementation in either direction.
+
+The change-management rules — what counts as a breaking change, the
+`x-experimental` marker, and the deprecation mechanism — are defined in
+[`docs/API_STABILITY.md`](https://github.com/Telocel-Labs/Trident/blob/dev/docs/API_STABILITY.md),
+the policy of record. This page declares the concrete v1 surface those
+rules apply to: which endpoints are stable, which are explicitly not yet,
+and the response contracts (error envelope, pagination, headers) clients
+can build against.
+
+---
+
+## Stable in v1
+
+For every endpoint listed below, the following are **frozen** for the life of
+`v1`:
+
+- **Routes and methods.** No documented `/v1/` route is removed or has its
+  method changed.
+- **Request shapes.** Existing parameters and body fields keep their names,
+  types, and semantics. New parameters and fields are only ever added as
+  optional.
+- **Response shapes.** Existing fields keep their names (snake_case), types,
+  and meaning. Fields are never removed or renamed; new fields may be added,
+  so clients must tolerate unknown fields.
+- **Status codes.** The documented status codes for each operation keep
+  their meaning. New codes may be added for new failure modes.
+- **The error envelope.** Errors are
+  `{"error": {"code", "message", "request_id"}}`. The `code` values
+  (`NOT_FOUND`, `UNAUTHORIZED`, `RATE_LIMITED`, `INVALID_ARGUMENT`,
+  `UNAVAILABLE`, `INTERNAL`, `PAYLOAD_TOO_LARGE`, `FORBIDDEN`) keep their
+  meanings; new codes may be added, so clients should treat an unknown code
+  as a generic failure of its status class. `message` text is
+  human-readable and **not** part of the contract — never match on it.
+- **Pagination semantics.** Cursors are opaque strings (up to 256 bytes)
+  valid only for the query shape that produced them; list responses report
+  `has_more` and a `next_cursor` that is `null`/omitted when exhausted. See
+  [Pagination](/api-reference/pagination).
+- **Rate-limit headers.** `X-RateLimit-Limit`, `X-RateLimit-Remaining`,
+  `X-RateLimit-Reset`, and `Retry-After` on 429 responses. Numeric limits
+  themselves are operational configuration, not contract.
+- **Authentication.** `X-API-Key` header auth for the public surface.
+
+The stable endpoint set:
+
+| Area | Endpoints |
+| --- | --- |
+| System | `GET /v1/health`, `GET /v1/ready`, `GET /v1/version` |
+| Events | `GET /v1/events`, `GET /v1/events/{id}`, `POST /v1/events/batch`, `GET /v1/events/stream` |
+| Contracts | `GET /v1/contracts/{id}/events/schema`, `GET /v1/contracts/{id}/spec`, `GET /v1/contracts/{id}/storage`, `GET /v1/contracts/{id}/storage/history` |
+| Statistics | `GET /v1/stats/indexer`, `GET /v1/stats/contracts` |
+| Monitoring | `GET /metrics` (Prometheus text exposition) |
+
+---
+
+## Explicitly not stable yet
+
+These surfaces work and are documented, but their shapes may still change
+without a major version. Depend on them knowingly:
+
+- **Webhooks** (`/v1/webhooks*`). The response bodies are camelCase (unlike
+  the rest of the API), the replay endpoint answers in snake_case, and
+  several error paths return plain text instead of the error envelope.
+  These inconsistencies will be normalized before webhooks join the frozen
+  surface, and that normalization will not be treated as a breaking change.
+- **Admin surface** (`/v1/admin/*`, `/v1/api-keys*`, and anything requiring
+  `X-Admin-Key`). Operator tooling, not a public integration surface.
+- **Contract simulation** (`POST /v1/contracts/{id}/call`). The decoded
+  `result` representation may be refined.
+- **WebSocket (`/ws`) and GraphQL (`/graphql`).** Documented in their own
+  guides; their protocols version independently of the REST surface.
+- **`/internal/*`** — operator-facing, no compatibility promise at all.
+- **Undocumented behavior.** Anything observable but absent from the
+  OpenAPI spec (exact error message text, field ordering, timing) is not
+  contract.
+
+---
+
+## Deprecation and breaking changes
+
+The full rules live in
+[`docs/API_STABILITY.md`](https://github.com/Telocel-Labs/Trident/blob/dev/docs/API_STABILITY.md).
+In short:
+
+1. A deprecation is **announced in the changelog** with a removal date at
+   least **90 days** out for a stable endpoint.
+2. From the announcement onward, responses from the deprecated endpoint
+   carry `Deprecation: true`, `Sunset: <RFC 3339 date>`, and a `Link`
+   header pointing at the migration guide.
+3. Removal of a stable endpoint or field happens only through a **new
+   `/v2/` surface** served in parallel through the notice window — never
+   within `v1`.
+4. Endpoints may be marked `x-experimental: true` in the spec; experimental
+   endpoints carry none of these guarantees.
+
+The OpenAPI spec's `info.version` drives all five SDK package versions —
+CI enforces that they match — so a breaking spec change is what bumps the
+SDK major versions, all together.
+
+---
+
+## How this is enforced
+
+- The contract test in `services/api` fails CI on any divergence between
+  the spec and the implemented routes, including undocumented status codes
+  and non-canonical error envelopes.
+- The live end-to-end suite validates real responses against the spec for
+  every documented operation it exercises.
+- SDK models are generated from the spec; CI fails if the generated models
+  are stale.
+- `scripts/check-sdk-versions.sh` fails CI when any SDK version disagrees
+  with the spec version.

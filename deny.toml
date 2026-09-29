@@ -1,0 +1,87 @@
+# cargo-deny configuration for Trident
+#
+# Tracks triaged cargo-audit advisories (issue #401). Every advisory surfaced
+# by `cargo audit` must be either fixed (upgrade/replace the dependency) or
+# formally accepted here with a documented rationale.
+#
+# Run:
+#   cargo deny check advisories
+#
+# to validate this configuration against the current dependency tree.
+#
+# See https://embarkstudios.github.io/cargo-deny/ for full documentation.
+
+[advisories]
+# The path where the advisory database is cloned/fetched into
+db-path = "~/.cargo/advisory-db"
+# The url(s) of the advisory databases to use
+db-urls = ["https://github.com/rustsec/advisory-db"]
+
+# Threshold for security vulnerabilities.
+# "deny" fails the build on any vulnerability; we can temporarily set to
+# "allow" with explicit ignore entries below while triaging the backlog
+# from issue #373, then restore to "deny" once all 10 advisories are cleared.
+vulnerability = "deny"
+
+# Threshold for unmaintained crates
+unmaintained = "warn"
+
+# Threshold for crates with security notices
+notice = "warn"
+
+# Threshold for yanked crates
+yanked = "deny"
+
+# Ignore advisories for the given IDs during cargo-deny checks.
+# Each entry must document:
+#   - Which dependency/version is affected
+#   - Why we accept the risk (no fix available, doesn't affect our usage, etc.)
+#   - Date triaged
+#   - Issue reference if remediation is planned
+#
+# Template:
+# { id = "RUSTSEC-YYYY-NNNN", reason = "Explanation of why this is accepted" }
+#
+# Example ignore entries (remove/replace with actual triaged advisories):
+# { id = "RUSTSEC-2023-0001", reason = "Affects unused feature flag in transitive dep; no fix available; mitigated by not calling affected API. Triaged 2026-08-26 (#401)" }
+
+ignore = [
+    # The 11 advisories from issue #373 plus RUSTSEC-2026-0258, all triaged
+    # 2026-08-30 into .cargo/audit.toml. See that file for full rationale
+    # per advisory. Keep both lists in sync: cargo audit reads audit.toml,
+    # cargo deny reads this file, and the two use different entry syntax.
+    { id = "RUSTSEC-2026-0204", reason = "Transitive; fmt::Display only. Triaged 2026-08-30 (#373)." },
+    { id = "RUSTSEC-2023-0071", reason = "Transitive; no RSA ops. Triaged 2026-08-30 (#373)." },
+    { id = "RUSTSEC-2026-0049", reason = "Transitive; unreachable path. Triaged 2026-08-30 (#373)." },
+    { id = "RUSTSEC-2026-0098", reason = "Transitive; unreachable path. Triaged 2026-08-30 (#373)." },
+    { id = "RUSTSEC-2026-0099", reason = "Transitive; unreachable path. Triaged 2026-08-30 (#373)." },
+    { id = "RUSTSEC-2026-0104", reason = "Transitive; unreachable path. Triaged 2026-08-30 (#373)." },
+    { id = "RUSTSEC-2026-0190", reason = "Transitive; unreachable path. Triaged 2026-08-30 (#373)." },
+    { id = "RUSTSEC-2024-0363", reason = "sqlx 0.7; needs dedicated upgrade PR. Triaged 2026-08-30 (#373)." },
+    { id = "RUSTSEC-2024-0436", reason = "Unmaintained build-time macro; no runtime impact. Triaged 2026-08-30 (#373)." },
+    { id = "RUSTSEC-2025-0119", reason = "Transitive; unreachable path. Triaged 2026-08-30 (#373)." },
+    { id = "RUSTSEC-2025-0134", reason = "Transitive; unreachable path. Triaged 2026-08-30 (#373)." },
+    { id = "RUSTSEC-2026-0258", reason = "h2 0.4.x upgraded to 0.4.19; remaining hit is h2 0.3.27 via tonic 0.11, which has no patched 0.3 release. Triaged 2026-08-30." },
+]
+
+[licenses]
+# We're not enforcing license allowlists yet, but cargo-deny supports it.
+# Uncomment and configure if/when license compliance becomes a requirement.
+# unlicensed = "deny"
+# allow = ["MIT", "Apache-2.0", "BSD-3-Clause"]
+# deny = ["GPL-2.0", "GPL-3.0"]
+
+[bans]
+# Deny multiple versions of the same crate
+multiple-versions = "warn"
+
+# Deny wildcard dependencies
+wildcards = "allow"
+
+[sources]
+# Deny crates from unknown registries
+unknown-registry = "deny"
+unknown-git = "deny"
+
+# Allow crates only from crates.io
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

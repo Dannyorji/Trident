@@ -1,0 +1,72 @@
+"""
+A Soroban contract event. Field names match the REST /v1/events payload with
+snake_case remapped to camelCase.
+"""
+type Event {
+  id: ID!
+  contractId: String!
+  ledgerSequence: Int!
+  ledgerTimestamp: String!
+  txHash: String!
+  eventIndex: Int!
+  eventType: String!
+  topics: [String!]!
+  data: String
+  createdAt: String
+}
+
+"""
+One page of events. Mirrors the REST envelope: nextCursor is null — never
+absent — on the last page, so an auto-pager stops on one rule across both
+transports.
+"""
+type EventPage {
+  events: [Event!]!
+  hasMore: Boolean!
+  nextCursor: String
+}
+
+"""Per-contract event statistics, mirroring GET /v1/stats/contracts."""
+type ContractStat {
+  contractId: String!
+  eventCount: Int!
+  firstLedger: Int
+  lastLedger: Int
+  firstSeen: String
+  lastSeen: String
+}
+
+type Query {
+  """
+  List events. Accepts the same filters and opaque cursor pagination as
+  GET /v1/events. The network is taken from the authenticated API key, not
+  from arguments.
+  """
+  events(
+    contractId: String
+    topic0: String
+    topic1: String
+    eventType: String
+    ledgerFrom: Int
+    ledgerTo: Int
+    cursor: String
+    limit: Int = 50
+  ): EventPage!
+
+  """Fetch one event by id. Null when no such event exists."""
+  event(id: ID!): Event
+
+  """Per-contract statistics, mirroring GET /v1/stats/contracts."""
+  contractStats(
+    fromLedger: Int
+    toLedger: Int
+    limit: Int = 50
+  ): [ContractStat!]!
+}
+
+type Subscription {
+  """
+  Live events for one contract, optionally filtered to a single topic0.
+  """
+  contractEvents(contractId: String!, topic0: String): Event!
+}

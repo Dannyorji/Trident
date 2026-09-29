@@ -52,6 +52,20 @@ var (
 		Help: "Total WebSocket subscriber registrations since startup.",
 	})
 
+	// Webhook delivery observability (issue #454). The per-subscription and
+	// global concurrency caps only help if an operator can see them binding —
+	// without these, a saturated delivery pool and a healthy one look
+	// identical from outside.
+	WebhookDeliveriesTotal = promauto.With(Registry).NewCounterVec(prometheus.CounterOpts{
+		Name: "trident_webhook_deliveries_total",
+		Help: "Webhook delivery attempts by outcome.",
+	}, []string{"outcome"}) // outcome: success|failure|skipped_in_flight|blocked_url
+
+	WebhookDeliveriesInFlight = promauto.With(Registry).NewGauge(prometheus.GaugeOpts{
+		Name: "trident_webhook_deliveries_in_flight",
+		Help: "Webhook deliveries currently executing, bounded by the global delivery semaphore.",
+	})
+
 	WSDisconnectsTotal = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "trident_ws_disconnects_total",
 		Help: "Total WebSocket subscriber unregistrations since startup.",
@@ -77,6 +91,20 @@ var (
 		Name: "trident_ratelimit_rejections_total",
 		Help: "Total requests rejected by a rate limiter, by limiter.",
 	}, []string{"limiter"}) // limiter: per_key|per_ip|global_concurrency
+
+	RateLimitFailOpenTotal = promauto.With(Registry).NewCounterVec(prometheus.CounterOpts{
+		Name: "trident_ratelimit_fail_open_total",
+		Help: "Total requests allowed because a rate-limit backend check failed, by limiter.",
+	}, []string{"limiter"}) // limiter: per_key
+
+	// PanicsRecoveredTotal counts handler-chain panics caught by
+	// middleware.Recover (issue #610) — otherwise an invisible failure mode:
+	// the client sees a dropped connection, nothing is logged, nothing is
+	// counted.
+	PanicsRecoveredTotal = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "trident_panics_recovered_total",
+		Help: "Total handler-chain panics caught by the recovery middleware.",
+	})
 
 	// DB pool saturation metrics (issue #238), sourced from pgxpool.Pool.Stat()
 	// by PollDBPool. All exposed as Gauges — Stat() itself only returns
@@ -135,6 +163,16 @@ var (
 		Name: "trident_db_pool_max_lifetime_destroy_count",
 		Help: "Cumulative number of connections destroyed for exceeding MaxConnLifetime.",
 	})
+
+	// RetentionRowsDeletedTotal makes the periodic retention job's effect
+	// observable (issue #604): without it, a disk-growth alert has no
+	// corresponding "and here is what the remediation actually did" signal,
+	// so an operator cannot tell a healthy pruning job from a silently
+	// broken one just by watching disk usage trend flat.
+	RetentionRowsDeletedTotal = promauto.With(Registry).NewCounterVec(prometheus.CounterOpts{
+		Name: "trident_retention_rows_deleted_total",
+		Help: "Rows deleted by the periodic retention job, by table.",
+	}, []string{"table"})
 )
 
 // PollDBPool periodically snapshots pool.Stat() into the DB pool gauges

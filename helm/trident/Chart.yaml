@@ -2,8 +2,14 @@ apiVersion: v2
 name: trident
 description: Helm chart for self-hosted Trident Soroban event indexer on Kubernetes
 type: application
-version: 0.1.0
-appVersion: "0.1.0"
+version: 1.0.0
+# Must match the real git release tag .github/workflows/release.yml pushes
+# images under (github.ref_name on a "v*.*.*" push, e.g. this "v1.0.0"), not
+# a bare "1.0.0" - the four workload templates interpolate this directly as
+# the image tag fallback (`{{ .Values.X.image.tag | default .Chart.AppVersion }}`,
+# issue #622), so a mismatch here means a default `helm install` pulls a tag
+# that was never published.
+appVersion: "v1.0.0"
 keywords:
   - soroban
   - stellar

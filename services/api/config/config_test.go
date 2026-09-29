@@ -16,8 +16,8 @@ func setEnv(t *testing.T, pairs map[string]string) {
 
 func allRequired(t *testing.T) {
 	setEnv(t, map[string]string{
-		"DATABASE_URL": "postgres://localhost/test",
-		"REDIS_URL":    "redis://localhost:6379",
+		"DATABASE_URL":  "postgres://localhost/test",
+		"REDIS_URL":     "redis://localhost:6379",
 		"API_GRPC_ADDR": "localhost:50051",
 	})
 }

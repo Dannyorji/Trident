@@ -75,25 +75,26 @@ type tierEntry struct {
 type TierCache struct {
 	mu      sync.RWMutex
 	entries map[string]tierEntry
+	now     func() time.Time
 }
 
 const tierCacheTTL = 5 * time.Minute
 
 // NewTierCache returns an empty, ready-to-use tier cache.
 func NewTierCache() *TierCache {
-	return &TierCache{entries: map[string]tierEntry{}}
+	return &TierCache{entries: map[string]tierEntry{}, now: time.Now}
 }
 
 func (tc *TierCache) get(hash string) (string, bool) {
 	tc.mu.RLock()
 	e, ok := tc.entries[hash]
 	tc.mu.RUnlock()
-	return e.tier, ok && time.Now().Before(e.exp)
+	return e.tier, ok && tc.now().Before(e.exp)
 }
 
 func (tc *TierCache) set(hash, tier string) {
 	tc.mu.Lock()
-	tc.entries[hash] = tierEntry{tier: tier, exp: time.Now().Add(tierCacheTTL)}
+	tc.entries[hash] = tierEntry{tier: tier, exp: tc.now().Add(tierCacheTTL)}
 	tc.mu.Unlock()
 }
 
@@ -107,7 +108,14 @@ func (tc *TierCache) Invalidate(hash string) {
 }
 
 func (tc *TierCache) resolve(ctx context.Context, apiKey string, db TierDB) string {
-	hash := hashKey(apiKey)
+	// Must match the hash stored in api_keys.key_hash (handlers.sha256hex /
+	// sha256KeyHash: plain SHA-256), not hashKey's HMAC-SHA256 — the latter
+	// is only for the legacy API_KEY_HASHES env-var auth path. Using HMAC
+	// here meant a DB-issued key's tier could never be found by this lookup
+	// and every such key silently fell back to "free" (issue #608). It also
+	// has to match what admin's UpdateAPIKey passes to InvalidateTier, which
+	// is the raw key_hash column value (plain SHA-256).
+	hash := sha256KeyHash(apiKey)
 	if t, ok := tc.get(hash); ok {
 		return t
 	}
@@ -223,6 +231,7 @@ func TieredRateLimit(cfg RateLimitConfig) func(http.Handler) http.Handler {
 			allowed, count, err := slide(r.Context(), redisKey, limit, windowMs)
 			if err != nil {
 				slog.Warn("rate limit check failed; failing open", "err", err)
+				metrics.RateLimitFailOpenTotal.WithLabelValues("per_key").Inc()
 				rlAllowed.Add(1)
 				next.ServeHTTP(w, r)
 				return

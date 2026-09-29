@@ -1,6 +1,6 @@
 [package]
 name = "trident-sdk"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "Rust client for the Trident Soroban event indexer"
 license = "MIT"
@@ -19,6 +19,9 @@ futures = "0.3"
 url = "2"
 rand = "0.8"
 tokio = { version = "1", features = ["time"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

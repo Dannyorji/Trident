@@ -28,10 +28,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Stellar RPC and parsing - reuse indexer rpc and parser modules by copying minimal logic
-base64 = "0.22"
-stellar-xdr = { version = "26.0.1", features = ["curr"] }
-stellar-strkey = "0.0.16"
-hex = "0.4"
 
 # Date/time
 chrono = { version = "0.4", features = ["serde"] }

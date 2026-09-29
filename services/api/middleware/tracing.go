@@ -58,6 +58,8 @@ type statusCapturingWriter struct {
 	statusCode int
 }
 
+func (w *statusCapturingWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
 // WriteHeader records the status code before writing it.
 func (w *statusCapturingWriter) WriteHeader(statusCode int) {
 	w.statusCode = statusCode

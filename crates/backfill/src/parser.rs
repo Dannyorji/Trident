@@ -1,10 +1,11 @@
-﻿use base64::{engine::general_purpose::STANDARD, Engine};
-use serde::Deserialize;
+﻿use serde::Deserialize;
 use serde_json::Value as Json;
-use stellar_strkey::{ed25519, Contract};
-use stellar_xdr::curr::{
-    AccountId, ContractId, Limited, Limits, PublicKey, ReadXdr, ScAddress, ScVal,
-};
+// ScVal decoding is shared with the live indexer (issue #506): this crate
+// previously carried a stale copy that predated the exact U256/I256
+// rendering from #415 and lacked the Timepoint/Duration/Error arms, so a
+// backfilled event could store different values than the live path stored
+// for the same XDR. One decoder makes that divergence impossible.
+use trident_common::scval::{decode_scval, scval_to_json, scval_to_string};
 use trident_common::{EventType, SorobanEvent, TridentError};
 
 /// Accept a field the RPC sends as either a JSON string or a JSON number.
@@ -132,6 +133,7 @@ impl Parser {
             ledger_timestamp: raw.ledger_closed_at.clone(),
             transaction_hash: raw.tx_hash.clone(),
             event_index,
+            raw_event_index: event_index,
             event_type,
         }))
     }
@@ -145,98 +147,5 @@ fn parse_event_type(raw: &str) -> Result<EventType, TridentError> {
         other => Err(TridentError::parse(anyhow::anyhow!(
             "unknown event type: {other}"
         ))),
-    }
-}
-
-fn decode_scval(b64: &str) -> Result<ScVal, TridentError> {
-    let bytes = STANDARD
-        .decode(b64)
-        .map_err(|e| TridentError::parse(anyhow::Error::new(e).context("base64 decode")))?;
-    let mut cursor = std::io::Cursor::new(bytes);
-    ScVal::read_xdr(&mut Limited::new(&mut cursor, Limits::none()))
-        .map_err(|e| TridentError::parse(anyhow::Error::new(e).context("XDR decode ScVal")))
-}
-
-pub fn scval_to_string(val: &ScVal) -> String {
-    match val {
-        ScVal::Symbol(s) => s.to_utf8_string_lossy(),
-        ScVal::String(s) => s.to_utf8_string_lossy(),
-        ScVal::Bool(b) => b.to_string(),
-        ScVal::Void => "void".into(),
-        ScVal::U32(n) => n.to_string(),
-        ScVal::I32(n) => n.to_string(),
-        ScVal::U64(n) => n.to_string(),
-        ScVal::I64(n) => n.to_string(),
-        ScVal::U128(parts) => {
-            let val = ((parts.hi as u128) << 64) | (parts.lo as u128);
-            val.to_string()
-        }
-        ScVal::I128(parts) => {
-            let val = ((parts.hi as i128) << 64) | (parts.lo as i128);
-            val.to_string()
-        }
-        ScVal::U256(parts) => format!(
-            "u256({:x}{:x}{:x}{:x})",
-            parts.hi_hi, parts.hi_lo, parts.lo_hi, parts.lo_lo
-        ),
-        ScVal::I256(parts) => format!(
-            "i256({:x}{:x}{:x}{:x})",
-            parts.hi_hi, parts.hi_lo, parts.lo_hi, parts.lo_lo
-        ),
-        ScVal::Bytes(b) => hex::encode(b.as_slice()),
-        ScVal::Address(addr) => scaddress_to_string(addr),
-        other => format!("{other:?}"),
-    }
-}
-
-pub fn scval_to_json(val: &ScVal) -> Json {
-    match val {
-        ScVal::Void => Json::Null,
-        ScVal::Bool(b) => Json::Bool(*b),
-        ScVal::Symbol(s) => Json::String(s.to_utf8_string_lossy()),
-        ScVal::String(s) => Json::String(s.to_utf8_string_lossy()),
-        ScVal::U32(n) => Json::from(*n),
-        ScVal::I32(n) => Json::from(*n),
-        ScVal::U64(n) => Json::from(*n),
-        ScVal::I64(n) => Json::from(*n),
-        ScVal::U128(parts) => {
-            let v = ((parts.hi as u128) << 64) | (parts.lo as u128);
-            if v <= u64::MAX as u128 {
-                Json::from(v as u64)
-            } else {
-                Json::String(v.to_string())
-            }
-        }
-        ScVal::I128(parts) => {
-            let v = ((parts.hi as i128) << 64) | (parts.lo as i128);
-            if v >= i64::MIN as i128 && v <= i64::MAX as i128 {
-                Json::from(v as i64)
-            } else {
-                Json::String(v.to_string())
-            }
-        }
-        ScVal::Bytes(b) => Json::String(hex::encode(b.as_slice())),
-        ScVal::Address(addr) => Json::String(scaddress_to_string(addr)),
-        ScVal::Vec(Some(items)) => Json::Array(items.iter().map(scval_to_json).collect()),
-        ScVal::Vec(None) => Json::Array(vec![]),
-        ScVal::Map(Some(entries)) => {
-            let obj: serde_json::Map<String, Json> = entries
-                .iter()
-                .map(|e| (scval_to_string(&e.key), scval_to_json(&e.val)))
-                .collect();
-            Json::Object(obj)
-        }
-        ScVal::Map(None) => Json::Object(serde_json::Map::new()),
-        other => Json::String(format!("{other:?}")),
-    }
-}
-
-fn scaddress_to_string(addr: &ScAddress) -> String {
-    match addr {
-        ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(bytes))) => {
-            ed25519::PublicKey(bytes.0).to_string().as_str().to_owned()
-        }
-        ScAddress::Contract(ContractId(hash)) => Contract(hash.0).to_string().as_str().to_owned(),
-        other => format!("{other:?}"),
     }
 }

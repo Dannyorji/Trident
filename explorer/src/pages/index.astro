@@ -1,7 +1,5 @@
 ---
 import Base from '../layouts/Base.astro';
-import { listEvents } from '../lib/api';
-import { truncate, relativeTime } from '../lib/format';
 import type { Network } from '../lib/types';
 
 const rawNetwork = Astro.url.searchParams.get('network');
@@ -11,14 +9,6 @@ const network: Network = rawNetwork === 'mainnet' ? 'mainnet' : 'testnet';
 const searchQuery = Astro.url.searchParams.get('q')?.trim();
 if (searchQuery) {
   return Astro.redirect(`/contract/${encodeURIComponent(searchQuery)}?network=${network}`);
-}
-
-let recentEvents: Awaited<ReturnType<typeof listEvents>>['events'] = [];
-try {
-  const result = await listEvents({ limit: 10, network });
-  recentEvents = result.events;
-} catch {
-  // non-critical — ticker is empty on API failure
 }
 ---
 
@@ -35,96 +25,79 @@ try {
 
     <!-- Search form (works without JS via ?q= redirect) -->
     <form method="get" class="flex gap-2 max-w-2xl mx-auto" id="search-form">
+      <label for="contract-input" class="sr-only">Soroban contract address</label>
       <input
         type="text"
         name="q"
         id="contract-input"
         placeholder="Soroban contract address (C...)"
-        class="flex-1 px-4 py-2.5 rounded-lg bg-gray-800 border border-gray-700 text-white placeholder-gray-500 focus:outline-none focus:border-indigo-500 font-mono text-sm"
+        class="flex-1 px-4 py-2.5 rounded-lg bg-gray-800 border border-gray-700 text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent font-mono text-sm"
         autocomplete="off"
         spellcheck="false"
+        aria-label="Soroban contract address"
+        aria-describedby="search-help"
       />
       <input type="hidden" name="network" value={network} />
       <button
         type="submit"
-        class="px-6 py-2.5 bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 rounded-lg text-white font-semibold text-sm transition-colors"
+        class="px-6 py-2.5 bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 rounded-lg text-white font-semibold text-sm transition-colors focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 focus:ring-offset-gray-950"
+        aria-label="Search for contract"
       >
         Explore
       </button>
     </form>
+    <p id="search-help" class="sr-only">Enter a contract address starting with C</p>
 
     <!-- Network toggle -->
     <div class="mt-4 flex justify-center gap-2 text-sm" role="group" aria-label="Network selector">
       <a
         href="?network=testnet"
-        class={`px-4 py-1.5 rounded-full font-medium transition-colors ${
+        class={`px-4 py-1.5 rounded-full font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 focus:ring-offset-gray-950 ${
           network === 'testnet'
             ? 'bg-indigo-600 text-white'
             : 'text-gray-400 hover:text-white hover:bg-gray-800'
         }`}
-        aria-current={network === 'testnet' ? 'true' : undefined}
+        aria-current={network === 'testnet' ? 'page' : undefined}
       >
         Testnet
       </a>
       <a
         href="?network=mainnet"
-        class={`px-4 py-1.5 rounded-full font-medium transition-colors ${
+        class={`px-4 py-1.5 rounded-full font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 focus:ring-offset-gray-950 ${
           network === 'mainnet'
             ? 'bg-indigo-600 text-white'
             : 'text-gray-400 hover:text-white hover:bg-gray-800'
         }`}
-        aria-current={network === 'mainnet' ? 'true' : undefined}
+        aria-current={network === 'mainnet' ? 'page' : undefined}
       >
         Mainnet
       </a>
     </div>
   </section>
 
-  <!-- Live ticker -->
-  <section class="mt-4">
+  <!-- Live ticker (client-rendered: skeleton → recent events or an honest state) -->
+  <section class="mt-4" aria-label="Recent events ticker">
     <div class="flex items-center justify-between mb-3">
       <h2 class="text-xs font-semibold text-gray-400 uppercase tracking-widest">
         Recent Events
         <span
           id="ticker-dot"
-          class="inline-block w-1.5 h-1.5 rounded-full bg-green-500 ml-2 align-middle"
-          title="Live"
+          class="inline-block w-1.5 h-1.5 rounded-full ml-2 align-middle"
+          role="status"
+          aria-label="Live ticker status"
+          aria-live="polite"
         ></span>
       </h2>
-      <span class="text-xs text-gray-600">Updates every 5s</span>
+      <span class="text-xs text-gray-600">Updates every 10s</span>
     </div>
 
     <ul id="event-ticker" class="space-y-1.5" aria-live="polite" aria-label="Recent events">
-      {
-        recentEvents.length === 0 ? (
-          <li class="text-gray-500 text-sm py-4 text-center">No recent events.</li>
-        ) : (
-          recentEvents.map((e) => (
-            <li class="flex items-center gap-4 bg-gray-900 rounded-lg px-4 py-2.5 text-sm hover:bg-gray-800 transition-colors">
-              <a
-                href={`/contract/${e.contract_id}?network=${network}`}
-                class="font-mono text-indigo-400 hover:text-indigo-300 truncate shrink-0 w-36"
-                title={e.contract_id}
-              >
-                {truncate(e.contract_id)}
-              </a>
-              <span class="text-gray-300 truncate flex-1">
-                {e.topics[0] ?? e.event_type}
-              </span>
-              <span class="text-gray-500 text-xs shrink-0 hidden sm:block" title={e.ledger_timestamp}>
-                {relativeTime(e.ledger_timestamp)}
-              </span>
-              <a
-                href={`/contract/${e.contract_id}/event/${e.id}?network=${network}`}
-                class="text-xs text-gray-500 hover:text-white shrink-0"
-                aria-label={`View event ${e.id}`}
-              >
-                #{e.ledger_sequence}
-              </a>
-            </li>
-          ))
-        )
-      }
+      <noscript>
+        <li class="text-gray-500 text-sm py-4 text-center">
+          Recent events load client-side. Enable JavaScript to see them, or
+          <a href="/api/recent-events.json?network={network}" class="text-indigo-400 hover:underline">view the raw feed</a>.
+        </li>
+      </noscript>
     </ul>
   </section>
 
@@ -133,7 +106,7 @@ try {
     Need programmatic access?
     <a
       href="https://app.trident.dev/signup"
-      class="text-indigo-400 hover:text-indigo-300 hover:underline"
+      class="text-indigo-400 hover:text-indigo-300 hover:underline focus:outline-none focus:ring-2 focus:ring-indigo-500 rounded"
       target="_blank"
       rel="noopener noreferrer">Get an API key</a
     > for higher rate limits and real-time subscriptions.
@@ -155,49 +128,8 @@ try {
       window.location.href = `/contract/${encodeURIComponent(val)}?network=${network}`;
     });
   }
+</script>
 
-  // Live ticker polling
-  const network =
-    new URLSearchParams(window.location.search).get('network') ?? 'testnet';
-
-  function renderEvent(e: {
-    contract_id: string;
-    topics: string[];
-    event_type: string;
-    ledger_sequence: number;
-    ledger_timestamp: string;
-    id: string;
-  }): string {
-    const trunc = (s: string) =>
-      s.length > 18 ? `${s.slice(0, 8)}...${s.slice(-6)}` : s;
-    return `
-      <li class="flex items-center gap-4 bg-gray-900 rounded-lg px-4 py-2.5 text-sm hover:bg-gray-800 transition-colors">
-        <a href="/contract/${e.contract_id}?network=${network}"
-           class="font-mono text-indigo-400 hover:text-indigo-300 truncate shrink-0 w-36"
-           title="${e.contract_id}">${trunc(e.contract_id)}</a>
-        <span class="text-gray-300 truncate flex-1">${e.topics[0] ?? e.event_type}</span>
-        <span class="text-gray-500 text-xs shrink-0 hidden sm:block">&nbsp;</span>
-        <a href="/contract/${e.contract_id}/event/${e.id}?network=${network}"
-           class="text-xs text-gray-500 hover:text-white shrink-0">#${e.ledger_sequence}</a>
-      </li>`;
-  }
-
-  async function pollTicker() {
-    try {
-      const res = await fetch(`/api/recent-events.json?network=${network}`);
-      if (!res.ok) return;
-      const events: Parameters<typeof renderEvent>[0][] = await res.json();
-      const ul = document.getElementById('event-ticker');
-      if (ul && events.length) {
-        ul.innerHTML = events.map(renderEvent).join('');
-      }
-    } catch {
-      // silent
-    }
-  }
-
-  const id = setInterval(pollTicker, 5000);
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden) clearInterval(id);
-  });
+<script>
+  import '../lib/ticker';
 </script>

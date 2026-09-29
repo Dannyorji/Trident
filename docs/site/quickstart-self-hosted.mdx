@@ -146,6 +146,20 @@ docker compose down -v
 
 ---
 
+## Troubleshooting
+
+| Problem | Fix |
+|---------|-----|
+| `docker compose up` exits immediately | Run `docker compose logs` to see which service crashed. Most common: Postgres not healthy yet — wait 10 seconds and retry. |
+| `indexer` logs `connection refused` | The Postgres container is still starting. The indexer retries automatically — give it a few seconds. |
+| `api` logs `gRPC backend unavailable` | The Rust indexer hasn't started serving gRPC yet. Check `docker compose ps` — all services should show `Up`. |
+| `curl localhost:3000/v1/events` returns 401 | You need an API key. Create one with `POST /v1/api-keys` using your admin key. |
+| Port 3000 already in use | Another process is using the port. Stop it with `lsof -ti:3000 | xargs kill` or change the port in `.env`. |
+| Slow first query | The indexer needs to catch up to the chain tip. Monitor progress with `GET /v1/ready`. |
+| `docker compose down -v` to reset | Wipes all data volumes. Use when you want a clean slate. |
+
+---
+
 ## What's next?
 
 <CardGroup cols={2}>

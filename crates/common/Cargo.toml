@@ -11,3 +11,10 @@ serde_json = "1"
 chrono = { version = "0.4", features = ["clock"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Shared ScVal decoding (issue #506) — versions pinned to match the indexer
+# and backfill crates so the whole workspace resolves one copy of each.
+base64 = "0.22"
+hex = "0.4"
+metrics = "0.24"
+stellar-strkey = "0.0.16"
+stellar-xdr = { version = "26.0.1", features = ["curr"] }

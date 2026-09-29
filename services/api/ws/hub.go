@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"sync"
 
+	"github.com/Depo-dev/trident/services/api/internal/logsampling"
 	"github.com/Depo-dev/trident/services/api/internal/metrics"
 )
 
@@ -14,6 +15,19 @@ import (
 // consumer, not a momentary blip, and is force-disconnected with a close
 // code rather than left to buffer drops indefinitely.
 const maxConsecutiveDrops = 5
+
+// registerLogSampler and unregisterLogSampler thin the per-connection
+// register/unregister debug logs (issue #239): metrics.WSConnectsTotal /
+// WSDisconnectsTotal already give exact counts, so these logs exist for
+// occasional manual debugging, not for counting — logging every one of a
+// busy deployment's churn is pure log volume with no analytical benefit and
+// can drown out other debug output. Separate samplers so each event type
+// gets its own predictable 1-in-50 coverage rather than sharing one counter
+// and letting a burst of one type starve the other's sample.
+var (
+	registerLogSampler   = logsampling.New(50)
+	unregisterLogSampler = logsampling.New(50)
+)
 
 // subscriber is the registration interface shared by REST WebSocket clients
 // and GraphQL subscription channels.
@@ -80,7 +94,9 @@ func (h *Hub) register(s subscriber) {
 	h.mu.Unlock()
 	metrics.WSActiveConnections.Inc()
 	metrics.WSConnectsTotal.Inc()
-	slog.Debug("ws: client registered", "contractId", s.getContractID())
+	if registerLogSampler.Allow() {
+		slog.Debug("ws: client registered", "contractId", s.getContractID())
+	}
 }
 
 // unregister removes s from the hub and calls shutdown so its goroutine
@@ -98,7 +114,9 @@ func (h *Hub) unregister(s subscriber) {
 		metrics.WSActiveConnections.Dec()
 		metrics.WSDisconnectsTotal.Inc()
 	}
-	slog.Debug("ws: client unregistered", "contractId", s.getContractID())
+	if unregisterLogSampler.Allow() {
+		slog.Debug("ws: client unregistered", "contractId", s.getContractID())
+	}
 }
 
 // Broadcast delivers msg to every subscriber watching contractID.

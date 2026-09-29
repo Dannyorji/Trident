@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 
+use clap::{Parser, Subcommand};
 use opentelemetry_otlp::WithExportConfig;
 use sqlx::postgres::PgPoolOptions;
 use std::time::Duration;
@@ -15,12 +16,237 @@ mod health;
 mod metrics;
 mod parser;
 mod poll;
+mod reconcile;
 mod redis_stream;
 mod rpc;
 mod spec;
 mod storage;
 mod streamer;
+/// Scheduled testnet ingest-correctness suite (issue #419). Test-only; compiled
+/// out of the binary entirely.
+#[cfg(test)]
+mod testnet_correctness;
 mod token_metadata;
+
+/// `trident-indexer` runs the poll-loop daemon when invoked with no
+/// subcommand (every existing deployment — Docker, Helm, `cargo run`), so
+/// this and `Command` are additive: nothing about the daemon path changes.
+#[derive(Parser, Debug)]
+#[command(author, version, about)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// Operator tooling for the `failed_events` dead-letter queue (issue #574).
+/// `DATABASE_URL` is read the same way the daemon reads it.
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Replay dead-lettered events back into `soroban_events`.
+    Replay {
+        /// Replay one event by its `failed_events.id`.
+        #[arg(long, conflicts_with = "all")]
+        id: Option<uuid::Uuid>,
+
+        /// Replay every row still pending (`replayed_at IS NULL`), oldest
+        /// first.
+        #[arg(long, conflicts_with = "id")]
+        all: bool,
+
+        /// List pending rows instead of replaying them. Combine with
+        /// neither `--id` nor `--all`, or use on its own — the runbook
+        /// query, run from the CLI instead of psql.
+        #[arg(long)]
+        list: bool,
+
+        /// Cap on rows considered by `--all` or `--list`.
+        #[arg(long, default_value_t = 1000)]
+        limit: i64,
+    },
+
+    /// Compare the live chain tip against the highest named `soroban_events`
+    /// partition and fail if headroom is below a safety margin (issue #643).
+    ///
+    /// The pre-built mainnet partitions in migration 0017 were sized against
+    /// mainnet's ledger height at authoring time; by the time a mainnet
+    /// indexer is actually pointed at the network, that height is stale and
+    /// the ceiling may already be exhausted. This is a launch-day gap
+    /// distinct from routine partition exhaustion (which
+    /// TridentPartitionExhaustionWarning/Exhausted already alert on once the
+    /// indexer is running) — this check exists to catch it *before* cutover.
+    PartitionCheck {
+        /// Minimum ledgers of headroom required between the live chain tip
+        /// and the highest named partition's upper bound. Defaults to 5M
+        /// ledgers (~289 days at mainnet's ~17,280 ledgers/day), matching the
+        /// TridentPartitionExhaustionWarning threshold so pre-flight and
+        /// runtime alerting agree on what "enough headroom" means.
+        #[arg(long, default_value_t = 5_000_000)]
+        min_headroom_ledgers: i64,
+    },
+}
+
+/// Runs a `replay` subcommand to completion and exits — never starts the
+/// poll-loop daemon, the metrics/health servers, or a signal handler, since
+/// this is a one-shot operator command, not a long-running service.
+async fn run_replay(
+    id: Option<uuid::Uuid>,
+    all: bool,
+    list: bool,
+    limit: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let database_url = std::env::var("DATABASE_URL")
+        .map_err(|_| "DATABASE_URL must be set to use `trident-indexer replay`")?;
+    let db = sqlx::PgPool::connect(&database_url).await?;
+
+    // Replayed rows must be tagged with this deployment's actual network
+    // (issue #595) — `failed_events` has no network column of its own, so
+    // there is nothing to recover it from other than the same `NETWORK` env
+    // var the daemon validates at startup.
+    let network =
+        config::normalize_network(&std::env::var("NETWORK").unwrap_or_else(|_| "testnet".into()))?;
+
+    // Bare `replay` (no flags) behaves like `--list`: report what's
+    // outstanding — the runbook's query, run from the CLI instead of psql —
+    // without replaying anything, since a no-argument invocation is more
+    // likely a mistake or a status check than an intent to replay
+    // everything.
+    let list = list || (!all && id.is_none());
+    if list {
+        print_pending(&db, limit).await?;
+    }
+    if !all && id.is_none() {
+        return Ok(());
+    }
+
+    // `--list --all` previews before replaying; `--list --id` prints the
+    // full pending table before replaying just that one row.
+    let ids: Vec<uuid::Uuid> = match id {
+        Some(id) => vec![id],
+        None => db::list_pending_failed_events(&db, limit)
+            .await?
+            .into_iter()
+            .map(|row| row.id)
+            .collect(),
+    };
+
+    let mut replayed = 0u32;
+    let mut skipped = 0u32;
+    for id in ids {
+        match db::replay_failed_event(&db, id, &network).await {
+            Ok(db::ReplayOutcome::Replayed) => {
+                println!("replayed {id}");
+                replayed += 1;
+            }
+            Ok(db::ReplayOutcome::AlreadyReplayedOrMissing) => {
+                println!("skipped {id} (already replayed or not found)");
+                skipped += 1;
+            }
+            Err(e) => {
+                eprintln!("failed to replay {id}: {e}");
+                skipped += 1;
+            }
+        }
+    }
+    println!("{replayed} replayed, {skipped} skipped");
+
+    Ok(())
+}
+
+/// Collapse a stored `error_message` to one line for the `--list` table.
+/// Dead-letter messages are raw driver errors and are routinely multi-line;
+/// printed verbatim they break the column layout. The full text stays in the
+/// row for anyone querying `failed_events` directly.
+fn truncate_error(msg: &str) -> String {
+    const MAX: usize = 120;
+    let one_line = msg.split_whitespace().collect::<Vec<_>>().join(" ");
+    match one_line.char_indices().nth(MAX) {
+        Some((byte_idx, _)) => format!("{}…", &one_line[..byte_idx]),
+        None => one_line,
+    }
+}
+
+/// Runs the `partition-check` subcommand to completion and exits (issue #643).
+///
+/// Compares the live Stellar RPC chain tip against the highest named
+/// `soroban_events` partition upper bound and fails loudly (non-zero exit)
+/// if the remaining headroom is below `min_headroom_ledgers`. Intended to run
+/// as an explicit pre-cutover gate, not as an ongoing check — routine
+/// exhaustion once the indexer is live is already covered by
+/// TridentPartitionExhaustionWarning/Exhausted in monitoring/alerts.yml.
+async fn run_partition_check(
+    min_headroom_ledgers: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
+
+    let cfg = config::Config::from_env()?;
+    let db = sqlx::PgPool::connect(&cfg.database_url).await?;
+
+    let ranges = db::named_partition_ranges(&db).await?;
+    let highest_upper = ranges.iter().map(|&(_, hi)| hi).max().ok_or_else(|| {
+        "no named soroban_events partitions found — only the DEFAULT catch-all exists"
+    })?;
+
+    let rpc = rpc::RpcClient::with_endpoints(
+        cfg.stellar_rpc_urls.clone(),
+        &rpc::RpcHttpSettings {
+            connect_timeout: cfg.rpc_connect_timeout,
+            request_timeout: cfg.rpc_request_timeout,
+            pool_idle_timeout: cfg.rpc_pool_idle_timeout,
+            pool_max_idle_per_host: cfg.rpc_pool_max_idle_per_host,
+            tcp_keepalive: cfg.rpc_tcp_keepalive,
+        },
+    )?;
+    let tip = rpc.get_latest_ledger().await?;
+
+    let headroom = highest_upper - tip as i64;
+
+    println!("network:                  {}", cfg.network);
+    println!("live chain tip:           {tip}");
+    println!("highest named partition:  {highest_upper} (exclusive upper bound)");
+    println!("headroom:                 {headroom} ledgers");
+    println!("required headroom:        {min_headroom_ledgers} ledgers");
+
+    if headroom < min_headroom_ledgers {
+        eprintln!(
+            "NO-GO: partition headroom ({headroom} ledgers) is below the required minimum \
+             ({min_headroom_ledgers} ledgers). Run `SELECT create_soroban_partition({highest_upper}, {});` \
+             (repeating as needed) to extend coverage before cutover (issue #643).",
+            highest_upper + 2_000_000,
+        );
+        std::process::exit(1);
+    }
+
+    println!("GO: partition headroom is sufficient.");
+    Ok(())
+}
+
+async fn print_pending(db: &sqlx::PgPool, limit: i64) -> Result<(), Box<dyn std::error::Error>> {
+    let pending = db::list_pending_failed_events(db, limit).await?;
+    if pending.is_empty() {
+        println!("No pending failed_events rows.");
+        return Ok(());
+    }
+    println!(
+        "{:<36}  {:>12}  {:<56}  {:<26}  attempts  {:<24}  error",
+        "id", "ledger", "contract_id", "tx_hash", "occurred_at"
+    );
+    for row in &pending {
+        println!(
+            "{:<36}  {:>12}  {:<56}  {:<26}  {:>8}  {:<24}  {}",
+            row.id,
+            row.ledger_sequence,
+            row.contract_id,
+            row.transaction_hash,
+            row.attempts,
+            row.occurred_at.to_rfc3339(),
+            truncate_error(&row.error_message),
+        );
+    }
+    println!("{} pending", pending.len());
+    Ok(())
+}
 
 fn init_tracer() -> Option<opentelemetry_sdk::trace::Tracer> {
     let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok()?;
@@ -61,6 +287,29 @@ fn init_tracer() -> Option<opentelemetry_sdk::trace::Tracer> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+    if let Some(Command::Replay {
+        id,
+        all,
+        list,
+        limit,
+    }) = cli.command
+    {
+        // A one-shot operator command: connect, do the work, exit. None of
+        // the daemon's tracer/metrics/health/signal-handler setup below runs
+        // for this path.
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env())
+            .init();
+        return run_replay(id, all, list, limit).await;
+    }
+    if let Some(Command::PartitionCheck {
+        min_headroom_ledgers,
+    }) = cli.command
+    {
+        return run_partition_check(min_headroom_ledgers).await;
+    }
+
     init_tracing(init_tracer());
 
     tracing::info!("Trident indexer starting");
@@ -69,6 +318,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("{e}");
         std::process::exit(1);
     });
+    cfg.log_effective_config();
 
     metrics::install(cfg.metrics_port)?;
 
@@ -157,6 +407,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let relay_shutdown = shutdown.clone();
     let relay_handle = tokio::spawn(async move { relay.run(relay_shutdown).await });
+
+    // Ledger-range reconciliation (issue #511): periodically re-fetches a
+    // settled window from the RPC and compares per-ledger event counts
+    // against the database, so silent under-indexing surfaces in minutes
+    // instead of at the next incident. Read-only; stops on the same shutdown
+    // signal, and needs no drain — a pass in flight holds no state worth
+    // finishing.
+    if cfg.reconcile_enabled {
+        let reconcile_rpc = rpc::RpcClient::with_endpoints(
+            cfg.stellar_rpc_urls.clone(),
+            &rpc::RpcHttpSettings {
+                connect_timeout: cfg.rpc_connect_timeout,
+                request_timeout: cfg.rpc_request_timeout,
+                pool_idle_timeout: cfg.rpc_pool_idle_timeout,
+                pool_max_idle_per_host: cfg.rpc_pool_max_idle_per_host,
+                tcp_keepalive: cfg.rpc_tcp_keepalive,
+                max_calls_per_sec: cfg.rpc_max_calls_per_sec,
+            },
+        )?;
+        let reconciler = reconcile::Reconciler::new(&cfg, db_pool.clone(), reconcile_rpc);
+        let reconcile_shutdown = shutdown.clone();
+        tokio::spawn(async move { reconciler.run(reconcile_shutdown).await });
+    } else {
+        tracing::warn!(
+            "RECONCILE_ENABLED=false: nothing is verifying indexed counts against the RPC source"
+        );
+    }
 
     // Allow the shutdown drain to finish its in-flight work before the process
     // is killed. Kubernetes/Fly terminationGracePeriodSeconds should be ≥ this

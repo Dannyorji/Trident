@@ -52,7 +52,7 @@ groups:
   - name: trident.indexer.heartbeat
     rules:
       - alert: TridentIndexerHeartbeatStale
-        expr: (time() - trident_indexer_heartbeat_timestamp_seconds) > 300
+        expr: (time() - trident_indexer_last_poll_timestamp_seconds) > 300
         for: 2m
         labels:
           severity: critical
@@ -60,15 +60,23 @@ groups:
         annotations:
           summary: "Trident indexer heartbeat is stale"
           description: >
-            trident_indexer_heartbeat_timestamp_seconds on
+            trident_indexer_last_poll_timestamp_seconds on
             {{ $labels.instance }} has not advanced in over 5 minutes. The
             poll loop is hung (deadlock, panic caught by a supervisor,
             blocked I/O) even though the process may still be running and
             /metrics may still respond.
           runbook_url: "docs/runbooks/alerts.md#tridentindexerheartbeatstale"
 
+      # #466 added a TridentIndexerStalled alert here for issue #400. It is
+      # dropped: with the metric name corrected above, TridentIndexerHeartbeatStale
+      # already covers staleness and TridentIndexerMetricsMissing already
+      # covers absence, both at the same critical severity. A third rule on
+      # the same series only pages twice for one failure. What #400 actually
+      # asked for — firing on silence rather than on lag — is satisfied by
+      # these two now that they query a series the indexer emits.
+
       - alert: TridentIndexerMetricsMissing
-        expr: absent(trident_indexer_heartbeat_timestamp_seconds)
+        expr: absent(trident_indexer_last_poll_timestamp_seconds)
         for: 3m
         labels:
           severity: critical
@@ -76,7 +84,7 @@ groups:
         annotations:
           summary: "Trident indexer metrics are missing entirely"
           description: >
-            No trident_indexer_heartbeat_timestamp_seconds series exists —
+            No trident_indexer_last_poll_timestamp_seconds series exists —
             the indexer's /metrics endpoint is not scrapeable at all (process
             down, crashed, or a scrape-config/network problem).
           runbook_url: "docs/runbooks/alerts.md#tridentindexermetricsmissing"
@@ -118,6 +126,152 @@ groups:
             recognise yet.
           runbook_url: "docs/runbooks/alerts.md#tridentindexerparseerrorratehigh"
 
+      # Dead-lettered events (#568). trident_indexer_dead_lettered_total only
+      # increments once an undecodable event's audit row is durably written
+      # to parse_errors (issue #414) — so any increase is real, replayable
+      # data to look at, not scrape noise. Distinct from
+      # TridentIndexerPersistDeadLetterBacklog below, which tracks events
+      # that decoded fine but failed to persist (issue #208).
+      - alert: TridentIndexerDeadLetteredEventsDetected
+        expr: increase(trident_indexer_dead_lettered_total[1h]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: "Trident indexer dead-lettered {{ $value | humanize }} event(s) in the last hour"
+          description: >
+            trident_indexer_dead_lettered_total increased. One or more
+            events failed XDR decoding and were durably written to
+            parse_errors after the dead-letter insert's own retries (issue
+            #414). These events were skipped rather than indexed; inspect
+            parse_errors for the payload and error_message to identify the
+            cause.
+          runbook_url: "docs/runbooks/alerts.md#tridentindexerdeadletteredeventsdetected"
+
+      # Unexpected ScVal variants (#506). The decoder matches every ScVal
+      # variant exhaustively — a new XDR variant fails compilation, so this
+      # cannot fire for "unknown" types. It fires when a structurally valid
+      # variant that should never appear in an event payload
+      # (ContractInstance / LedgerKeyContractInstance / LedgerKeyNonce) is
+      # decoded from live traffic: the value is stored faithfully, but the
+      # emitting contract deserves a look.
+      #
+      # Fixed as part of issue #617: this rule previously had no for/labels/
+      # annotations at all, and the block below (belonging to it, runbook_url
+      # included) had been misattached to TridentIndexerPersistDeadLetterBacklog's
+      # alert instead — that rule fired with these ScVal-variant annotations
+      # rather than its own, and this one fired with no severity, no
+      # description, and no runbook link.
+      - alert: TridentIndexerUnexpectedScValVariant
+        expr: increase(trident_scval_unexpected_variant_total[1h]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: "Trident decoded {{ $value | humanize }} anomalous ScVal variant(s) in the last hour"
+          description: >
+            An event payload contained an ScVal variant that no well-behaved
+            contract emits (ContractInstance or a ledger-key form). The value
+            was decoded and stored faithfully — never coerced — and the
+            indexer logs name the variant and context. Identify the emitting
+            contract from the logs and review what it is publishing.
+          runbook_url: "docs/runbooks/alerts.md#tridentindexerunexpectedscvalvariant"
+      # A non-empty persist dead-letter queue is data missing from
+      # soroban_events until someone replays it — a silently growing DLQ is
+      # the same as data loss. Rows leave the pending state only through the
+      # documented replay procedure, so this fires for as long as any exist.
+      - alert: TridentIndexerPersistDeadLetterBacklog
+        expr: trident_indexer_persist_dead_letter_backlog > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: "Trident indexer has {{ $value | humanize }} event(s) awaiting replay in the persist dead-letter queue"
+          description: >
+            trident_indexer_persist_dead_letter_backlog is non-zero.
+            One or more events decoded fine but exhausted the persist retry
+            budget, so the streamer captured them in failed_events (issues
+            #208/#508) and advanced the cursor past them. The data is safe
+            but missing from soroban_events until replayed.
+          runbook_url: "docs/runbooks/alerts.md#tridentindexerpersistdeadletterbacklog"
+
+      # A non-empty persist dead-letter queue is data missing from
+      # soroban_events until someone replays it — a silently growing DLQ is
+      # the same as data loss. Rows leave the pending state only through the
+      # documented replay procedure, so this fires for as long as any exist.
+      - alert: TridentIndexerPersistDeadLetterBacklog
+        expr: trident_indexer_persist_dead_letter_backlog > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: "Trident indexer has {{ $value | humanize }} event(s) pending replay in failed_events"
+          description: >
+            failed_events has pending rows: at least one well-formed event's
+            database commit failed through its full retry budget and was
+            captured for replay rather than blocking the ingest cursor
+            (issue #508). Data is safe but missing from soroban_events until
+            replayed — see the runbook for the replay procedure.
+          runbook_url: "docs/runbooks/alerts.md#tridentindexerpersistdeadletterbacklog"
+
+  # ---------------------------------------------------------------------------
+  # Ledger-range reconciliation against the RPC source (#511).
+  # ---------------------------------------------------------------------------
+  - name: trident.indexer.reconciliation
+    rules:
+      - alert: TridentIndexerReconciliationMismatch
+        expr: trident_indexer_reconcile_discrepant_ledgers > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: "Trident indexed counts disagree with the RPC source for {{ $value }} ledger(s)"
+          description: >
+            The reconciliation loop compared indexed event counts per ledger
+            against getEvents over a settled window and found disagreement.
+            The indexer logs name the exact ledger ranges with both counts.
+            This is the silent-under-indexing signal: the API may be
+            returning confident, incomplete answers for these ledgers.
+          runbook_url: "docs/runbooks/alerts.md#tridentindexerreconciliationmismatch"
+
+      - alert: TridentIndexerReconciliationFailing
+        expr: increase(trident_indexer_reconcile_pass_failures_total[30m]) > 2
+        for: 30m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: "Trident reconciliation passes are failing"
+          description: >
+            The reconciliation loop keeps aborting before producing a report
+            (RPC or database failures). While this fires, nothing is
+            verifying that indexed counts match the chain - treat the
+            mismatch alert's silence as unknown, not clean.
+          runbook_url: "docs/runbooks/alerts.md#tridentindexerreconciliationfailing"
+
+      - alert: TridentIndexerRetainedFloorLedgersSkipped
+        expr: increase(trident_indexer_retained_floor_ledgers_skipped_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: "Trident indexer permanently skipped {{ $value }} ledger(s) it could no longer retrieve from the RPC"
+          description: >
+            The indexer's cursor was outside the RPC's retention window and
+            was advanced to the oldest ledger the RPC still retains. Every
+            ledger between the old cursor and that floor is lost to live
+            polling - the indexer reports healthy (lag returns to 0) despite
+            the gap. The skipped range is enqueued as a backfill_jobs row;
+            run `crates/backfill --from-queue` to recover it before the
+            source RPC prunes further.
+          runbook_url: "docs/runbooks/alerts.md#tridentindexerretainedfloorledgersskipped"
+
   # ---------------------------------------------------------------------------
   # Stellar RPC health (#297).
   # ---------------------------------------------------------------------------
@@ -128,7 +282,7 @@ groups:
           (
             sum(rate(trident_indexer_rpc_errors_total[5m]))
             /
-            (sum(rate(trident_indexer_rpc_request_duration_seconds_count[5m])) + 0.0001)
+            (sum(rate(trident_indexer_rpc_call_duration_seconds_count[5m])) + 0.0001)
           ) > 0.05
         for: 10m
         labels:
@@ -147,7 +301,7 @@ groups:
           (
             sum(rate(trident_indexer_rpc_errors_total[5m]))
             /
-            (sum(rate(trident_indexer_rpc_request_duration_seconds_count[5m])) + 0.0001)
+            (sum(rate(trident_indexer_rpc_call_duration_seconds_count[5m])) + 0.0001)
           ) > 0.25
         for: 5m
         labels:
@@ -250,3 +404,296 @@ groups:
             out for 10 minutes. Requests will start queuing or timing out on
             acquire once it's fully saturated.
           runbook_url: "docs/runbooks/alerts.md#tridentapidbpoolsaturated"
+
+  # ---------------------------------------------------------------------------
+  # Disk capacity — soroban_events grows without bound (issue #432).
+  #
+  # Thresholds are derived from a measured growth rate rather than picked as
+  # round numbers: 890 bytes per event including indexes, measured over 500k
+  # synthetic rows on the full migration chain (see
+  # docs/performance.md#storage-capacity-and-disk-growth).
+  #
+  # The design goal is lead time, not detection. A disk alert that fires at 95%
+  # gives roughly a day of warning at the 10x rate, which is not enough to
+  # provision and migrate. These fire on projected exhaustion instead, so the
+  # page arrives while there is still time to act.
+  #
+  # Requires node_exporter (node_filesystem_*) on the database host. If your
+  # Postgres is managed and does not expose those series, substitute the
+  # provider's equivalent disk metric — the thresholds still apply.
+  # ---------------------------------------------------------------------------
+  - name: trident.storage.capacity
+    rules:
+      - alert: TridentDiskFillingWithin14Days
+        expr: >
+          predict_linear(
+            node_filesystem_avail_bytes{mountpoint="/var/lib/postgresql",fstype!~"tmpfs|overlay"}[6h],
+            14 * 24 * 3600
+          ) < 0
+        for: 1h
+        labels:
+          severity: warning
+          service: database
+        annotations:
+          summary: "Postgres volume projected to fill within 14 days"
+          description: >
+            Extrapolating the last 6 hours of growth, the Postgres data volume
+            on {{ $labels.instance }} runs out of space within 14 days. At the
+            measured 890 bytes/event this is the expected trajectory once
+            sustained event rates rise; it is a provisioning signal, not an
+            incident. Plan a volume resize or enable partition retention.
+          runbook_url: "docs/runbooks/alerts.md#tridentdiskfillingwithin14days"
+
+      - alert: TridentDiskFillingWithin48Hours
+        expr: >
+          predict_linear(
+            node_filesystem_avail_bytes{mountpoint="/var/lib/postgresql",fstype!~"tmpfs|overlay"}[6h],
+            48 * 3600
+          ) < 0
+        for: 30m
+        labels:
+          severity: critical
+          service: database
+        annotations:
+          summary: "Postgres volume projected to fill within 48 hours"
+          description: >
+            The Postgres data volume on {{ $labels.instance }} is projected to
+            be full within 48 hours. A full volume stops ingest and fails
+            writes across the API. Resize now, or drop the oldest
+            soroban_events partition if retention allows.
+          runbook_url: "docs/runbooks/alerts.md#tridentdiskfillingwithin48hours"
+
+      # Backstop for the case predict_linear cannot see: a step change in
+      # consumption (a large backfill, a WAL pileup) that outruns a 6h trend.
+      - alert: TridentDiskSpaceLow
+        expr: >
+          node_filesystem_avail_bytes{mountpoint="/var/lib/postgresql",fstype!~"tmpfs|overlay"}
+            / node_filesystem_size_bytes{mountpoint="/var/lib/postgresql",fstype!~"tmpfs|overlay"}
+            < 0.15
+        for: 15m
+        labels:
+          severity: warning
+          service: database
+        annotations:
+          summary: "Postgres volume below 15% free ({{ $value | humanizePercentage }})"
+          description: >
+            Less than 15% of the Postgres data volume remains on
+            {{ $labels.instance }}. Unlike the predictive alerts above this
+            fires regardless of trend, so it also catches a sudden step in
+            usage such as a backfill or a WAL pileup.
+          runbook_url: "docs/runbooks/alerts.md#tridentdiskspacelow"
+
+  # ---------------------------------------------------------------------------
+  # Container resource saturation & OOM killer (#444)
+  # ---------------------------------------------------------------------------
+  - name: trident.container.resources
+    rules:
+      - alert: TridentContainerOOMKilled
+        expr: increase(kube_pod_container_status_terminated_reason{reason="OOMKilled"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          service: infrastructure
+        annotations:
+          summary: "Container {{ $labels.container }} in pod {{ $labels.pod }} was OOM killed"
+          description: >
+            Container {{ $labels.container }} exceeded its memory limit and was terminated
+            by the kernel OOM killer. Check memory headroom and increase memory limits or tune GOMEMLIMIT.
+          runbook_url: "docs/runbooks/alerts.md#tridentcontaineroomkilled"
+
+      - alert: TridentContainerMemoryHigh
+        expr: >
+          container_memory_working_set_bytes{container=~"api|grpc-api|indexer"}
+            / container_spec_memory_limit_bytes{container=~"api|grpc-api|indexer"}
+            > 0.85
+        for: 5m
+        labels:
+          severity: warning
+          service: infrastructure
+        annotations:
+          summary: "Container {{ $labels.container }} memory usage > 85% of limit"
+          description: >
+            Container {{ $labels.container }} in pod {{ $labels.pod }} is at {{ $value | humanizePercentage }}
+            of its configured memory limit.
+          runbook_url: "docs/runbooks/alerts.md#tridentcontainermemoryhigh"
+
+      - alert: TridentContainerCPUThrottling
+        expr: >
+          increase(container_cpu_cfs_throttled_periods_total{container=~"api|grpc-api|indexer"}[5m])
+            / increase(container_cpu_cfs_periods_total{container=~"api|grpc-api|indexer"}[5m])
+            > 0.25
+        for: 10m
+        labels:
+          severity: warning
+          service: infrastructure
+        annotations:
+          summary: "Container {{ $labels.container }} CPU throttled > 25%"
+          description: >
+            Container {{ $labels.container }} in pod {{ $labels.pod }} is experiencing significant CPU throttling
+            under CFS quotas. Consider raising CPU limits or scaling out replicas.
+          runbook_url: "docs/runbooks/alerts.md#tridentcontainercputhrottling"
+
+  # ---------------------------------------------------------------------------
+  # Partition coverage — soroban_events named partitions (issue #525).
+  #
+  # soroban_events is RANGE-partitioned by ledger_sequence. Named partitions
+  # must be pre-created ahead of the ingest frontier; when they run out every
+  # new row silently falls into soroban_events_default (the catch-all DEFAULT
+  # partition), which has no indexes and no retention tooling.
+  #
+  # The indexer exposes trident_indexer_partition_lookahead_ledgers: the
+  # distance in ledgers between the current cursor and the upper bound of the
+  # last named partition. When it reaches 0 the indexer halts with a Fatal
+  # error rather than writing to DEFAULT (see assert_no_default_partition_overflow
+  # in crates/indexer/src/db/mod.rs). These two alert tiers give lead time to
+  # act before that halt:
+  #
+  #   Warning  < 5_000_000 ledgers (~289 days at 17,280 ledgers/day)
+  #   Critical <= 0 ledgers  (overflow is imminent or already happening)
+  #
+  # To add the next partition:
+  #   SELECT create_soroban_partition(<last_upper>, <last_upper + 2000000>);
+  # See docs/runbooks/alerts.md#tridentpartitionexhaustionwarning for the full
+  # procedure and docs/deployment.md#staging for the partition strategy.
+  # ---------------------------------------------------------------------------
+  - name: trident.indexer.partitions
+    rules:
+      - alert: TridentPartitionExhaustionWarning
+        expr: trident_indexer_partition_lookahead_ledgers < 5000000
+        for: 30m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: >-
+            soroban_events partition lookahead below 5M ledgers
+            ({{ $value | humanize }} remaining)
+          description: >
+            trident_indexer_partition_lookahead_ledgers has been below
+            5,000,000 for 30 minutes. At the current Stellar mainnet rate of
+            ~17,280 ledgers/day that is fewer than 289 days before the ingest
+            frontier reaches the last named partition boundary and the indexer
+            halts. Run `SELECT create_soroban_partition(<last_upper>,
+            <last_upper + 2000000>);` to extend the partition table before
+            that deadline.
+          runbook_url: "docs/runbooks/alerts.md#tridentpartitionexhaustionwarning"
+
+      - alert: TridentPartitionExhausted
+        expr: trident_indexer_partition_lookahead_ledgers <= 0
+        for: 5m
+        labels:
+          severity: critical
+          service: indexer
+        annotations:
+          summary: "soroban_events partition lookahead exhausted — indexer will halt"
+          description: >
+            trident_indexer_partition_lookahead_ledgers is at or below 0: the
+            ingest cursor has reached or passed the upper bound of the last
+            named soroban_events partition. The indexer will refuse to commit
+            any further pages and will halt with a Fatal error to prevent
+            silent writes to soroban_events_default. Add the next partition
+            immediately: `SELECT create_soroban_partition(<last_upper>,
+            <last_upper + 2000000>);` — see the runbook for the exact values.
+          runbook_url: "docs/runbooks/alerts.md#tridentpartitionexhausted"
+
+  # ---------------------------------------------------------------------------
+  # Outbox delivery guarantee (issue #617). The outbox is the sole delivery
+  # guarantee for live subscribers (crates/indexer/src/db/outbox.rs) — before
+  # this group, its backlog threshold existed only as a tracing::warn! log
+  # line inside the relay, not an alert. A stuck relay with Redis down
+  # produces a climbing gauge and a growing table that nothing paged on; the
+  # first signal was a customer report.
+  # ---------------------------------------------------------------------------
+  - name: trident.indexer.outbox
+    rules:
+      - alert: TridentOutboxBacklogWarning
+        expr: trident_indexer_outbox_backlog >= 10000
+        for: 10m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: "Trident indexer outbox backlog is {{ $value | humanize }} rows"
+          description: >
+            trident_indexer_outbox_backlog has been at or above 10,000 (the
+            relay's own backlog_alert_threshold default, OUTBOX_BACKLOG_ALERT_THRESHOLD)
+            for 10 minutes. The relay is falling behind publishing to Redis;
+            live subscribers are seeing growing delivery lag.
+          runbook_url: "docs/runbooks/alerts.md#tridentoutboxbacklogwarning"
+
+      - alert: TridentOutboxBacklogCritical
+        expr: trident_indexer_outbox_backlog >= 50000
+        for: 5m
+        labels:
+          severity: critical
+          service: indexer
+        annotations:
+          summary: "Trident indexer outbox backlog is critically high ({{ $value | humanize }} rows)"
+          description: >
+            trident_indexer_outbox_backlog has been at or above 50,000 for 5
+            minutes — five times the relay's own warning threshold. Redis is
+            very likely down or the relay loop has stopped entirely; live
+            subscribers have stopped receiving events. Check
+            trident_indexer_outbox_published_total for whether the counter
+            is still advancing at all.
+          runbook_url: "docs/runbooks/alerts.md#tridentoutboxbacklogcritical"
+
+      - alert: TridentOutboxPublishFailuresHigh
+        expr: |
+          rate(trident_indexer_outbox_publish_failures_total[10m]) > 0
+        for: 10m
+        labels:
+          severity: critical
+          service: indexer
+        annotations:
+          summary: "Trident indexer outbox publishes are failing"
+          description: >
+            trident_indexer_outbox_publish_failures_total has been
+            increasing for 10 minutes. Every failed publish leaves its row
+            in the outbox for the next attempt, directly feeding
+            trident_indexer_outbox_backlog — this alert is the earliest
+            signal, firing before the backlog itself crosses a threshold.
+          runbook_url: "docs/runbooks/alerts.md#tridentoutboxpublishfailureshigh"
+
+      - alert: TridentDeadLetteredEventsHigh
+        expr: |
+          increase(trident_indexer_dead_lettered_total[1h]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: "Trident indexer has dead-lettered {{ $value | humanize }} event(s) in the last hour"
+          description: >
+            trident_indexer_dead_lettered_total increased in the last hour.
+            This event was undecodable (a poison message where retry never
+            helps, distinct from PERSIST_DEAD_LETTERED_TOTAL's well-formed-
+            but-uncommittable events) and was written to parse_errors so the
+            poll could advance past it. Complements
+            TridentIndexerParseErrorRateHigh, which alerts on the *rate* of
+            all parse failures including ones that later succeed on retry;
+            this counter only moves when an event is actually abandoned,
+            which is what an alert should fire on regardless of the overall
+            error rate.
+          runbook_url: "docs/runbooks/alerts.md#tridentdeadletteredeventshigh"
+
+      - alert: TridentIndexerDBPoolSaturated
+        expr: |
+          ((trident_indexer_db_pool_size - trident_indexer_db_pool_idle_connections) / trident_indexer_db_pool_size) > 0.9
+        for: 10m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: >-
+            Trident indexer Postgres pool is close to exhausted
+            ({{ $value | humanizePercentage }} in use)
+          description: >
+            Over 90% of the indexer's Postgres connection pool has been
+            checked out for 10 minutes. Only the API's pool
+            (TridentAPIDBPoolSaturated, above) was alerted before this —
+            the indexer's own pool had trident_indexer_db_pool_size and
+            trident_indexer_db_pool_idle_connections emitted but nothing
+            watching them.
+          runbook_url: "docs/runbooks/alerts.md#tridentindexerdbpoolsaturated"
+

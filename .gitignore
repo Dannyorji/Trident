@@ -35,3 +35,18 @@ __pycache__/
 
 # soroban-sdk test debug snapshots (contracts/)
 test_snapshots/
+
+# Coverage reports (issue #325). The `coverage` make targets and the CI job
+# write these; they are uploaded as CI artifacts, never committed.
+lcov.info
+coverage.xml
+.coverage
+coverage.html
+services/api/coverage.html
+sdk/typescript/coverage/
+htmlcov/
+
+# Local output from the launch verification harnesses (load-tests/*.sh)
+load-tests/launch-soak-results/
+load-tests/chaos-results/
+load-tests/shutdown-results/

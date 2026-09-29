@@ -9,10 +9,13 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/Depo-dev/trident/services/api/cursor"
 	apigrpc "github.com/Depo-dev/trident/services/api/grpc"
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
 	"github.com/Depo-dev/trident/services/api/middleware"
@@ -57,6 +60,15 @@ var (
 	// write deadline in Stream() failing, which always means "disconnect",
 	// so there is no separate drop counter to pair this with.
 	metricSSESlowConsumerDisconnects atomic.Int64
+
+	// Contract-stats rollup fallback (#654): incremented every time
+	// GET /v1/stats/contracts serves the default "all time" query from the
+	// live aggregation path instead of contract_stats_rollup, either because
+	// the rollup query itself failed or because it has never been populated
+	// for the network. A default-range request always prefers the rollup, so
+	// any sustained rate here means the rollup is broken and every request is
+	// silently re-scanning the full event history — alert on it.
+	metricContractStatsRollupFallback atomic.Int64
 )
 
 // RecordWebhookDelivery records the outcome and round-trip latency of a single
@@ -179,6 +191,10 @@ func MetricsHandler(pool *pgxpool.Pool, rdb *redis.Client) http.HandlerFunc {
 		_, _ = fmt.Fprintf(w, "# HELP trident_concurrency_in_flight Requests currently in flight.\n")
 		_, _ = fmt.Fprintf(w, "# TYPE trident_concurrency_in_flight gauge\n")
 		_, _ = fmt.Fprintf(w, "trident_concurrency_in_flight %d\n", middleware.InFlightRequests())
+
+		_, _ = fmt.Fprintf(w, "# HELP trident_contract_stats_rollup_fallback_total Times GET /v1/stats/contracts served the default-range query via live aggregation instead of the maintained rollup.\n")
+		_, _ = fmt.Fprintf(w, "# TYPE trident_contract_stats_rollup_fallback_total counter\n")
+		_, _ = fmt.Fprintf(w, "trident_contract_stats_rollup_fallback_total %d\n", metricContractStatsRollupFallback.Load())
 	}
 }
 
@@ -434,6 +450,35 @@ type ContractStats struct {
 	AvgWriteBytes      *float64 `json:"avg_write_bytes"`
 }
 
+// statsKeyset is the decoded pagination position for GET /v1/stats/contracts.
+// Contracts are ordered by (event_count DESC, contract_id DESC); both parts are
+// required because event_count alone is not unique and a tie would otherwise
+// skip or repeat rows across pages.
+type statsKeyset struct {
+	EventCount int64
+	ContractID string
+}
+
+// encodeStatsCursor renders a keyset position as an opaque cursor token.
+func encodeStatsCursor(k statsKeyset) string {
+	return cursor.Encode(fmt.Sprintf("%d:%s", k.EventCount, k.ContractID))
+}
+
+// decodeStatsKeyset parses a pagingToken previously produced by
+// encodeStatsCursor. A malformed token is an error, not a silent reset to
+// page one.
+func decodeStatsKeyset(pagingToken string) (*statsKeyset, error) {
+	idx := strings.IndexByte(pagingToken, ':')
+	if idx <= 0 || idx == len(pagingToken)-1 {
+		return nil, fmt.Errorf("malformed stats cursor")
+	}
+	count, err := strconv.ParseInt(pagingToken[:idx], 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("malformed stats cursor: %w", err)
+	}
+	return &statsKeyset{EventCount: count, ContractID: pagingToken[idx+1:]}, nil
+}
+
 // ContractsStatsResponse is the JSON response for GET /v1/stats/contracts
 type ContractsStatsResponse struct {
 	Contracts   []*ContractStats `json:"contracts"`
@@ -441,6 +486,8 @@ type ContractsStatsResponse struct {
 	ToLedger    int64            `json:"to_ledger"`
 	Network     string           `json:"network"`
 	GeneratedAt string           `json:"generated_at"`
+	HasMore     bool             `json:"has_more"`
+	NextCursor  *string          `json:"next_cursor"`
 }
 
 // ContractsStats handles GET /v1/stats/contracts (analytics endpoint).
@@ -450,9 +497,10 @@ type ContractsStatsResponse struct {
 //   - to_ledger (optional): upper bound, inclusive. Default: latest indexed ledger
 //   - network (optional): "testnet" or "mainnet". Default: "testnet"
 //   - limit (optional): 1-100, number of contracts to return. Default: 50
+//   - cursor (optional): opaque pagination cursor from previous response's next_cursor
 //
 // Response is cached in Redis for 60 seconds using key:
-// stats:contracts:{network}:{from}:{to}:{limit}
+// stats:contracts:{network}:{from}:{to}:{limit}:{cursor}
 //
 // Returns results ordered by event_count DESC (highest volume first).
 func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
@@ -463,8 +511,16 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 		}
 
 		q := r.URL.Query()
+		// network is intentionally excluded from the allowed set: it is
+		// derived from the authenticated key's context below, exactly as
+		// every other data endpoint (ListEvents, ContractStorageLatest,
+		// etc.) enforces it. A client-supplied ?network is rejected outright
+		// rather than silently ignored, consistent with RejectUnknownParams'
+		// existing "unrecognised param is a client bug" convention (issue
+		// #612) — otherwise a testnet-scoped key could read mainnet
+		// aggregates by passing ?network=mainnet.
 		if verr := validation.RejectUnknownParams(
-			q, "from_ledger", "to_ledger", "network", "limit",
+			q, "from_ledger", "to_ledger", "limit", "cursor",
 		); verr != nil {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 			return
@@ -474,16 +530,36 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 		params, verr := validation.ValidateQueryStats(
 			q.Get("from_ledger"),
 			q.Get("to_ledger"),
-			q.Get("network"),
 			q.Get("limit"),
 		)
 		if verr != nil {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
 			return
 		}
+		params.Network = middleware.NetworkFromContext(r.Context())
+
+		pagingToken, verr := validation.ValidateCursor("cursor", q.Get("cursor"))
+		if verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
+			return
+		}
+
+		var afterKey *statsKeyset
+		if pagingToken != "" {
+			decoded, decErr := decodeStatsKeyset(pagingToken)
+			if decErr != nil {
+				httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "cursor is not a valid pagination cursor")
+				return
+			}
+			afterKey = decoded
+		}
 
 		// Build cache key
-		cacheKey := fmt.Sprintf("stats:contracts:%s:%d:%d:%d", params.Network, params.FromLedger, params.ToLedger, params.Limit)
+		cursorKey := ""
+		if pagingToken != "" {
+			cursorKey = pagingToken
+		}
+		cacheKey := fmt.Sprintf("stats:contracts:%s:%d:%d:%d:%s", params.Network, params.FromLedger, params.ToLedger, params.Limit, cursorKey)
 
 		// Try Redis cache first
 		if cached, err := rdb.Get(r.Context(), cacheKey).Result(); err == nil {
@@ -505,7 +581,7 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 		// unfiltered event history per contract, so it can only answer the
 		// default "all time" query. Any explicit ledger-range filter falls
 		// back to the live aggregate below, which the rollup cannot cover.
-		isDefaultRange := q.Get("from_ledger") == "" && q.Get("to_ledger") == ""
+		isDefaultRange := q.Get("from_ledger") == "" && q.Get("to_ledger") == "" && pagingToken == ""
 
 		var stats []*ContractStats
 		var err error
@@ -516,9 +592,12 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 				slog.ErrorContext(r.Context(), "rollup query failed; falling back to live aggregation", "err", err)
 				usedRollup = false
 			}
+			if !usedRollup {
+				metricContractStatsRollupFallback.Add(1)
+			}
 		}
 		if !usedRollup {
-			stats, err = queryContractStats(ctx, db, params)
+			stats, err = queryContractStats(ctx, db, params, afterKey)
 			if err != nil {
 				slog.ErrorContext(r.Context(), "database query failed", "err", err)
 				httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to fetch statistics")
@@ -529,7 +608,7 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 		// Get the latest ledger for the response metadata if to_ledger was not explicitly set
 		toLedger := params.ToLedger
 		if q.Get("to_ledger") == "" {
-			latestLedger, err := getLatestIndexedLedger(ctx, db)
+			latestLedger, err := getLatestIndexedLedger(ctx, db, params.Network)
 			if err != nil {
 				slog.ErrorContext(r.Context(), "failed to get latest ledger", "err", err)
 				// Continue anyway; use 0 as fallback
@@ -538,12 +617,26 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 			toLedger = latestLedger
 		}
 
+		hasMore := len(stats) > int(params.Limit)
+		if hasMore {
+			stats = stats[:params.Limit]
+		}
+
+		var nextCursor *string
+		if hasMore && len(stats) > 0 {
+			last := stats[len(stats)-1]
+			encoded := encodeStatsCursor(statsKeyset{EventCount: last.EventCount, ContractID: last.ContractID})
+			nextCursor = &encoded
+		}
+
 		response := &ContractsStatsResponse{
 			Contracts:   stats,
 			FromLedger:  params.FromLedger,
 			ToLedger:    toLedger,
 			Network:     params.Network,
 			GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+			HasMore:     hasMore,
+			NextCursor:  nextCursor,
 		}
 
 		// Marshal to JSON for caching and response
@@ -578,11 +671,25 @@ func ContractsStats(db DBPool, rdb *redis.Client) http.HandlerFunc {
 // when a ledger range is supplied; the GROUP BY + ORDER BY event_count DESC is
 // a computed aggregate and is not index-backed — this is expected for an
 // aggregation query. The LIMIT cap prevents runaway result sets (#255).
-func queryContractStats(ctx context.Context, db DBPool, params *validation.QueryStatsParams) ([]*ContractStats, error) {
+func queryContractStats(ctx context.Context, db DBPool, params *validation.QueryStatsParams, after *statsKeyset) ([]*ContractStats, error) {
 	// Belt-and-suspenders: clamp limit even if the caller skips ValidateQueryStats.
 	limit := params.Limit
 	if limit <= 0 || limit > validation.StatsLimitMax {
 		limit = validation.StatsLimitDefault
+	}
+
+	// Fetch one extra row so the caller can detect whether another page exists.
+	fetch := limit + 1
+
+	// Keyset predicate applied to the aggregate via HAVING, since event_count
+	// is a computed column and cannot be referenced in WHERE.
+	having := ""
+	var afterCount int64
+	var afterContract string
+	if after != nil {
+		having = "HAVING (COUNT(*), e.contract_id) < ($5::BIGINT, $6::TEXT)"
+		afterCount = after.EventCount
+		afterContract = after.ContractID
 	}
 
 	query := `
@@ -621,11 +728,17 @@ func queryContractStats(ctx context.Context, db DBPool, params *validation.Query
 	GROUP BY
 		e.contract_id, m.invocation_count, m.total_fee_charged,
 		m.avg_fee_charged, m.avg_cpu_instructions, m.avg_read_bytes, m.avg_write_bytes
-	ORDER BY event_count DESC
+	` + having + `
+	ORDER BY event_count DESC, e.contract_id DESC
 	LIMIT $4
 	`
 
-	rows, err := db.Query(ctx, query, params.Network, params.FromLedgerPtr, params.ToLedgerPtr, limit)
+	args := []any{params.Network, params.FromLedgerPtr, params.ToLedgerPtr, fetch}
+	if after != nil {
+		args = append(args, afterCount, afterContract)
+	}
+
+	rows, err := db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -704,11 +817,11 @@ func queryContractStatsFromRollup(ctx context.Context, db DBPool, params *valida
 		GROUP BY contract_id
 	) m ON m.contract_id = r.contract_id
 	WHERE r.network = $1
-	ORDER BY r.event_count DESC
+	ORDER BY r.event_count DESC, r.contract_id DESC
 	LIMIT $2
 	`
 
-	rows, err := db.Query(ctx, query, params.Network, params.Limit)
+	rows, err := db.Query(ctx, query, params.Network, params.Limit+1)
 	if err != nil {
 		return nil, false, err
 	}
@@ -807,9 +920,13 @@ func RefreshContractStatsRollup(ctx context.Context, db SchemaRegistryDB) error 
 	return err
 }
 
-// getLatestIndexedLedger queries the database for the highest indexed ledger sequence.
-func getLatestIndexedLedger(ctx context.Context, db DBPool) (int64, error) {
+// getLatestIndexedLedger queries the database for the highest indexed ledger
+// sequence for the given network. Ledger sequences are not comparable across
+// networks, so this must scope by network like every other query in this
+// file — an unscoped MAX() would silently mix testnet and mainnet heights
+// once both are indexed in the same database (issue #653).
+func getLatestIndexedLedger(ctx context.Context, db DBPool, network string) (int64, error) {
 	var latest int64
-	err := db.QueryRow(ctx, "SELECT COALESCE(MAX(ledger_sequence), 0) FROM soroban_events").Scan(&latest)
+	err := db.QueryRow(ctx, "SELECT COALESCE(MAX(ledger_sequence), 0) FROM soroban_events WHERE network = $1", network).Scan(&latest)
 	return latest, err
 }

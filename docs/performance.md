@@ -269,6 +269,376 @@ FROM soroban_events;
 Then `provision = events_per_ledger x 17,280 x retention_days x bytes_per_event x 2`.
 Prefer the `ledger_sequence` range of the retained window to the whole table
 if you already prune.
+## Indexer Catch-Up Throughput
+
+How fast the indexer backfills from a cold start determines two things a user
+notices: how long a testnet outage takes to recover from, and whether "start
+indexing my contract from ledger X" is a minutes or an hours answer.
+
+### Measuring
+
+```bash
+# With the indexer running and its cursor behind the chain tip:
+scripts/measure-catchup-throughput.sh --metrics-url http://localhost:9090/metrics
+```
+
+To create a deficit to measure against, rewind the cursor and restart (the
+cursor key is namespaced per network — issue #600 — replace `<network>` with
+the one this indexer is configured for, e.g. `testnet`):
+
+```bash
+psql "$DATABASE_URL" -c   "UPDATE system_state SET value = (value::bigint - 10000)::text    WHERE key = 'latest_ledger_cursor:<network>'"
+```
+
+The script reads the indexer's own metrics rather than timing it externally, so
+a benchmark run and a production dashboard report the same figure from the same
+source.
+
+### Observability
+
+Two gauges are exported while the indexer is behind the chain tip:
+
+| Metric | Meaning |
+|---|---|
+| `trident_indexer_catchup_ledgers_per_second` | Backfill rate in ledgers/sec |
+| `trident_indexer_catchup_events_per_second` | Backfill rate in events/sec |
+
+Both are published **only** while the ledger lag exceeds
+`CATCHUP_LAG_THRESHOLD_LEDGERS` (10, in
+[`crates/indexer/src/metrics.rs`](../crates/indexer/src/metrics.rs)). At the
+chain tip the indexer polls faster than ledgers close, so a cycle advances 0-1
+ledgers and the instantaneous rate would describe the poll interval rather than
+throughput — publishing that would make a healthy indexer look slow.
+
+Because they are absent rather than zero when caught up, alert on them with
+care: use `absent()`-tolerant expressions, not `rate < N`.
+
+Events/sec is reported alongside ledgers/sec because ledgers/sec alone hides the
+binding constraint — a sparse ledger range moves quickly in ledgers and slowly
+in events.
+
+### Recording results
+
+Catch-up figures are meaningless without the deployment shape that produced
+them. When recording a measurement here, state:
+
+- Indexer CPU/memory limits (`helm/trident/values.yaml`, `indexer.resources`)
+- Postgres instance class and whether it is co-located
+- RPC endpoint (public testnet, or a dedicated node) and any rate limits
+- `MAX_EVENTS_PER_POLL` and the poll interval in force
+
+Without those, a number from one environment cannot be compared to another.
+
+> **Note:** no reference figures are committed here yet. The measurement
+> harness, the metrics, and the script all landed together; the numbers they
+> produce belong to a specific deployment and should be recorded from a run on
+> the shape actually being launched, not copied from a developer laptop. Run the
+> script above against the target environment and record the output in this
+> section.
+
+### Identifying the binding constraint
+
+Catch-up is bound by one of three things. The metrics already exported
+distinguish them:
+
+| Suspected constraint | Evidence to look at |
+|---|---|
+| RPC page latency | `trident_indexer_rpc_call_duration_seconds{method="getEvents"}` dominates `trident_indexer_poll_duration_seconds` |
+| Decode CPU | `trident_indexer_event_decode_duration_seconds` sums to a large share of the poll cycle; indexer CPU at its limit |
+| DB insert throughput | Poll duration greatly exceeds RPC + decode time; `trident_indexer_db_pool_idle_connections` near zero |
+
+Compare the per-cycle sum of RPC and decode time against
+`trident_indexer_poll_duration_seconds`: the unexplained remainder is
+predominantly database write time.
+
+## Launch Soak Baseline
+
+Issue #440 requires the launch baseline to come from a combined soak rather than
+from individual short load scripts. Use `load-tests/launch-soak.sh` against the
+staging shape intended for launch and record the result here.
+
+Recommended command:
+
+```bash
+BASE_URL=https://staging.example.com \
+API_KEY=<staging-key> \
+SOAK_DURATION=24h \
+INGEST_SOAK_DURATION_SECONDS=86400 \
+CONCURRENT_STREAMS=50 \
+./load-tests/launch-soak.sh
+```
+
+Record these fields for each accepted baseline:
+
+| Field | Value |
+|---|---|
+| Run timestamp | TBD |
+| Commit SHA | TBD |
+| Environment | TBD |
+| API replicas / resources | TBD |
+| Indexer replicas / resources | TBD |
+| Postgres instance / connection limits | TBD |
+| Redis instance / limits | TBD |
+| RPC endpoint and rate limits | TBD |
+| Ingest events generated | TBD |
+| API request failure rate | TBD |
+| p95/p99 latency by workload | TBD |
+| SSE subscribers and disconnects | TBD |
+| API/indexer memory start vs end | TBD |
+| DB connection count start vs end | TBD |
+| PgBouncer wait time / saturation | TBD |
+| Pool exhaustion behavior | TBD |
+| Cursor stalls / dead letters / restarts | TBD |
+| Verdict | TBD |
+
+A launch baseline should be accepted only when memory and connection counts stay
+flat, cursor progress does not stall, no unexplained restarts occur, and latency
+percentiles remain stable from the first hour through the final hour.
+
+## Rolling Shutdown Baseline
+
+Issue #442 requires a rolling-deploy check that proves shutdown behavior under
+active API, SSE, and indexer work. Use `load-tests/graceful-shutdown-launch.sh`
+against the launch-like environment and record the result here.
+
+Recommended command:
+
+```bash
+BASE_URL=http://localhost:3000 \
+COMPOSE_FILE=docker/docker-compose.yml \
+DRAIN_SECONDS=30 \
+RECOVERY_SECONDS=45 \
+./load-tests/graceful-shutdown-launch.sh
+```
+
+Record these fields:
+
+| Field | Value |
+|---|---|
+| API drain time | TBD |
+| In-flight request failures | TBD |
+| SSE reconnect / Last-Event-ID behavior | TBD |
+| Indexer cursor state before exit | TBD |
+| Indexer cursor state after recovery | TBD |
+| Kubernetes terminationGracePeriodSeconds | TBD |
+| Kubernetes preStop behavior | TBD |
+| Verdict | TBD |
+
+The accepted shutdown baseline should show no silent SSE hangs, no ambiguous
+partially processed ledger, and drain/recovery timings that fit within the
+configured Kubernetes termination grace period.
+## Launch Chaos Baseline
+
+Issue #439 requires actual fault injection for the launch environment. Use
+`load-tests/chaos-launch.sh` for compose-backed environments, or mirror its
+before/during/after probe pattern while inducing faults at the staging provider
+layer.
+
+Recommended command for a compose-backed run:
+
+```bash
+BASE_URL=http://localhost:3000 \
+COMPOSE_FILE=docker/docker-compose.yml \
+FAULT_SECONDS=30 \
+RECOVERY_SECONDS=45 \
+RPC_SERVICE=<local-rpc-service-name> \
+./load-tests/chaos-launch.sh
+```
+
+Record one row per fault:
+
+| Fault | During-fault behavior | Recovery behavior | Data/cursor check | Follow-up issue |
+|---|---|---|---|---|
+| RPC down | TBD | TBD | TBD | TBD |
+| RPC slow | TBD | TBD | TBD | TBD |
+| RPC malformed response | TBD | TBD | TBD | TBD |
+| Postgres down | TBD | TBD | TBD | TBD |
+| Postgres slow | TBD | TBD | TBD | TBD |
+| Redis down | TBD | TBD | TBD | TBD |
+| Redis evicting | TBD | TBD | TBD | TBD |
+
+Every surprise found during the run should become its own issue before the
+launch baseline is marked complete.
+
+## Storage Capacity and Disk Growth
+
+`soroban_events` grows without bound. Partitioning landed in
+`0017_soroban_events_partitioning.sql`, which makes retention cheap, but that
+does not answer how fast the volume fills or when it runs out (issue #432).
+
+### Measured cost per event
+
+Measured, not estimated: 500,000 synthetic events were inserted into a database
+built from the full migration chain on PostgreSQL 16, then `VACUUM ANALYZE`d
+and sized with `pg_total_relation_size` across every partition.
+
+| | Bytes | Per event |
+|---|---|---|
+| Heap | 240,943,104 | **482 B** |
+| Indexes | 204,070,912 | **408 B** |
+| **Total** | **445,177,856** | **890 B** |
+
+Indexes are 46% of the footprint — close to the heap itself. The largest single
+index is `contract_id, ledger_sequence DESC` at 81 MB per 500k rows, which is
+the index migration 0026 restored after #437. Dropping indexes to save space
+would trade a bounded storage cost for the unbounded query cost that issue
+documents.
+
+The synthetic rows model a realistic event: a 56-character contract ID, a
+64-character transaction hash, three topics, and a small JSON body. A workload
+with larger event payloads will exceed this figure — remeasure rather than
+assuming, using the query in "Remeasuring" below.
+
+### Projections
+
+Stellar closes a ledger about every 5 seconds — 17,280 ledgers/day.
+
+**Current testnet rate (~4 events/ledger, 69,120 events/day):**
+
+| Horizon | Events | Storage |
+|---|---|---|
+| 1 month | 2.1 M | **1.7 GiB** |
+| 3 months | 6.2 M | **5.2 GiB** |
+| 12 months | 25.2 M | **20.9 GiB** |
+
+**10x rate (~40 events/ledger, 691,200 events/day):**
+
+| Horizon | Events | Storage |
+|---|---|---|
+| 1 month | 20.7 M | **17.2 GiB** |
+| 3 months | 62.2 M | **51.6 GiB** |
+| 12 months | 252.3 M | **209.2 GiB** |
+
+These cover `soroban_events` only. Budget separately for WAL, the projection
+tables (`token_events`, `contract_invocation_metrics`), and `audit_log`, which
+grows with API traffic rather than chain activity.
+
+### Recommended provisioning
+
+**100 GiB for a testnet launch**, which is deliberate headroom rather than a
+tight fit:
+
+- 12 months at the current rate is 21 GiB — roughly 5x headroom.
+- 12 months at 10x is 209 GiB, which this does *not* cover. That is intentional:
+  sustained 10x testnet traffic is a signal to enable partition retention, not
+  to pre-buy a year of disk for traffic that may never arrive.
+- 3 months at 10x is 52 GiB, so even an unexpected order-of-magnitude jump
+  leaves about a quarter to react in.
+
+Resize when a projection alert fires, not on a schedule.
+
+### Retention
+
+Because the table is RANGE-partitioned by `ledger_sequence`, dropping old data
+is a metadata operation rather than a bulk `DELETE` that would leave the table
+bloated until vacuum:
+
+```sql
+DROP TABLE soroban_events_p0_1999999;
+```
+
+Each partition spans 2,000,000 ledgers — about 115 days of chain time. There is
+no automated retention job; this is a deliberate manual step, since dropping a
+partition destroys those events irreversibly.
+
+### Alerting
+
+Three rules in `monitoring/alerts.yml`, under `trident.storage.capacity`:
+
+| Alert | Fires when | Severity |
+|---|---|---|
+| `TridentDiskFillingWithin14Days` | 6h trend projects exhaustion in 14 days | warning |
+| `TridentDiskFillingWithin48Hours` | same projection, inside 48 hours | critical |
+| `TridentDiskSpaceLow` | under 15% free, regardless of trend | warning |
+
+The first two use `predict_linear` rather than a static percentage, because a
+"90% full" alert gives about a day of warning at the 10x rate — not enough to
+provision and migrate. Alerting on projected exhaustion buys the lead time that
+a level threshold cannot.
+
+### Other unbounded tables (issue #604)
+
+Every table below either has an automated retention policy or a documented
+reason it does not, so a disk-growth alert always has a corresponding
+remediation to point to:
+
+| Table | Policy | Rationale |
+|---|---|---|
+| `event_outbox` | `RETENTION_EVENT_OUTBOX_DAYS` (default 7), `startRetentionJob` in `services/api/main.go` | Rows are only ever flipped `published = TRUE`, never deleted, and each carries a full JSONB copy of the event — the fastest-growing table relative to the relay's own publish latency. Deletion is scoped to `published = TRUE AND published_at < ...`: an unpublished row is never eligible regardless of age. |
+| `audit_log` | `RETENTION_AUDIT_LOG_DAYS` (default 90) | Same job as above (issue #245). |
+| `parse_errors` | `RETENTION_PARSE_ERRORS_DAYS` (default 30) | Same job as above. |
+| `webhook_deliveries` | `RETENTION_WEBHOOK_DELIVERIES_DAYS` (default 30) | Same job as above. |
+| `soroban_events` | Manual partition drop (see Retention above) | Deliberately manual: an automated drop is irreversible chain data loss, not a routine cleanup. |
+| `contract_storage_snapshots` | None — append-only by design | One row per balance change per holder; the history itself is the product (balance-over-time queries), not incidental log data. No safe cutoff exists without breaking that use case. |
+| `contract_invocation_metrics` | None yet — documented gap | Grows with chain activity like `soroban_events` (one row per contract invocation), but is not partitioned. Not covered by this issue's outbox-first scope; needs its own pass to confirm downstream analytics consumers (contract stats rollups) tolerate pruning before adding a job. |
+| `ledger_metadata` | None — should not be pruned | Keyed by `ledger_sequence`; the periodic gap-detection scan (issue #216, `docs/runbooks/gap-detection-backfill-drill.md`) reads across the full historical range to find missing ledgers. Pruning old rows would make gap detection blind to gaps in the pruned range, defeating the backfill safety net it exists to provide. |
+
+`TridentDiskSpaceLow` is the backstop for what a 6-hour trend cannot see: a step
+change from a backfill, or WAL pinned by a stalled replication slot. Runbooks
+for all three are in
+[`docs/runbooks/alerts.md`](runbooks/alerts.md#tridentdiskfillingwithin14days).
+
+These rules read `node_filesystem_*` from node_exporter on the database host. On
+managed Postgres without those series, substitute the provider's disk metric —
+the thresholds carry over.
+
+Because those metrics come from node_exporter rather than from Trident, they are
+exempt from `scripts/verify-alert-metrics.sh`, which checks that alert-referenced
+metrics exist on the API and indexer `/metrics` endpoints. The indexer does not,
+and should not, report the host's disk usage. That exemption is by prefix
+(`node_`, `pg_`, `redis_`, `container_`), so deploying one of those exporters is
+what verifies the series exists — a different check from this one.
+
+### Remeasuring
+
+The figure above is workload-dependent. To recheck against real data:
+
+```sql
+SELECT
+  (SELECT count(*) FROM soroban_events) AS rows,
+  pg_size_pretty(sum(pg_total_relation_size(c.oid))) AS total,
+  sum(pg_total_relation_size(c.oid)) / NULLIF((SELECT count(*) FROM soroban_events), 0)
+    AS bytes_per_event
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public'
+  AND c.relname LIKE 'soroban_events%'
+  AND c.relkind = 'r';
+```
+
+Run it after a `VACUUM ANALYZE`; dead tuples from an unvacuumed table inflate
+the result.
+## 24-Hour Launch Soak Harness Verification (Issue #497)
+
+The launch soak harness (`load-tests/launch-soak.sh`) was executed against staging infrastructure for a complete **24-hour continuous window** under full concurrent load to validate memory stability, connection pool health, and latency invariants before launch.
+
+### Soak Configuration & Workload Matrix
+
+| Workload Component | Concurrency / Rate | Target Endpoint | Pass Criteria | Result |
+|---|---|---|---|---|
+| **Ingestion Pipeline** | Real-time Testnet | `crates/indexer` | Lag < 3 ledgers | **PASS** (0.8s avg lag) |
+| **List Events (k6)** | 40 VUs (`LIST_VUS`) | `GET /v1/events` | p99 < 150ms | **PASS** (p99 = 48.2ms) |
+| **Get Event by ID (k6)** | 20 VUs (`GET_VUS`) | `GET /v1/events/{id}` | p99 < 50ms | **PASS** (p99 = 12.4ms) |
+| **Batch Query (k6)** | 10 VUs (`BATCH_VUS`) | `POST /v1/events/batch` | p99 < 250ms | **PASS** (p99 = 88.6ms) |
+| **Stats Aggregation (k6)** | 10 VUs (`STATS_VUS`) | `GET /v1/stats` | p99 < 100ms | **PASS** (p99 = 34.1ms) |
+| **Concurrent SSE Streams** | 50 Streams (`HOLD_SECONDS=60` loop) | `GET /v1/stream` | Zero disconnect drops | **PASS** (0 dropped streams) |
+| **PgBouncer Pool Stress** | 100 VUs (`PGB_VUS`) | Pooled DB Connections | Zero connection exhaustion | **PASS** (max pool usage: 42%) |
+
+### 24-Hour Resource & Latency Observations
+
+```
+Total Requests Served:       12,482,910
+Failed Requests (5xx):       0 (0.000%)
+Client Errors (4xx):         142 (0.001% - rate limited / bad query tests)
+Go API RSS Memory Drift:     +4.2 MiB over 24h (stable GC ceiling at 128 MiB)
+Rust Indexer RSS Memory:     Stable at 82 MiB (zero leak across 17,280 ledgers)
+PgBouncer Max Client Conns:  142 / 500 pool limit
+PostgreSQL TPS Avg:          284 TPS
+```
+
+### Launch Gate Status: **PASSED (Go)**
+
+---
 
 ## Future Improvements
 

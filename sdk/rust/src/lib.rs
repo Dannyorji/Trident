@@ -45,6 +45,7 @@ pub mod openapi_models_gen;
 mod retry;
 mod subscription;
 mod types;
+pub mod webhook;
 
 pub use client::TridentClient;
 pub use errors::TridentError;
@@ -55,4 +56,7 @@ pub use types::{
     ContractStats, ContractStatsQuery, ContractStatsResponse, EventType, HealthChecks,
     HealthResponse, IndexerStatsResponse, Network, PaginatedEvents, QueryParams, SorobanEvent,
     TridentConfig,
+};
+pub use webhook::{
+    compute_signature, verify_signature, WebhookVerificationError, DEFAULT_TOLERANCE_SECONDS,
 };

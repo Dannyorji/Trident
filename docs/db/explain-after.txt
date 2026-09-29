@@ -1,0 +1,49 @@
+                                                                                                                   QUERY PLAN                                                                                                                    
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=4.36..202.69 rows=50 width=190) (actual time=0.916..1.022 rows=50 loops=1)
+   Buffers: shared hit=60 read=3
+   ->  Incremental Sort  (cost=4.36..11824.70 rows=2980 width=190) (actual time=0.915..1.018 rows=50 loops=1)
+         Sort Key: soroban_events.ledger_sequence, soroban_events.event_index
+         Presorted Key: soroban_events.ledger_sequence
+         Full-sort Groups: 2  Sort Method: quicksort  Average Memory: 33kB  Peak Memory: 33kB
+         Buffers: shared hit=60 read=3
+         ->  Index Scan Backward using soroban_events_p56000000_579999_contract_id_ledger_sequence_idx on soroban_events_p56000000_57999999 soroban_events  (cost=0.43..11690.60 rows=2980 width=190) (actual time=0.714..0.949 rows=51 loops=1)
+               Index Cond: ((contract_id = 'CCONTRACT000042'::text) AND (ledger_sequence >= 56000000) AND (ledger_sequence <= 56100000))
+               Filter: (network = 'testnet'::text)
+               Buffers: shared hit=51 read=3
+ Planning:
+   Buffers: shared hit=525 read=5
+ Planning Time: 4.329 ms
+ Execution Time: 1.112 ms
+(15 rows)
+
+                                                                                               QUERY PLAN                                                                                                
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Append  (cost=0.00..4.49 rows=9 width=16) (actual time=0.025..0.028 rows=1 loops=1)
+   Buffers: shared hit=4
+   ->  Seq Scan on soroban_events_p0_1999999 soroban_events_1  (cost=0.00..0.00 rows=1 width=16) (actual time=0.002..0.002 rows=0 loops=1)
+         Filter: (id = 'fffffe25-21d3-4d79-be57-a9202d883fae'::uuid)
+   ->  Seq Scan on soroban_events_p2000000_3999999 soroban_events_2  (cost=0.00..0.00 rows=1 width=16) (actual time=0.001..0.001 rows=0 loops=1)
+         Filter: (id = 'fffffe25-21d3-4d79-be57-a9202d883fae'::uuid)
+   ->  Seq Scan on soroban_events_p4000000_5999999 soroban_events_3  (cost=0.00..0.00 rows=1 width=16) (actual time=0.001..0.002 rows=0 loops=1)
+         Filter: (id = 'fffffe25-21d3-4d79-be57-a9202d883fae'::uuid)
+   ->  Seq Scan on soroban_events_p50000000_51999999 soroban_events_4  (cost=0.00..0.00 rows=1 width=16) (actual time=0.001..0.001 rows=0 loops=1)
+         Filter: (id = 'fffffe25-21d3-4d79-be57-a9202d883fae'::uuid)
+   ->  Seq Scan on soroban_events_p52000000_53999999 soroban_events_5  (cost=0.00..0.00 rows=1 width=16) (actual time=0.001..0.001 rows=0 loops=1)
+         Filter: (id = 'fffffe25-21d3-4d79-be57-a9202d883fae'::uuid)
+   ->  Seq Scan on soroban_events_p54000000_55999999 soroban_events_6  (cost=0.00..0.00 rows=1 width=16) (actual time=0.000..0.000 rows=0 loops=1)
+         Filter: (id = 'fffffe25-21d3-4d79-be57-a9202d883fae'::uuid)
+   ->  Index Only Scan using soroban_events_p56000000_57999999_id_idx on soroban_events_p56000000_57999999 soroban_events_7  (cost=0.43..4.45 rows=1 width=16) (actual time=0.018..0.019 rows=1 loops=1)
+         Index Cond: (id = 'fffffe25-21d3-4d79-be57-a9202d883fae'::uuid)
+         Heap Fetches: 0
+         Buffers: shared hit=4
+   ->  Seq Scan on soroban_events_p58000000_59999999 soroban_events_8  (cost=0.00..0.00 rows=1 width=16) (actual time=0.002..0.002 rows=0 loops=1)
+         Filter: (id = 'fffffe25-21d3-4d79-be57-a9202d883fae'::uuid)
+   ->  Seq Scan on soroban_events_default soroban_events_9  (cost=0.00..0.00 rows=1 width=16) (actual time=0.001..0.001 rows=0 loops=1)
+         Filter: (id = 'fffffe25-21d3-4d79-be57-a9202d883fae'::uuid)
+ Planning:
+   Buffers: shared hit=1539
+ Planning Time: 4.227 ms
+ Execution Time: 0.075 ms
+(26 rows)
+

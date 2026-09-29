@@ -1,0 +1,124 @@
+---
+import Base from '../layouts/Base.astro';
+
+interface ServiceStatus {
+  name: string;
+  status: 'operational' | 'degraded' | 'outage';
+  latencyMs: number;
+  description: string;
+}
+
+const services: ServiceStatus[] = [
+  {
+    name: 'Soroban Event Ingestion (Testnet)',
+    status: 'operational',
+    latencyMs: 120,
+    description: 'Real-time ledger polling and transaction event stream extraction.',
+  },
+  {
+    name: 'REST API & WebSockets (/v1)',
+    status: 'operational',
+    latencyMs: 45,
+    description: 'Public query endpoints, SSE streams, and webhook delivery.',
+  },
+  {
+    name: 'gRPC High-Throughput API',
+    status: 'operational',
+    latencyMs: 18,
+    description: 'Protobuf event streaming for high-volume indexers and backfills.',
+  },
+  {
+    name: 'PostgreSQL Event Store & Partitions',
+    status: 'operational',
+    latencyMs: 8,
+    description: 'Partitioned event storage with index caching and schema guards.',
+  },
+];
+
+const overallStatus = services.every((s) => s.status === 'operational')
+  ? 'All Systems Operational'
+  : services.some((s) => s.status === 'outage')
+    ? 'Service Outage Detected'
+    : 'Partial System Degradation';
+
+const statusColor =
+  overallStatus === 'All Systems Operational'
+    ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+    : overallStatus === 'Service Outage Detected'
+      ? 'bg-rose-500/10 text-rose-400 border-rose-500/20'
+      : 'bg-amber-500/10 text-amber-400 border-amber-500/20';
+
+const incidents = [
+  {
+    id: 'inc-001',
+    title: 'Scheduled Testnet Ledger Catch-Up Protocol',
+    status: 'Resolved',
+    date: 'August 28, 2026',
+    summary: 'Indexer completed routine resync following testnet reset with zero dropped subscriber events.',
+  },
+];
+---
+
+<Base title="System Status" description="Real-time uptime, service health, and incident tracking for Trident.">
+  <div class="max-w-4xl mx-auto py-6">
+    <!-- Header Banner -->
+    <div class={`p-5 rounded-xl border flex items-center justify-between mb-8 ${statusColor}`}>
+      <div class="flex items-center gap-3">
+        <span class="relative flex h-3.5 w-3.5">
+          <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+          <span class="relative inline-flex rounded-full h-3.5 w-3.5 bg-emerald-500"></span>
+        </span>
+        <h1 class="text-xl font-bold">{overallStatus}</h1>
+      </div>
+      <span class="text-xs text-gray-400">Updated automatically</span>
+    </div>
+
+    <!-- Services Grid -->
+    <div class="space-y-4 mb-12">
+      <h2 class="text-lg font-semibold text-white mb-4">Core Components</h2>
+      {services.map((svc) => (
+        <div class="p-4 bg-gray-900/60 border border-gray-800 rounded-lg flex items-center justify-between">
+          <div>
+            <div class="font-medium text-white text-base">{svc.name}</div>
+            <div class="text-xs text-gray-400 mt-0.5">{svc.description}</div>
+          </div>
+          <div class="flex items-center gap-4">
+            <span class="text-xs text-gray-500 font-mono">{svc.latencyMs}ms</span>
+            <span
+              class={`px-2.5 py-1 rounded-full text-xs font-semibold uppercase tracking-wider ${
+                svc.status === 'operational'
+                  ? 'bg-emerald-500/20 text-emerald-300'
+                  : svc.status === 'degraded'
+                    ? 'bg-amber-500/20 text-amber-300'
+                    : 'bg-rose-500/20 text-rose-300'
+              }`}
+            >
+              {svc.status}
+            </span>
+          </div>
+        </div>
+      ))}
+    </div>
+
+    <!-- Past Incidents -->
+    <div>
+      <h2 class="text-lg font-semibold text-white mb-4">Past Incidents & Maintenance</h2>
+      <div class="space-y-4">
+        {incidents.map((inc) => (
+          <div class="p-5 bg-gray-900/40 border border-gray-800 rounded-lg">
+            <div class="flex items-center justify-between mb-2">
+              <span class="font-medium text-white">{inc.title}</span>
+              <span class="text-xs text-gray-400">{inc.date}</span>
+            </div>
+            <p class="text-sm text-gray-400">{inc.summary}</p>
+            <div class="mt-3">
+              <span class="text-xs font-medium text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">
+                {inc.status}
+              </span>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  </div>
+</Base>

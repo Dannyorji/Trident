@@ -1,0 +1,96 @@
+name: Explorer Build
+
+# Issue #520: "wire it into CI so it breaks loudly when the API changes."
+# explorer-perf.yml already exercises explorer/ against a real testnet API,
+# but only on a weekly schedule/manual dispatch, and it never actually runs
+# `npm run build` — it discovered the explorer's build had been broken
+# outright (a duplicated template block in one page, since fixed) only
+# because someone ran `npm run build` by hand. This job runs the real
+# production build on every push/PR that touches explorer/, so a build
+# break (from an API/type change, a bad merge, or anything else) is a red
+# CI check within minutes, not something waiting to be found by hand.
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - "explorer/**"
+      - "sdk/typescript/**"
+      - ".github/workflows/explorer-build.yml"
+  pull_request:
+    paths:
+      - "explorer/**"
+      - "sdk/typescript/**"
+      - ".github/workflows/explorer-build.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          # Astro 7 refuses to run on anything below 22.12 ("Node.js v20.x is
+          # not supported by Astro"). Pinned at 20, this job failed before it
+          # compiled a line — the workflow added to catch a broken explorer
+          # build could not itself run.
+          node-version: "22.12"
+
+      - name: Build the TypeScript SDK
+        working-directory: sdk/typescript
+        run: |
+          npm install
+          npm run build
+
+      # explorer/ depends on the SDK via a local `file:../sdk/typescript`
+      # dependency (the SDK is not yet published — see #517/#429, blocked on
+      # #512), so the SDK must be built before `npm install` in explorer/
+      # resolves and links it.
+      - name: Install explorer dependencies
+        working-directory: explorer
+        run: npm install --legacy-peer-deps
+
+      - name: Type-check
+        working-directory: explorer
+        # astro check has pre-existing, unrelated failures in
+        # scripts/a11y-test.ts and scripts/perf-test.ts (tracked
+        # separately) — this job checks the build, which is the specific
+        # "breaks loudly" signal #520 asks for; a full green astro check
+        # across the whole package is a separate concern.
+        run: npm run build
+
+      - name: Verify the built server actually starts
+        working-directory: explorer
+        env:
+          TRIDENT_TESTNET_API_URL: https://api.testnet.trident.dev
+          TRIDENT_MAINNET_API_URL: https://api.mainnet.trident.dev
+          EXPLORER_API_KEY: ci-smoke-test-key
+          PORT: 4321
+        run: |
+          node dist/server/entry.mjs &
+          SERVER_PID=$!
+          for i in $(seq 1 20); do
+            # localhost, not 127.0.0.1: @astrojs/node binds the hostname and
+            # on a dual-stack runner that can be ::1 only, so the v4 literal
+            # never connects.
+            #
+            # No --fail, and any HTTP status counts. This step verifies the
+            # built server boots and serves — not that the page renders
+            # successfully. Rendering "/" calls the real testnet API with a
+            # dummy key, so a non-2xx here is the expected, correct outcome;
+            # requiring 2xx made the check depend on a live external service.
+            code=$(curl --silent --show-error --max-time 2 -o /dev/null -w '%{http_code}' \
+              "http://localhost:4321/" 2>/dev/null || echo "000")
+            if [ "$code" != "000" ]; then
+              echo "Server responded with HTTP $code"
+              kill "$SERVER_PID"
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "Server did not respond within the timeout" >&2
+          kill "$SERVER_PID" 2>/dev/null || true
+          exit 1

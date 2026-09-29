@@ -80,7 +80,9 @@ sdk-build:
 test:
 	cargo test --all
 	cd services/api && go test ./...
-	cd sdk/typescript && npm install && npm run test
+	cd sdk/go && go test ./...
+	cd sdk/python && pip install -e ".[dev]" && pytest -q
+	cd sdk/typescript && npm install && npm run build && npm run test
 	cd sdk/react && npm install && npm run test
 
 deploy: ## Deploy all services to Fly.io in dependency order (requires flyctl)
@@ -109,3 +111,53 @@ lint-openapi: ## Lint the OpenAPI specification
 		echo "spectral CLI not found. Install with: npm install -g @stoplight/spectral-cli"; \
 		exit 1; \
 	fi
+
+# Coverage (issue #325). Mirrors the `coverage` job in .github/workflows/ci.yml
+# so a local run and CI report the same numbers from the same tools.
+#
+# cargo-llvm-cov, not tarpaulin: llvm-cov uses the compiler's own
+# instrumentation, so it reports the regions rustc actually sees.
+
+coverage: coverage-rust coverage-go coverage-sdk ## Collect coverage for Rust, Go, and the SDKs
+
+coverage-rust: ## Rust workspace coverage (HTML + lcov in target/llvm-cov)
+	@command -v cargo-llvm-cov >/dev/null 2>&1 || { \
+		echo "cargo-llvm-cov not found. Install with: cargo install cargo-llvm-cov"; \
+		exit 1; \
+	}
+	cargo llvm-cov --workspace --html --lcov --output-path lcov.info -- --test-threads=1
+	@echo "HTML report: target/llvm-cov/html/index.html"
+
+coverage-go: ## Go API coverage (HTML in services/api/coverage.html)
+	cd services/api && go test ./... -coverprofile=coverage.out
+	cd services/api && go tool cover -html=coverage.out -o coverage.html
+	cd services/api && go tool cover -func=coverage.out | tail -1
+
+coverage-sdk: ## TypeScript and Python SDK coverage
+	cd sdk/typescript && npm run test -- --coverage || \
+		echo "note: install @vitest/coverage-v8 for TypeScript coverage"
+	cd sdk/python && pytest -q --cov --cov-report=term --cov-fail-under=0
+
+# Enforce the floors CI enforces. Runs the measurement itself rather than
+# depending on a profile a previous target may or may not have produced —
+# the previous version read services/api/coverage.out without generating it,
+# so a clean tree failed on a missing file rather than on coverage.
+#
+# Floors are set from measured baselines, not aspiration; see the `coverage`
+# job in .github/workflows/ci.yml for the rationale and current numbers.
+coverage-check: ## Enforce coverage floors on MVP-critical packages
+	@set -e; \
+	cd services/api; \
+	echo "Checking Go critical-package coverage floors..."; \
+	fail=0; \
+	for spec in "handlers:43" "middleware:66" "cursor:90" "validation:95"; do \
+		pkg=$${spec%%:*}; floor=$${spec##*:}; \
+		actual=$$(go test ./$$pkg -coverprofile=cov-$$pkg.out 2>/dev/null \
+			| grep -oE 'coverage: [0-9.]+%' | grep -oE '[0-9.]+' || echo 0); \
+		if awk -v a="$$actual" -v f="$$floor" 'BEGIN { exit !(a + 0 < f + 0) }'; then \
+			echo "  FAIL $$pkg: $$actual% is below the $$floor% floor"; fail=1; \
+		else \
+			echo "  ok   $$pkg: $$actual% (floor $$floor%)"; \
+		fi; \
+	done; \
+	exit $$fail

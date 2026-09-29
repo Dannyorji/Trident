@@ -5,7 +5,9 @@
 
 global:
   # Name of a pre-existing Secret that holds sensitive env vars.
-  # Required keys: DATABASE_URL, REDIS_URL, ADMIN_API_KEY
+  # Required keys: DATABASE_URL, REDIS_URL, ADMIN_API_KEY, API_KEY_SALT,
+  # STELLAR_RPC_URL. Production values files contain references only; the
+  # values themselves live in the external backend configured below.
   #
   # This name is also the *target* Secret when externalSecret.enabled is
   # true below — the operator writes/syncs into a Secret with this same
@@ -35,7 +37,8 @@ global:
       kind: ClusterSecretStore
     refreshInterval: 1h
     # Maps each key the chart's Secret needs (DATABASE_URL, REDIS_URL,
-    # ADMIN_API_KEY) to its path in the backend. Defaults assume a
+    # ADMIN_API_KEY, API_KEY_SALT, STELLAR_RPC_URL) to its path in the backend.
+    # Defaults assume a
     # single JSON/KV secret at "trident/prod" with matching keys —
     # override remoteRef.key / .property per backend layout.
     data:
@@ -51,6 +54,14 @@ global:
         remoteRef:
           key: trident/prod
           property: ADMIN_API_KEY
+      - secretKey: API_KEY_SALT
+        remoteRef:
+          key: trident/prod
+          property: API_KEY_SALT
+      - secretKey: STELLAR_RPC_URL
+        remoteRef:
+          key: trident/prod
+          property: STELLAR_RPC_URL
 
 # ---------------------------------------------------------------------------
 # Database migrations (issue #308) — runs as a Helm pre-install/pre-upgrade
@@ -65,7 +76,14 @@ migrations:
   enabled: true
   image:
     repository: ghcr.io/telocel-labs/trident-migrate
-    tag: latest
+    # Empty means "use Chart.yaml's appVersion" (see the image tag lines in
+    # templates/*.yaml, which fall back to .Chart.AppVersion). A self-hoster
+    # deploying this chart with no overrides gets the version-pinned image
+    # that ships with this chart release, not a floating tag that silently
+    # moves and defeats `helm rollback` (issue #622). staging-deploy.yml
+    # already overrides this with --set for the CI/CD path; this default is
+    # what an unattended `helm install` with no overrides resolves to.
+    tag: ""
   resources:
     requests:
       cpu: "100m"
@@ -85,7 +103,9 @@ migrations:
 indexer:
   image:
     repository: ghcr.io/telocel-labs/trident-indexer
-    tag: latest
+    # See migrations.image.tag above for why this defaults to empty rather
+    # than "latest" (issue #622).
+    tag: ""
   replicaCount: 1
   resources:
     requests:
@@ -135,7 +155,9 @@ indexer:
 grpcApi:
   image:
     repository: ghcr.io/telocel-labs/trident-grpc-api
-    tag: latest
+    # See migrations.image.tag above for why this defaults to empty rather
+    # than "latest" (issue #622).
+    tag: ""
   replicaCount: 1
   service:
     port: 5000
@@ -179,7 +201,9 @@ grpcApi:
 goApi:
   image:
     repository: ghcr.io/telocel-labs/trident-go-api
-    tag: latest
+    # See migrations.image.tag above for why this defaults to empty rather
+    # than "latest" (issue #622).
+    tag: ""
   replicaCount: 2
   service:
     port: 3000

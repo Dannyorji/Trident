@@ -80,7 +80,8 @@
         "api-reference/rate-limiting",
         "api-reference/events-list",
         "api-reference/events-get",
-        "api-reference/health"
+        "api-reference/health",
+        "api-reference/compatibility"
       ]
     },
     {
@@ -111,7 +112,8 @@
         "sdk/get-event-by-id",
         "sdk/subscribe",
         "sdk/errors",
-        "sdk/transport"
+        "sdk/transport",
+        "sdk/versioning"
       ]
     },
     {

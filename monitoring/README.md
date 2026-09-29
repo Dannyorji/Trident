@@ -34,6 +34,34 @@ with Prometheus):
 promtool check rules monitoring/alerts.yml
 ```
 
+## Alert routing
+
+`alertmanager.yml` routes `alerts.yml`'s alerts by `severity`/`service`
+label to a receiver — load it via Alertmanager's `--config.file` flag, or
+convert `route`/`receivers` into an `AlertmanagerConfig` CRD if running the
+Prometheus Operator. Validate it with `amtool` (ships with Alertmanager):
+
+```bash
+amtool check-config monitoring/alertmanager.yml
+```
+
+The `on-call-critical`/`on-call-warning` receivers are wired into the
+routing tree but have no delivery target configured yet — see the comments
+in `alertmanager.yml` and [issue #445](https://github.com/Telocel-Labs/Trident/issues/445)
+(naming an actual on-call owner and escalation path is a decision for the
+project's operators, not something this file can invent).
+
+## Verifying an alert actually fires
+
+`../scripts/verify-indexer-silence-alerts.sh` runs a real Prometheus against
+the real `alerts.yml`, kills a synthetic indexer target, and confirms one of
+the silence-based alerts (`TridentIndexerHeartbeatStale`,
+`TridentIndexerMetricsMissing`, `TridentIndexerProcessDown`) reaches
+`state=firing` — the concrete proof behind issue #526's "killing the indexer
+fires the alert" requirement. It can also point at a real staging
+Prometheus (`SKIP_LOCAL_PROMETHEUS=1 PROMETHEUS_URL=...`) to verify the same
+thing against a real deployment instead of the local synthetic target.
+
 ## Metrics catalog and runbook
 
 - The full metrics catalog (every metric `alerts.yml` references, plus

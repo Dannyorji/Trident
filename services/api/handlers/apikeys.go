@@ -10,12 +10,22 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Depo-dev/trident/services/api/cursor"
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
 	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/Depo-dev/trident/services/api/validation"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
+)
+
+// apiKeyListDefaultLimit/apiKeyListMaxLimit bound GET /v1/api-keys pagination
+// (issue #220) — same shape as ListContracts/ListEvents: a bounded default
+// page, and a hard ceiling so a client can never force one query to return
+// an unbounded result set.
+const (
+	apiKeyListDefaultLimit = 50
+	apiKeyListMaxLimit     = 200
 )
 
 // apiKeyQueryTimeout bounds the DB calls in the api-key admin handlers so a
@@ -49,6 +59,15 @@ type APIKeyResponse struct {
 	RequestCount  int64   `json:"request_count"`
 	RevokedAt     *string `json:"revoked_at,omitempty"`
 	CreatedAt     string  `json:"created_at"`
+}
+
+// ListAPIKeysResponse is the response envelope for GET /v1/api-keys (issue
+// #220) — the same has_more/next_cursor shape as ListEventsResponse, so
+// every keyset-paginated list endpoint in this API is walked the same way.
+type ListAPIKeysResponse struct {
+	APIKeys    []APIKeyResponse `json:"api_keys"`
+	HasMore    bool             `json:"has_more"`
+	NextCursor *string          `json:"next_cursor"`
 }
 
 type createKeyRequest struct {
@@ -100,9 +119,12 @@ func CreateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "invalid JSON body")
 			return
 		}
-		if req.Network == "" {
-			req.Network = "mainnet"
+		network, verr := validation.ValidateNetwork("network", req.Network, "mainnet")
+		if verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
+			return
 		}
+		req.Network = network
 		if req.RateLimitTier == "" {
 			req.RateLimitTier = "standard"
 		}
@@ -161,14 +183,54 @@ func ListAPIKeys(cfg APIKeyConfig) http.HandlerFunc {
 			return
 		}
 
+		if verr := validation.RejectUnknownParams(r.URL.Query(), "limit", "cursor"); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
+			return
+		}
+
+		limit := apiKeyListDefaultLimit
+		if l := r.URL.Query().Get("limit"); l != "" {
+			n, err := parseInt(l)
+			if err != nil || n <= 0 || n > apiKeyListMaxLimit {
+				httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT,
+					fmt.Sprintf("limit must be an integer between 1 and %d", apiKeyListMaxLimit))
+				return
+			}
+			limit = n
+		}
+
+		// created_at is not unique on its own (two keys can be created in the
+		// same instant), so the keyset is (created_at, id) — a total order
+		// with id as tiebreaker — not created_at alone (issue #220).
+		//
+		// Both bind as untyped nil (SQL NULL) when no cursor is supplied,
+		// never as a zero time / empty string: binding "" for a ::uuid
+		// parameter fails to cast regardless of the WHERE clause's IS NULL
+		// branch, because the cast happens while binding the parameter
+		// value, before the OR can short-circuit it away.
+		var cursorCreatedAt, cursorID any
+		if c := r.URL.Query().Get("cursor"); c != "" {
+			t, id, err := cursor.DecodeKeyset(c)
+			if err != nil {
+				httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "cursor is not a valid pagination cursor")
+				return
+			}
+			cursorCreatedAt, cursorID = t, id
+		}
+
 		ctx, cancel := context.WithTimeout(r.Context(), apiKeyQueryTimeout)
 		defer cancel()
 
+		// LIMIT $3 fetches one extra row past the page: its presence is how
+		// has_more is known without a separate COUNT query.
 		rows, err := cfg.DB.Query(ctx,
 			`SELECT id, key_prefix, label, network, rate_limit_tier, created_by,
 			        last_used_at, request_count, revoked_at, created_at
 			 FROM api_keys
-			 ORDER BY created_at DESC`,
+			 WHERE ($1::timestamptz IS NULL OR (created_at, id) < ($1::timestamptz, $2::uuid))
+			 ORDER BY created_at DESC, id DESC
+			 LIMIT $3`,
+			cursorCreatedAt, cursorID, limit+1,
 		)
 		if err != nil {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to list api keys")
@@ -176,7 +238,11 @@ func ListAPIKeys(cfg APIKeyConfig) http.HandlerFunc {
 		}
 		defer rows.Close()
 
-		keys := []APIKeyResponse{}
+		type row struct {
+			key       APIKeyResponse
+			createdAt time.Time
+		}
+		fetched := make([]row, 0, limit+1)
 		for rows.Next() {
 			var k APIKeyResponse
 			var lastUsedAt, revokedAt *time.Time
@@ -196,14 +262,35 @@ func ListAPIKeys(cfg APIKeyConfig) http.HandlerFunc {
 				s := revokedAt.UTC().Format(time.RFC3339)
 				k.RevokedAt = &s
 			}
-			keys = append(keys, k)
+			fetched = append(fetched, row{key: k, createdAt: createdAt})
 		}
 		if rows.Err() != nil {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "query error")
 			return
 		}
 
-		writeJSON(w, http.StatusOK, map[string]any{"api_keys": keys})
+		hasMore := len(fetched) > limit
+		if hasMore {
+			fetched = fetched[:limit]
+		}
+
+		keys := make([]APIKeyResponse, len(fetched))
+		for i, f := range fetched {
+			keys[i] = f.key
+		}
+
+		var nextCursor *string
+		if hasMore {
+			last := fetched[len(fetched)-1]
+			c := cursor.EncodeKeyset(last.createdAt, last.key.ID)
+			nextCursor = &c
+		}
+
+		writeJSON(w, http.StatusOK, ListAPIKeysResponse{
+			APIKeys:    keys,
+			HasMore:    hasMore,
+			NextCursor: nextCursor,
+		})
 	}
 }
 
@@ -276,6 +363,74 @@ func UpdateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 			k.LastUsedAt = &s
 		}
 		writeJSON(w, http.StatusOK, k)
+	}
+}
+
+// RotateAPIKey handles POST /v1/api-keys/{id}/rotate (admin-only).
+//
+// Creates a new replacement key inheriting the network, rate_limit_tier, and label
+// of the existing active key, allowing seamless zero-downtime key rotation with an overlap window.
+// The old key remains active until explicitly revoked.
+func RotateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !requireAdmin(cfg, w, r) {
+			return
+		}
+
+		id := r.PathValue("id")
+		if verr := validation.ValidateUUID("id", id); verr != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), apiKeyQueryTimeout)
+		defer cancel()
+
+		var oldLabel, oldNetwork, oldTier string
+		var oldCreatedBy *string
+		err := cfg.DB.QueryRow(ctx,
+			`SELECT label, network, rate_limit_tier, created_by
+			 FROM api_keys
+			 WHERE id = $1 AND revoked_at IS NULL`,
+			id,
+		).Scan(&oldLabel, &oldNetwork, &oldTier, &oldCreatedBy)
+		if err == pgx.ErrNoRows {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusNotFound, httputil.NOT_FOUND, "active api key not found for rotation")
+			return
+		}
+		if err != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to query api key")
+			return
+		}
+
+		// Generate new key: "trident_" + 32 random hex bytes
+		rawBytes := make([]byte, 32)
+		if _, err := rand.Read(rawBytes); err != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to generate key entropy")
+			return
+		}
+		plainKey := "trident_" + hex.EncodeToString(rawBytes)
+		keyHash := sha256hex(plainKey)
+		keyPrefix := plainKey[:16]
+
+		newLabel := fmt.Sprintf("%s (rotated %s)", oldLabel, time.Now().UTC().Format("2006-01-02"))
+
+		var resp APIKeyResponse
+		var createdAt time.Time
+		err = cfg.DB.QueryRow(ctx,
+			`INSERT INTO api_keys (key_hash, key_prefix, label, network, rate_limit_tier, created_by)
+			 VALUES ($1, $2, $3, $4, $5, $6)
+			 RETURNING id, key_prefix, label, network, rate_limit_tier, created_by, request_count, created_at`,
+			keyHash, keyPrefix, newLabel, oldNetwork, oldTier, oldCreatedBy,
+		).Scan(&resp.ID, &resp.KeyPrefix, &resp.Label, &resp.Network, &resp.RateLimitTier, &resp.CreatedBy, &resp.RequestCount, &createdAt)
+		if err != nil {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to store rotated api key")
+			return
+		}
+
+		resp.Key = &plainKey
+		resp.CreatedAt = createdAt.UTC().Format(time.RFC3339)
+		writeJSON(w, http.StatusCreated, resp)
 	}
 }
 
@@ -353,17 +508,22 @@ func NewAPIKeyUsageTracker(db *pgxpool.Pool, flushInterval time.Duration) (track
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
+			ids := make([]string, 0, len(pending))
+			counts := make([]int64, 0, len(pending))
 			for id, count := range pending {
-				if _, err := db.Exec(ctx,
-					`UPDATE api_keys
-					 SET request_count = request_count + $1,
-					     last_used_at  = NOW()
-					 WHERE id = $2`,
-					count, id,
-				); err != nil {
-					// Log but don't crash — usage tracking is non-critical.
-					_ = err
-				}
+				ids = append(ids, id)
+				counts = append(counts, count)
+			}
+			if _, err := db.Exec(ctx,
+				`UPDATE api_keys AS k
+				 SET request_count = k.request_count + u.count,
+				     last_used_at  = NOW()
+				 FROM (SELECT unnest($1::uuid[]) AS id, unnest($2::bigint[]) AS count) AS u
+				 WHERE k.id = u.id`,
+				ids, counts,
+			); err != nil {
+				// Log but don't crash — usage tracking is non-critical.
+				_ = err
 			}
 			pending = map[string]int64{}
 		}

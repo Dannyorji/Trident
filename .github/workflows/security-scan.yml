@@ -65,6 +65,9 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Verify no secret is baked into an image layer
+        run: bash scripts/check-image-history.sh "${{ matrix.tag }}"
+
       # v0.9.0 pinned a syft version whose installer URL now 404s, and it
       # derived the upload artifact name from the image tag — which contains
       # a colon and is rejected as an invalid artifact name. Both are fixed by
@@ -98,6 +101,33 @@ jobs:
           exit-code: "1"
           trivyignores: .trivyignore
 
+  # The migration image is released alongside the three application images,
+  # but is not part of the pre-existing vulnerability/SBOM matrix. Build it
+  # separately here so every shipped image receives the layer-secret audit
+  # without changing unrelated vulnerability policy.
+  migration-image-secret-audit:
+    name: Image secret audit (migrate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@2b51285047da1547ffb1b2203d8be4c0af6b1f20 # v3.2.0
+
+      - name: Build migration image (loaded locally, not pushed)
+        uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
+        with:
+          context: .
+          file: database/Dockerfile
+          push: false
+          load: true
+          tags: trident-migrate:secret-audit
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify no secret is baked into an image layer
+        run: bash scripts/check-image-history.sh trident-migrate:secret-audit
+
   # ---------------------------------------------------------------------------
   # Dependency vulnerability audits — one step per ecosystem actually
   # present in this repo (Rust workspace, the two standalone Go modules,
@@ -112,14 +142,17 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
-      # Reports but does not block: this job had never actually run (its
-      # toolchain pin resolved to nothing), so its first green-field run
-      # surfaced 10 pre-existing advisories in transitive dependencies.
-      # Triage is tracked in #373. Restore blocking (drop continue-on-error)
-      # once that backlog is cleared.
+      # audit-check installs cargo-audit itself without --locked, which
+      # resolves its dependencies to their newest releases. kstring 2.0.4 now
+      # requires rustc 1.96 while the stable runner is on 1.94, so that
+      # unpinned build fails before the audit ever runs. Installing it here
+      # with --locked uses cargo-audit's own lockfile, which builds on
+      # stable; the action reuses the binary it finds on PATH.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version ^0.22
+
       - name: cargo audit (Rust workspace)
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
-        continue-on-error: true
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -128,33 +161,39 @@ jobs:
         with:
           go-version: "1.25"
 
+      # govulncheck reports standard-library advisories against the toolchain
+      # it runs under, so leaving this at the action's default ('stable') makes
+      # the result depend on whatever Go was released most recently rather than
+      # on what we ship. Pin it to the 1.25 line — the same minor as
+      # services/api/Dockerfile's builder and the `go` directive in both
+      # modules — so a finding here means the released binary is affected.
       - name: govulncheck (services/api)
         uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
         with:
           work-dir: services/api
+          go-version-input: "1.25"
 
       - name: govulncheck (sdk/go)
         uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
         with:
           work-dir: sdk/go
+          go-version-input: "1.25"
 
       - name: Set up Node
         uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
         with:
           node-version: "20"
 
-      # --omit=dev drops the @astrojs/language-server / volar-service-* editor
-      # tooling, which is never bundled into the built site. What remains is
-      # not dev tooling: astro ^4.16.18 itself carries high-severity runtime
-      # advisories (SSRF via Host header, cache poisoning, reflected XSS via
-      # server islands), fixable only by the breaking major bump to Astro 5.
+      # Reports but does not block. #466 moved explorer to Astro 5 and removed
+      # continue-on-error on the assumption that cleared the HIGH advisories.
+      # It does not: resolving this package.json on Astro 5 still leaves HIGH
+      # findings in esbuild and sharp, and npm's own remediation is
+      # `astro@7`. Verified 2026-08-26 by resolving the manifest in isolation.
       #
-      # Reports but does not block, matching how `cargo audit` above is
-      # handled and for the same reason: this job had never run — its action
-      # pins resolved to nothing — so its first real run surfaced a backlog
-      # that predates any change here. Nothing in this branch touches
-      # explorer/. Triage is tracked in #373; restore blocking (drop
-      # continue-on-error) once the Astro 5 bump lands.
+      # Astro 7 + Tailwind 4 does audit clean (0 vulnerabilities), but that is
+      # a two-major jump plus the Tailwind v4 migration (@astrojs/tailwind is
+      # replaced by @tailwindcss/vite), which needs its own change against
+      # #402 rather than riding along here.
       - name: npm audit (explorer)
         working-directory: explorer
         run: npm audit --audit-level=high --omit=dev

@@ -311,7 +311,7 @@ func TestContractStatsRollup_MatchesLiveAggregation(t *testing.T) {
 		t.Fatalf("rollup should be populated for network %q after refresh", network)
 	}
 
-	liveStats, err := queryContractStats(ctx, pool, params)
+	liveStats, err := queryContractStats(ctx, pool, params, nil)
 	if err != nil {
 		t.Fatalf("live query: %v", err)
 	}
@@ -339,5 +339,140 @@ func TestContractStatsRollup_MatchesLiveAggregation(t *testing.T) {
 	}
 	if rollupRow.EventCount != 3 {
 		t.Errorf("expected 3 seeded events, got event_count=%d", rollupRow.EventCount)
+	}
+}
+
+// TestQueryContractStats_KeysetPagination_TiedEventCountsNoSkipOrDuplicate is
+// the regression test for issue #567: GET /v1/stats/contracts orders results
+// by event_count DESC, which is not a total order, so paging with only
+// event_count as the cursor position could skip or repeat rows whenever two
+// or more contracts tie on event_count. queryContractStats already orders
+// and predicates on (event_count DESC, contract_id DESC) — this test proves
+// that tiebreaker actually holds across pages rather than asserting it from
+// reading the SQL alone: five contracts share event_count=2, three more
+// share event_count=1, paged two at a time end to end, and the full set must
+// come back with no contract missing and none seen twice.
+func TestQueryContractStats_KeysetPagination_TiedEventCountsNoSkipOrDuplicate(t *testing.T) {
+	dbURL := os.Getenv("TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("TEST_DATABASE_URL not set")
+	}
+
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer pool.Close()
+
+	runID := time.Now().UnixNano()
+	// soroban_events.network is CHECK-constrained to a fixed enum (migration
+	// 0031), so isolation between test runs comes from the contract_id
+	// prefix, not a synthetic network value.
+	const network = "testnet"
+
+	// contractEventCounts: 5 contracts tied at event_count=2, 3 tied at
+	// event_count=1 — both groups large enough that a limit=2 page cannot
+	// avoid landing mid-tie at least once.
+	contractEventCounts := map[string]int{}
+	for i := 0; i < 5; i++ {
+		contractEventCounts[fmt.Sprintf("CKEYSETTIE2_%d_%d", runID, i)] = 2
+	}
+	for i := 0; i < 3; i++ {
+		contractEventCounts[fmt.Sprintf("CKEYSETTIE1_%d_%d", runID, i)] = 1
+	}
+
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, "DELETE FROM soroban_events WHERE network = $1", network)
+	})
+
+	seedEvent := `
+		INSERT INTO soroban_events
+			(contract_id, ledger_sequence, ledger_timestamp, transaction_hash,
+			 event_index, event_type, network, topics, data)
+		VALUES ($1, $2, $3, $4, 0, 'contract', $5, '[]', '{}')
+	`
+	seq := int64(200)
+	for contractID, count := range contractEventCounts {
+		for i := 0; i < count; i++ {
+			ts := time.Unix(1_700_000_000+seq, 0).UTC()
+			if _, err := pool.Exec(ctx, seedEvent, contractID, seq, ts, fmt.Sprintf("tx%d", seq), network); err != nil {
+				t.Fatalf("seed event for %s: %v", contractID, err)
+			}
+			seq++
+		}
+	}
+
+	const pageSize = 2
+	params := &validation.QueryStatsParams{Network: network, Limit: pageSize}
+
+	// network=testnet is shared with whatever else may be in this database,
+	// so unrelated contracts can legitimately be interleaved in the result
+	// set. Walk the real, full pagination sequence — a shared network is
+	// exactly the situation where an incorrect cursor could skip or repeat a
+	// row at a page boundary — but only assert about this test's own seeded
+	// contracts, identified by the CKEYSETTIE prefix.
+	isMine := func(contractID string) bool {
+		_, ok := contractEventCounts[contractID]
+		return ok
+	}
+
+	seen := map[string]int{}
+	var mineOrder []string
+	var after *statsKeyset
+	for page := 0; ; page++ {
+		if page > 2000 {
+			t.Fatal("pagination did not terminate")
+		}
+		stats, err := queryContractStats(ctx, pool, params, after)
+		if err != nil {
+			t.Fatalf("page %d: query: %v", page, err)
+		}
+		hasMore := len(stats) > pageSize
+		if hasMore {
+			stats = stats[:pageSize]
+		}
+		if len(stats) > pageSize {
+			t.Fatalf("page %d: returned %d rows, want at most limit=%d", page, len(stats), pageSize)
+		}
+		for _, cs := range stats {
+			if isMine(cs.ContractID) {
+				seen[cs.ContractID]++
+				mineOrder = append(mineOrder, cs.ContractID)
+			}
+		}
+		if !hasMore || len(stats) == 0 {
+			break
+		}
+		last := stats[len(stats)-1]
+		after = &statsKeyset{EventCount: last.EventCount, ContractID: last.ContractID}
+		if len(seen) == len(contractEventCounts) {
+			break
+		}
+	}
+
+	if len(seen) != len(contractEventCounts) {
+		t.Fatalf("saw %d of this test's own contracts across all pages, want %d (seen: %v)", len(seen), len(contractEventCounts), mineOrder)
+	}
+	for contractID, count := range seen {
+		if count != 1 {
+			t.Errorf("contract %s appeared %d times across pages, want exactly once (order: %v)", contractID, count, mineOrder)
+		}
+	}
+
+	// Order itself must be non-increasing by event_count, and strictly
+	// decreasing by contract_id within a tied event_count run — proving the
+	// tiebreaker, not just eventual completeness, held across page
+	// boundaries. This holds for this test's own contracts regardless of
+	// what unrelated rows were interleaved between them.
+	for i := 1; i < len(mineOrder); i++ {
+		prevCount := contractEventCounts[mineOrder[i-1]]
+		curCount := contractEventCounts[mineOrder[i]]
+		if curCount > prevCount {
+			t.Fatalf("position %d: event_count increased (%s=%d after %s=%d), order not preserved across a page boundary", i, mineOrder[i], curCount, mineOrder[i-1], prevCount)
+		}
+		if curCount == prevCount && mineOrder[i] >= mineOrder[i-1] {
+			t.Fatalf("position %d: tied event_count=%d but contract_id did not strictly decrease (%s then %s)", i, curCount, mineOrder[i-1], mineOrder[i])
+		}
 	}
 }

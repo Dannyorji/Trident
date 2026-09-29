@@ -1,0 +1,146 @@
+## Q1: cursor lookup (WHERE id = $1)
+                                                                                               QUERY PLAN                                                                                               
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Append  (cost=0.00..41366.48 rows=9 width=12) (actual time=0.080..183.718 rows=1 loops=1)
+   Buffers: shared hit=3 read=7500 written=495
+   ->  Seq Scan on soroban_events_p0_1999999 soroban_events_1  (cost=0.00..0.00 rows=1 width=12) (actual time=0.002..0.003 rows=0 loops=1)
+         Filter: (id = '12518558-84aa-4c75-bbae-430542f46f33'::uuid)
+   ->  Seq Scan on soroban_events_p2000000_3999999 soroban_events_2  (cost=0.00..0.00 rows=1 width=12) (actual time=0.001..0.001 rows=0 loops=1)
+         Filter: (id = '12518558-84aa-4c75-bbae-430542f46f33'::uuid)
+   ->  Seq Scan on soroban_events_p4000000_5999999 soroban_events_3  (cost=0.00..0.00 rows=1 width=12) (actual time=0.003..0.003 rows=0 loops=1)
+         Filter: (id = '12518558-84aa-4c75-bbae-430542f46f33'::uuid)
+   ->  Seq Scan on soroban_events_p50000000_51999999 soroban_events_4  (cost=0.00..0.00 rows=1 width=12) (actual time=0.001..0.001 rows=0 loops=1)
+         Filter: (id = '12518558-84aa-4c75-bbae-430542f46f33'::uuid)
+   ->  Seq Scan on soroban_events_p52000000_53999999 soroban_events_5  (cost=0.00..0.00 rows=1 width=12) (actual time=0.001..0.001 rows=0 loops=1)
+         Filter: (id = '12518558-84aa-4c75-bbae-430542f46f33'::uuid)
+   ->  Seq Scan on soroban_events_p54000000_55999999 soroban_events_6  (cost=0.00..0.00 rows=1 width=12) (actual time=0.001..0.001 rows=0 loops=1)
+         Filter: (id = '12518558-84aa-4c75-bbae-430542f46f33'::uuid)
+   ->  Index Scan using soroban_events_p56000000_57999999_pkey on soroban_events_p56000000_57999999 soroban_events_7  (cost=0.43..41366.44 rows=1 width=12) (actual time=0.071..183.691 rows=1 loops=1)
+         Index Cond: (id = '12518558-84aa-4c75-bbae-430542f46f33'::uuid)
+         Buffers: shared hit=3 read=7500 written=495
+   ->  Seq Scan on soroban_events_p58000000_59999999 soroban_events_8  (cost=0.00..0.00 rows=1 width=12) (actual time=0.012..0.012 rows=0 loops=1)
+         Filter: (id = '12518558-84aa-4c75-bbae-430542f46f33'::uuid)
+   ->  Seq Scan on soroban_events_default soroban_events_9  (cost=0.00..0.00 rows=1 width=12) (actual time=0.002..0.002 rows=0 loops=1)
+         Filter: (id = '12518558-84aa-4c75-bbae-430542f46f33'::uuid)
+ Planning:
+   Buffers: shared hit=709
+ Planning Time: 2.308 ms
+ Execution Time: 183.823 ms
+(25 rows)
+
+
+## Q2: list_events (contract_id + ledger range + ORDER BY + LIMIT)
+                                                                                                   QUERY PLAN                                                                                                    
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=59.74..3026.16 rows=50 width=190) (actual time=7.090..11.144 rows=50 loops=1)
+   Buffers: shared hit=5201 read=908
+   ->  Incremental Sort  (cost=59.74..176146.11 rows=2968 width=190) (actual time=7.089..11.139 rows=50 loops=1)
+         Sort Key: soroban_events.ledger_sequence, soroban_events.event_index
+         Presorted Key: soroban_events.ledger_sequence
+         Full-sort Groups: 2  Sort Method: quicksort  Average Memory: 33kB  Peak Memory: 33kB
+         Buffers: shared hit=5201 read=908
+         ->  Index Scan using soroban_events_p56000000_57999999_pkey on soroban_events_p56000000_57999999 soroban_events  (cost=0.43..176012.55 rows=2968 width=190) (actual time=0.063..11.005 rows=51 loops=1)
+               Index Cond: ((ledger_sequence >= 56000000) AND (ledger_sequence <= 56100000))
+               Filter: ((network = 'testnet'::text) AND (contract_id = 'CCONTRACT000042'::text))
+               Rows Removed by Filter: 25001
+               Buffers: shared hit=5192 read=908
+ Planning:
+   Buffers: shared hit=342 read=8
+ Planning Time: 3.252 ms
+ Execution Time: 11.248 ms
+(16 rows)
+
+
+## Q3: get_event (WHERE id = $1 AND network = $2)
+                                                                                               QUERY PLAN                                                                                                
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Append  (cost=0.00..41366.48 rows=9 width=202) (actual time=0.027..101.159 rows=1 loops=1)
+   Buffers: shared hit=4316 read=3187 written=731
+   ->  Seq Scan on soroban_events_p0_1999999 soroban_events_1  (cost=0.00..0.00 rows=1 width=204) (actual time=0.003..0.003 rows=0 loops=1)
+         Filter: ((id = '12518558-84aa-4c75-bbae-430542f46f33'::uuid) AND (network = 'testnet'::text))
+   ->  Seq Scan on soroban_events_p2000000_3999999 soroban_events_2  (cost=0.00..0.00 rows=1 width=204) (actual time=0.001..0.001 rows=0 loops=1)
+         Filter: ((id = '12518558-84aa-4c75-bbae-430542f46f33'::uuid) AND (network = 'testnet'::text))
+   ->  Seq Scan on soroban_events_p4000000_5999999 soroban_events_3  (cost=0.00..0.00 rows=1 width=204) (actual time=0.003..0.003 rows=0 loops=1)
+         Filter: ((id = '12518558-84aa-4c75-bbae-430542f46f33'::uuid) AND (network = 'testnet'::text))
+   ->  Seq Scan on soroban_events_p50000000_51999999 soroban_events_4  (cost=0.00..0.00 rows=1 width=204) (actual time=0.001..0.001 rows=0 loops=1)
+         Filter: ((id = '12518558-84aa-4c75-bbae-430542f46f33'::uuid) AND (network = 'testnet'::text))
+   ->  Seq Scan on soroban_events_p52000000_53999999 soroban_events_5  (cost=0.00..0.00 rows=1 width=204) (actual time=0.001..0.001 rows=0 loops=1)
+         Filter: ((id = '12518558-84aa-4c75-bbae-430542f46f33'::uuid) AND (network = 'testnet'::text))
+   ->  Seq Scan on soroban_events_p54000000_55999999 soroban_events_6  (cost=0.00..0.00 rows=1 width=204) (actual time=0.001..0.001 rows=0 loops=1)
+         Filter: ((id = '12518558-84aa-4c75-bbae-430542f46f33'::uuid) AND (network = 'testnet'::text))
+   ->  Index Scan using soroban_events_p56000000_57999999_pkey on soroban_events_p56000000_57999999 soroban_events_7  (cost=0.43..41366.44 rows=1 width=190) (actual time=0.017..101.127 rows=1 loops=1)
+         Index Cond: (id = '12518558-84aa-4c75-bbae-430542f46f33'::uuid)
+         Filter: (network = 'testnet'::text)
+         Buffers: shared hit=4316 read=3187 written=731
+   ->  Seq Scan on soroban_events_p58000000_59999999 soroban_events_8  (cost=0.00..0.00 rows=1 width=204) (actual time=0.013..0.013 rows=0 loops=1)
+         Filter: ((id = '12518558-84aa-4c75-bbae-430542f46f33'::uuid) AND (network = 'testnet'::text))
+   ->  Seq Scan on soroban_events_default soroban_events_9  (cost=0.00..0.00 rows=1 width=204) (actual time=0.002..0.002 rows=0 loops=1)
+         Filter: ((id = '12518558-84aa-4c75-bbae-430542f46f33'::uuid) AND (network = 'testnet'::text))
+ Planning:
+   Buffers: shared hit=896
+ Planning Time: 25.788 ms
+ Execution Time: 101.250 ms
+(26 rows)
+
+
+## Q4: audit_log total requests
+                                                                                                   QUERY PLAN                                                                                                   
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=1539.42..1539.43 rows=1 width=8) (actual time=34.699..34.699 rows=1 loops=1)
+   Buffers: shared hit=3 read=220 written=137
+   ->  Index Only Scan using idx_audit_log_key_ts on audit_log  (cost=0.42..1475.92 rows=25400 width=0) (actual time=0.091..33.027 rows=24848 loops=1)
+         Index Cond: ((api_key_id = '1c9b47ff-e67c-4183-8946-22f5b7356d55'::uuid) AND (ts >= '2026-01-01 00:00:00+00'::timestamp with time zone) AND (ts < '2026-01-08 00:00:00+00'::timestamp with time zone))
+         Heap Fetches: 0
+         Buffers: shared hit=3 read=220 written=137
+ Planning:
+   Buffers: shared hit=122 read=8
+ Planning Time: 1.619 ms
+ Execution Time: 34.742 ms
+(10 rows)
+
+
+## Q5: audit_log successful requests
+                                                                                                      QUERY PLAN                                                                                                      
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=10548.42..10548.43 rows=1 width=8) (actual time=141.742..141.744 rows=1 loops=1)
+   Buffers: shared hit=4325 read=4222 written=3691
+   ->  Bitmap Heap Scan on audit_log  (cost=1226.15..10506.15 rows=16909 width=0) (actual time=5.417..140.237 rows=16492 loops=1)
+         Recheck Cond: ((api_key_id = '1c9b47ff-e67c-4183-8946-22f5b7356d55'::uuid) AND (ts >= '2026-01-01 00:00:00+00'::timestamp with time zone) AND (ts < '2026-01-08 00:00:00+00'::timestamp with time zone))
+         Filter: (status_code < 400)
+         Rows Removed by Filter: 8356
+         Heap Blocks: exact=8325
+         Buffers: shared hit=4325 read=4222 written=3691
+         ->  Bitmap Index Scan on idx_audit_log_key_ts  (cost=0.00..1221.92 rows=25400 width=0) (actual time=4.357..4.357 rows=24848 loops=1)
+               Index Cond: ((api_key_id = '1c9b47ff-e67c-4183-8946-22f5b7356d55'::uuid) AND (ts >= '2026-01-01 00:00:00+00'::timestamp with time zone) AND (ts < '2026-01-08 00:00:00+00'::timestamp with time zone))
+               Buffers: shared hit=222
+ Planning:
+   Buffers: shared hit=134
+ Planning Time: 0.570 ms
+ Execution Time: 141.824 ms
+(15 rows)
+
+
+## Q6: audit_log by-endpoint breakdown
+                                                                                                         QUERY PLAN                                                                                                         
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=10635.34..10635.35 rows=3 width=28) (actual time=37.555..37.556 rows=3 loops=1)
+   Sort Key: (count(*)) DESC
+   Sort Method: quicksort  Memory: 25kB
+   Buffers: shared hit=8166 read=384
+   ->  HashAggregate  (cost=10635.27..10635.32 rows=3 width=28) (actual time=37.497..37.502 rows=3 loops=1)
+         Group Key: endpoint
+         Batches: 1  Memory Usage: 24kB
+         Buffers: shared hit=8163 read=384
+         ->  Bitmap Heap Scan on audit_log  (cost=1228.27..10444.77 rows=25400 width=16) (actual time=4.602..30.870 rows=24848 loops=1)
+               Recheck Cond: ((api_key_id = '1c9b47ff-e67c-4183-8946-22f5b7356d55'::uuid) AND (ts >= '2026-01-01 00:00:00+00'::timestamp with time zone) AND (ts < '2026-01-08 00:00:00+00'::timestamp with time zone))
+               Heap Blocks: exact=8325
+               Buffers: shared hit=8163 read=384
+               ->  Bitmap Index Scan on idx_audit_log_key_ts  (cost=0.00..1221.92 rows=25400 width=0) (actual time=3.480..3.480 rows=24848 loops=1)
+                     Index Cond: ((api_key_id = '1c9b47ff-e67c-4183-8946-22f5b7356d55'::uuid) AND (ts >= '2026-01-01 00:00:00+00'::timestamp with time zone) AND (ts < '2026-01-08 00:00:00+00'::timestamp with time zone))
+                     Buffers: shared hit=222
+ Planning:
+   Buffers: shared hit=180 read=2
+ Planning Time: 1.768 ms
+ Execution Time: 37.776 ms
+(19 rows)
+

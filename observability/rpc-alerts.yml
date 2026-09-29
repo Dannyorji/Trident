@@ -33,6 +33,7 @@ groups:
             timing-out provider apart from bad request shape
             (invalid_cursor). Check trident_indexer_rpc_active_endpoint for
             whether failover has already kicked in.
+          runbook_url: "docs/runbooks/alerts.md#tridentrpchigherrorrate"
 
       - alert: TridentRPCHighLatency
         expr: |
@@ -50,6 +51,7 @@ groups:
             outright timeouts (trident_indexer_rpc_timeouts_total). Left
             unaddressed this typically turns into ingest lag
             (trident_indexer_ledger_lag).
+          runbook_url: "docs/runbooks/alerts.md#tridentrpchighlatency"
 
       - alert: TridentRPCFailoverActive
         expr: trident_indexer_rpc_active_endpoint > 0
@@ -63,6 +65,7 @@ groups:
             primary) for at least 5 minutes — the primary RPC endpoint has
             not recovered. Check trident_indexer_rpc_failovers_total for how
             often this pool has been flapping between endpoints.
+          runbook_url: "docs/runbooks/alerts.md#tridentrpcfailoveractive"
 
       - alert: TridentRPCRateLimited
         expr: sum(rate(trident_indexer_rpc_errors_total{error_type="rate_limited"}[5m])) > 0
@@ -77,3 +80,36 @@ groups:
             freshness the same way an outage does; consider raising the
             provider's quota or adding a secondary endpoint to the pool
             (issue #213).
+          runbook_url: "docs/runbooks/alerts.md#tridentrpcratelimited"
+
+      - alert: TridentRPCHealthScoreLow
+        expr: trident_rpc_health_score < 50
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "RPC endpoint {{ $labels.endpoint }} health score is degraded ({{ $value }}/100)"
+          description: >-
+            trident_rpc_health_score for {{ $labels.endpoint }} has been
+            below 50 (the midpoint of its 0-100 scale, crates/indexer/src/rpc/health.rs)
+            for 10 minutes — the scorer is penalizing this endpoint faster
+            than it recovers, ahead of the pool actually failing over. Check
+            trident_indexer_rpc_errors_total and
+            trident_indexer_rpc_call_duration_seconds for this endpoint to
+            see which is driving the penalty.
+          runbook_url: "docs/runbooks/alerts.md#tridentrpchealthscorelow"
+
+      - alert: TridentRPCHealthScoreCritical
+        expr: trident_rpc_health_score < 20
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "RPC endpoint {{ $labels.endpoint }} health score is critical ({{ $value }}/100)"
+          description: >-
+            trident_rpc_health_score for {{ $labels.endpoint }} has been
+            below 20 for 5 minutes — near the scorer's floor of 0. If this
+            is the only configured endpoint, ingest is likely already
+            degraded; check trident_indexer_rpc_active_endpoint to confirm
+            whether failover to another endpoint has occurred.
+          runbook_url: "docs/runbooks/alerts.md#tridentrpchealthscorecritical"

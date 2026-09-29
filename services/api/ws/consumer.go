@@ -12,11 +12,17 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const (
-	// streamKey is the Redis Stream written by the Rust indexer.
-	streamKey = "trident:events"
-	groupName = "trident-api"
-)
+// StreamKey is the Redis Stream the indexer publishes events to. Exported
+// so other consumers of the same stream (e.g. middleware.StartCacheInvalidator,
+// issue #221) have one source of truth for the name rather than a second
+// copy of the literal that could drift from this one.
+const StreamKey = "trident:events"
+
+const groupName = "trident-api"
+
+// streamKey is a private alias for StreamKey, kept so this file's many
+// internal references don't all need renaming.
+const streamKey = StreamKey
 
 // streamEntry is the JSON structure expected in each Redis Stream message value.
 type streamEntry struct {
