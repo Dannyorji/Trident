@@ -192,6 +192,83 @@ LIMIT 50;
 
 Expected output should show `Index Scan`, not `Seq Scan` or `Bitmap Heap Scan`.
 
+## Storage Capacity and Disk Growth
+
+Disk is dominated by `soroban_events` and its six indexes. Testnet's synthetic
+traffic is a poor guide: a testnet-scale volume (for example the 100 GiB often
+quoted for a testnet launch) must **not** be reused for mainnet. Use the mainnet
+projection below.
+
+### Mainnet storage capacity and provisioning
+
+**Recommended mainnet provisioning: 512 GiB of database storage** for a 90-day
+event retention at the expected event rate, with a documented path to 1.5 TiB
+for a high-activity deployment (table below). Alert at 80% used.
+
+#### Method
+
+- Stellar closes a ledger about every 5 seconds: ~17,280 ledgers/day.
+- `events/day = events per ledger x 17,280`.
+- **Bytes per stored event: ~1 KiB, heap plus all six indexes.** This is a
+  planning estimate from the schema in `database/schema.sql` (UUID, contract id
+  and transaction hash as text, `topics` and `data` JSONB, two generated topic
+  columns, plus about 24 bytes of tuple header; the indexes add roughly 40-50%
+  on top of the heap). Real payloads vary a lot by contract, so **measure your
+  own figure** (see "Calibrating" below) before committing to a purchase.
+- Provisioned size = stored data x 2, which covers table/index bloat, WAL,
+  vacuum and index-rebuild headroom (`CREATE INDEX CONCURRENTLY` needs space for
+  a second copy of an index), the other tables, and staying under the 80% alert
+  line.
+
+The events-per-ledger scenarios are **planning assumptions, not measured
+mainnet data** — this repository has no mainnet deployment to observe. Replace
+them with your own numbers as soon as you have a week of mainnet ingest.
+
+#### Projection
+
+| Scenario | Events / ledger | Events / day | Growth / day | 30 days | 90 days | 365 days |
+|---|---|---|---|---|---|---|
+| Low | 20 | 0.35 M | 0.33 GiB | 10 GiB | 30 GiB | 120 GiB |
+| **Expected (baseline)** | **100** | **1.73 M** | **1.65 GiB** | **50 GiB** | **148 GiB** | **602 GiB** |
+| High (busy contracts) | 500 | 8.64 M | 8.24 GiB | 247 GiB | 741 GiB | 3.0 TiB |
+
+| Scenario | Retention | Stored data | **Provision (x2)** |
+|---|---|---|---|
+| Low | 90 days | 30 GiB | **100 GiB** |
+| **Expected** | **90 days** | **148 GiB** | **~300 GiB -> provision 512 GiB** (headroom to ~180 days) |
+| High | 90 days | 741 GiB | **1.5 TiB** |
+
+Unbounded retention on the expected scenario reaches ~1.2 TiB of provisioned
+disk after a year, so set `RETENTION_SOROBAN_EVENTS_DAYS` (default `0`, pruning
+disabled — see [`ENVIRONMENT.md`](ENVIRONMENT.md)) on mainnet, or plan disk
+growth. Because `soroban_events` is partitioned by `ledger_sequence`, retention
+is a cheap partition drop rather than a bulk `DELETE`.
+
+Spikes multiply growth: an airdrop or launch can push a single day to the High
+row. See
+[`runbooks/mainnet-event-volume-spike.md`](runbooks/mainnet-event-volume-spike.md).
+Indexing diagnostic events (`INDEX_DIAGNOSTIC=true`) and unfiltered ingest raise
+the per-day figure well past these numbers; restrict with the contract allowlist
+and `INDEX_TOPIC_FILTERS` where you can.
+
+#### Calibrating with real numbers
+
+After a day or more of mainnet ingest, compute the actual figures:
+
+```sql
+-- Bytes per event, heap plus indexes
+SELECT pg_size_pretty(pg_total_relation_size('soroban_events')) AS total,
+       pg_total_relation_size('soroban_events') / NULLIF(count(*), 0) AS bytes_per_event
+FROM soroban_events;
+
+-- Events per ledger and per day
+SELECT count(*)::float / NULLIF(max(ledger_sequence) - min(ledger_sequence) + 1, 0) AS events_per_ledger
+FROM soroban_events;
+```
+
+Then `provision = events_per_ledger x 17,280 x retention_days x bytes_per_event x 2`.
+Prefer the `ledger_sequence` range of the retained window to the whole table
+if you already prune.
 ## Indexer Catch-Up Throughput
 
 How fast the indexer backfills from a cold start determines two things a user
