@@ -580,12 +580,19 @@ jobs:
       # `rust` job and production apply. This validates the migrations as an
       # ordered, idempotent chain and can never silently depend on a stale
       # database/schema.sql mirror (which had drifted from migrations).
+      #
+      # `*.down.sql` rollback files (issue #602) are excluded: this loop applies
+      # the forward chain only, the same set `sqlx migrate run` applies. A
+      # down migration is only ever run deliberately via `sqlx migrate revert`.
       - name: Apply database migrations
         env:
           PGPASSWORD: trident
         run: |
           set -euo pipefail
           for f in database/migrations/*.sql; do
+            case "$f" in
+              *.down.sql) continue ;;
+            esac
             echo "Applying $f"
             psql -v ON_ERROR_STOP=1 -h localhost -U postgres -d trident_test -f "$f"
           done
@@ -1279,6 +1286,15 @@ jobs:
           DATABASE_URL: postgres://postgres:trident@localhost:5432/trident_schema_check
         run: bash scripts/check-schema-drift.sh
 
+      # Applies the full forward chain, then every .down.sql in reverse order,
+      # against the same scratch database (issue #602). Proves each rollback
+      # file is valid SQL that actually runs against a schema carrying every
+      # later migration's objects, not just that it exists per lint rule 5.
+      - name: Check migration rollbacks apply cleanly
+        env:
+          DATABASE_URL: postgres://postgres:trident@localhost:5432/trident_schema_check
+        run: bash scripts/check-migration-rollback.sh
+
   # ---------------------------------------------------------------------------
   # Backup/restore drill (issue #619). Runs the real scripts/backup.sh and
   # scripts/restore.sh against a scratch database on every CI run, rather
@@ -1444,12 +1460,17 @@ jobs:
         with:
           tool: cargo-llvm-cov
 
+      # `*.down.sql` rollback files (issue #602) are excluded: this loop applies
+      # the forward chain only, the same set `sqlx migrate run` applies.
       - name: Apply database migrations
         env:
           PGPASSWORD: trident
         run: |
           set -euo pipefail
           for f in database/migrations/*.sql; do
+            case "$f" in
+              *.down.sql) continue ;;
+            esac
             psql -v ON_ERROR_STOP=1 -h localhost -U postgres -d trident_test -f "$f"
           done
 

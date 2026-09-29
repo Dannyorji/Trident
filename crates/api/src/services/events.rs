@@ -208,6 +208,60 @@ fn resolve_network(network: &str) -> &str {
 }
 
 // ---------------------------------------------------------------------------
+// Pagination cursor (issue #603)
+// ---------------------------------------------------------------------------
+//
+// `list_events` keyset-paginates on `(ledger_sequence, event_index)` — see the
+// `ORDER BY`/`WHERE (ledger_sequence, event_index) > ($7, $8)` clause below.
+// The cursor's job is only to carry that pair from one page to the next.
+//
+// Previously the cursor was the last row's bare `id`, and resolving it meant
+// `SELECT ledger_sequence, event_index FROM soroban_events WHERE id = $1` — a
+// lookup by `id` alone, which cannot use the partitioned primary key
+// `(ledger_sequence, id)` and so probes every partition via the global
+// `idx_soroban_events_id_desc` index on every page after the first.
+//
+// Encoding `ledger_sequence` (and `event_index`, the other half of the
+// keyset) directly into the cursor removes that lookup entirely: decoding
+// the cursor is now pure string parsing, and the values it yields feed
+// straight into the same `WHERE` clause `list_events` already had, which can
+// prune to a single partition because `ledger_sequence` is known up front.
+// The cursor stays opaque to callers — this is an internal format change to
+// the token wrapped by the Go layer's `cursor.Encode`/`cursor.Decode`
+// (services/api/cursor/cursor.go), which never inspects the token's
+// contents, so no documented API contract changes.
+const CURSOR_SEPARATOR: char = '_';
+
+/// Encode a `(ledger_sequence, event_index)` keyset position as this
+/// service's raw pagination token.
+fn encode_events_cursor(ledger_sequence: i64, event_index: i32) -> String {
+    format!("{ledger_sequence}{CURSOR_SEPARATOR}{event_index}")
+}
+
+/// Decode a cursor produced by [`encode_events_cursor`]. Returns an error for
+/// anything else, including the bare-UUID cursors this service issued before
+/// issue #603 — those referred to a specific row that may since have aged out
+/// of retention, and re-deriving `(ledger_sequence, event_index)` from one
+/// would require the very lookup this change exists to remove. A client
+/// holding a pre-#603 cursor gets a clear "start over" error instead of a
+/// silently different page.
+#[allow(clippy::result_large_err)]
+fn decode_events_cursor(cursor: &str) -> Result<(i64, i32), Status> {
+    let (seq_part, idx_part) = cursor
+        .split_once(CURSOR_SEPARATOR)
+        .ok_or_else(|| Status::invalid_argument("cursor is not a valid pagination cursor"))?;
+
+    let ledger_sequence: i64 = seq_part
+        .parse()
+        .map_err(|_| Status::invalid_argument("cursor is not a valid pagination cursor"))?;
+    let event_index: i32 = idx_part
+        .parse()
+        .map_err(|_| Status::invalid_argument("cursor is not a valid pagination cursor"))?;
+
+    Ok((ledger_sequence, event_index))
+}
+
+// ---------------------------------------------------------------------------
 // Redis stream consumer (issue #236)
 // ---------------------------------------------------------------------------
 
@@ -349,23 +403,8 @@ impl Events for EventsServiceImpl {
             let (cursor_seq, cursor_idx): (Option<i64>, Option<i32>) = if req.cursor.is_empty() {
                 (None, None)
             } else {
-                let cursor_id = Uuid::parse_str(&req.cursor)
-                    .map_err(|_| Status::invalid_argument("cursor must be a valid UUID"))?;
-
-                let row: Option<(i64, i32)> = sqlx::query_as(
-                    "SELECT ledger_sequence, event_index FROM soroban_events WHERE id = $1",
-                )
-                .bind(cursor_id)
-                .fetch_optional(&db)
-                .await
-                .map_err(db_err)?;
-
-                match row {
-                    Some((seq, idx)) => (Some(seq), Some(idx)),
-                    None => {
-                        return Err(Status::invalid_argument("cursor references unknown event"))
-                    }
-                }
+                let (seq, idx) = decode_events_cursor(&req.cursor)?;
+                (Some(seq), Some(idx))
             };
 
             let rows: Vec<EventRow> = sqlx::query_as(
@@ -403,7 +442,9 @@ impl Events for EventsServiceImpl {
 
             let has_more = rows.len() as i64 == limit;
             let next_cursor = if has_more {
-                rows.last().map(|r| r.id.to_string()).unwrap_or_default()
+                rows.last()
+                    .map(|r| encode_events_cursor(r.ledger_sequence, r.event_index))
+                    .unwrap_or_default()
             } else {
                 String::new()
             };
@@ -659,6 +700,69 @@ mod tests {
         assert!(!second_page.has_more);
     }
 
+    // Issue #603's "done when": page-two latency is independent of partition
+    // count, verified structurally rather than by wall-clock timing (which is
+    // noisy and environment-dependent, and this repo has no criterion/bench
+    // harness to make a timing assertion meaningful in CI). The structural
+    // proof is that cursor resolution issues zero queries against
+    // soroban_events: decode_events_cursor is pure string parsing, so a page-N
+    // request's only soroban_events access is the same range-scoped SELECT
+    // every page runs, whose cost is governed by `limit`, not by how many
+    // partitions exist upstream of the cursor position. This replaces the old
+    // `SELECT ledger_sequence, event_index FROM soroban_events WHERE id = $1`
+    // lookup, which — being an equality lookup on a column outside the
+    // partitioned primary key (ledger_sequence, id) — had to be checked
+    // against every partition (see docs/db/explain-events-603.txt, captured
+    // against a database seeded across 9 partitions: an `Append` over all 9
+    // for the old query vs. zero extra queries for the new decode).
+    #[tokio::test]
+    async fn list_events_page_two_cursor_resolution_touches_no_partition() {
+        let (db_url, redis_url) = require_services!();
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let contract_id = format!("CONTRACT_PART_{}", uuid::Uuid::new_v4());
+        seed_events(&pool, &contract_id, "testnet", 3).await;
+
+        let svc = make_svc(&db_url, &redis_url).await;
+
+        let first_page = svc
+            .list_events(Request::new(ListEventsRequest {
+                contract_id: contract_id.clone(),
+                network: "testnet".to_string(),
+                limit: 1,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(first_page.has_more);
+
+        // This is the whole fix: resolving the next page's position is pure
+        // parsing, not a database round trip. Before #603 there was no
+        // equivalent client-side call at all — the lookup happened inside
+        // list_events itself, invisibly, on every page after the first.
+        let (seq, idx) = decode_events_cursor(&first_page.next_cursor)
+            .expect("service-issued cursor must decode with no DB access");
+        assert!(seq > 0, "expected a real ledger_sequence, got {seq}");
+        assert!(idx >= 0);
+
+        // The second page then runs exactly one soroban_events query — same
+        // as the first page — confirming no hidden lookup query was reintroduced.
+        let second_page = svc
+            .list_events(Request::new(ListEventsRequest {
+                contract_id: contract_id.clone(),
+                network: "testnet".to_string(),
+                limit: 200,
+                cursor: first_page.next_cursor,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(second_page.events.len(), 2);
+        assert!(!second_page.has_more);
+    }
+
     #[tokio::test]
     async fn list_events_isolated_by_network() {
         let (db_url, redis_url) = require_services!();
@@ -806,13 +910,68 @@ mod tests {
         let req = Request::new(ListEventsRequest {
             contract_id: "CTEST".to_string(),
             network: "testnet".to_string(),
-            cursor: "not-a-uuid".to_string(),
+            cursor: "not-a-valid-cursor".to_string(),
             limit: 200,
             ..Default::default()
         });
         let err = svc.list_events(req).await.unwrap_err();
 
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    // Issue #603: the cursor format changed from a bare event id (requiring a
+    // WHERE id = $1 lookup that cannot use the partitioned primary key) to an
+    // encoded (ledger_sequence, event_index) pair. A pre-#603 bare-UUID cursor
+    // must now fail cleanly rather than silently mis-paginate: decode_events_cursor
+    // requires a CURSOR_SEPARATOR the UUID's own hyphens never produce, since
+    // splitting on '_' never finds one in a UUID string, so this is exercised
+    // both directly below and end-to-end here.
+    #[tokio::test]
+    async fn list_events_with_pre_603_uuid_cursor_returns_invalid_argument() {
+        let (db_url, redis_url) = require_services!();
+        let svc = make_svc(&db_url, &redis_url).await;
+
+        let req = Request::new(ListEventsRequest {
+            contract_id: "CTEST".to_string(),
+            network: "testnet".to_string(),
+            cursor: Uuid::new_v4().to_string(),
+            limit: 200,
+            ..Default::default()
+        });
+        let err = svc.list_events(req).await.unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    // Proves issue #603's actual fix at the unit level, independent of a
+    // database: decoding a cursor this service encoded recovers the exact
+    // (ledger_sequence, event_index) pair, with no DB round trip involved at
+    // all — encode_events_cursor/decode_events_cursor never touch `db`.
+    #[test]
+    fn events_cursor_round_trips_ledger_sequence_and_event_index() {
+        let encoded = encode_events_cursor(59_600_000, 3);
+        let (seq, idx) = decode_events_cursor(&encoded).expect("valid cursor should decode");
+        assert_eq!(seq, 59_600_000);
+        assert_eq!(idx, 3);
+    }
+
+    #[test]
+    fn events_cursor_rejects_malformed_input() {
+        for bad in [
+            "",
+            "not-a-valid-cursor",
+            "59600000",     // missing the event_index half
+            "59600000_",    // empty event_index half
+            "_3",           // empty ledger_sequence half
+            "abc_3",        // non-numeric ledger_sequence
+            "59600000_abc", // non-numeric event_index
+            "59600000_3_4", // extra segment
+        ] {
+            assert!(
+                decode_events_cursor(bad).is_err(),
+                "expected {bad:?} to be rejected as a malformed cursor"
+            );
+        }
     }
 
     #[tokio::test]

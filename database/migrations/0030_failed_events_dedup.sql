@@ -1,5 +1,17 @@
 -- failed_events dedup + pending-uniqueness (issue #508, completing #208).
 --
+-- lint:allow-no-rollback The DELETE below permanently removes every
+--   pending duplicate row except the newest one per (contract_id,
+--   ledger_sequence, event_index): each deleted row's own occurred_at,
+--   error_message and individual attempts count is gone (the survivor's
+--   attempts is overwritten with the summed total, which is a merge, not a
+--   record of the originals). There is no reverse migration that can
+--   recreate rows whose contents were never preserved anywhere. A
+--   .down.sql could still drop uq_failed_events_pending and stop there, but
+--   that would silently misrepresent "rollback" as restoring pre-migration
+--   state when the data loss from the DELETE is unconditional and already
+--   done by the time any revert could run.
+--
 -- 0028 introduced the persist dead-letter queue but every exhausted retry
 -- burst INSERTs a fresh row, so one poison event re-encountered across polls
 -- (an RPC redelivery, a backfill overlap) accumulates duplicates and the
