@@ -65,11 +65,12 @@ services:
       PGBOUNCER_AUTH_QUERY: SELECT usename, passwd FROM pg_shadow WHERE usename=$$1
       PGBOUNCER_POOL_MODE: transaction
       PGBOUNCER_MAX_CLIENT_CONN: 1000
-      # DEFAULT_POOL_SIZE must be >= the sum of every service's per-instance
-      # pool size times its replica count. With the defaults below
-      # (indexer 3 + gRPC API 10 + 3 Go API replicas * 5 = 28) a value of 20
-      # is the per-(user,db) ceiling PgBouncer keeps open to Postgres; raise it
-      # together with Postgres max_connections when scaling out.
+      # DEFAULT_POOL_SIZE is the per-(user,db) ceiling of real connections
+      # PgBouncer keeps open to Postgres. In transaction mode it must cover the
+      # transactions running at the same moment, not the sum of every client
+      # pool (indexer 3 + gRPC API 10 + 3 Go API replicas * 5 = 28 clients is
+      # fine on 20). Re-size it, and Postgres max_connections, when scaling
+      # out: see "Sizing pools as replicas scale" in docs/deployment.md.
       PGBOUNCER_DEFAULT_POOL_SIZE: 20
       PGBOUNCER_MIN_POOL_SIZE: 5
       PGBOUNCER_SERVER_TLS_SSLMODE: prefer
