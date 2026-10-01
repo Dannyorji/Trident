@@ -210,10 +210,27 @@ impl Config {
         // rather than deleting a large swath of history automatically.
         let max_reorg_rewind_depth = parse_bounded_u64("MAX_REORG_REWIND_DEPTH", 50, 1, 100_000);
         let gap_scan_max_per_run = parse_bounded_u64("GAP_SCAN_MAX_PER_RUN", 100, 1, 10_000);
-        let rpc_connect_timeout_ms =
-            parse_bounded_u64("RPC_CONNECT_TIMEOUT_MS", 5_000, 100, 60_000);
-        let rpc_request_timeout_ms =
-            parse_bounded_u64("RPC_REQUEST_TIMEOUT_MS", 30_000, 500, 600_000);
+        // Mainnet RPC providers see materially higher p99 latency than
+        // testnet for large getEvents pages under real contract/event
+        // volume, especially shared-capacity third-party providers — the
+        // testnet-tuned defaults below risk spurious timeouts (and
+        // unnecessary failover) against mainnet. See "Mainnet RPC timeout
+        // tuning" in docs/deployment.md for the measurement methodology
+        // behind these numbers; both remain fully overridable per deployment.
+        let (rpc_connect_timeout_default_ms, rpc_request_timeout_default_ms) =
+            default_rpc_timeouts_ms(&network);
+        let rpc_connect_timeout_ms = parse_bounded_u64(
+            "RPC_CONNECT_TIMEOUT_MS",
+            rpc_connect_timeout_default_ms,
+            100,
+            60_000,
+        );
+        let rpc_request_timeout_ms = parse_bounded_u64(
+            "RPC_REQUEST_TIMEOUT_MS",
+            rpc_request_timeout_default_ms,
+            500,
+            600_000,
+        );
         let rpc_pool_idle_timeout_ms =
             parse_bounded_u64("RPC_POOL_IDLE_TIMEOUT_MS", 90_000, 1_000, 600_000);
         let rpc_pool_max_idle_per_host =
@@ -574,6 +591,27 @@ fn default_network_passphrase(network: &str) -> Result<String, TridentError> {
         other => Err(TridentError::config(anyhow::anyhow!(
             "[indexer] NETWORK={other:?} has no well-known passphrase; set NETWORK_PASSPHRASE explicitly"
         ))),
+    }
+}
+
+/// Environment-aware defaults for `RPC_CONNECT_TIMEOUT_MS` /
+/// `RPC_REQUEST_TIMEOUT_MS`, returned as `(connect_ms, request_ms)`.
+///
+/// The original static defaults (5000ms / 30000ms) were tuned against
+/// testnet latency characteristics and applied identically regardless of
+/// `NETWORK`. Mainnet RPC providers under real contract and event volume —
+/// especially shared-capacity third-party providers — commonly see
+/// materially higher p99 latency for large `getEvents` pages, so those
+/// defaults risk spurious timeouts (misread as provider failures, triggering
+/// unnecessary failover) on mainnet. See "Mainnet RPC timeout tuning" in
+/// `docs/deployment.md` for the measurement methodology and recommended
+/// starting points this derives from; both values stay fully overridable via
+/// `RPC_CONNECT_TIMEOUT_MS` / `RPC_REQUEST_TIMEOUT_MS` regardless of network.
+fn default_rpc_timeouts_ms(network: &str) -> (u64, u64) {
+    if network == "mainnet" {
+        (10_000, 45_000)
+    } else {
+        (5_000, 30_000)
     }
 }
 
@@ -1210,6 +1248,33 @@ mod tests {
             assert_eq!(cfg.rpc_pool_idle_timeout.as_millis(), 90_000);
             assert_eq!(cfg.rpc_pool_max_idle_per_host, 8);
             assert_eq!(cfg.rpc_tcp_keepalive.as_millis(), 60_000);
+        });
+    }
+
+    #[test]
+    fn rpc_timeouts_use_higher_mainnet_defaults() {
+        let mut vars = required_vars();
+        vars.push(("NETWORK", "mainnet"));
+        with_env(&vars, || {
+            for key in ["RPC_CONNECT_TIMEOUT_MS", "RPC_REQUEST_TIMEOUT_MS"] {
+                env::remove_var(key);
+            }
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.rpc_connect_timeout.as_millis(), 10_000);
+            assert_eq!(cfg.rpc_request_timeout.as_millis(), 45_000);
+        });
+    }
+
+    #[test]
+    fn rpc_timeout_mainnet_default_is_still_overridable() {
+        let mut vars = required_vars();
+        vars.push(("NETWORK", "mainnet"));
+        vars.push(("RPC_CONNECT_TIMEOUT_MS", "2000"));
+        vars.push(("RPC_REQUEST_TIMEOUT_MS", "8000"));
+        with_env(&vars, || {
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.rpc_connect_timeout.as_millis(), 2_000);
+            assert_eq!(cfg.rpc_request_timeout.as_millis(), 8_000);
         });
     }
 

@@ -86,8 +86,8 @@ guessing would silently derive wrong SAC contract ids.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `RPC_CONNECT_TIMEOUT_MS` | Optional | `5000` (min `100`, max `60000`) | TCP connect timeout. |
-| `RPC_REQUEST_TIMEOUT_MS` | Optional | `30000` (min `500`, max `600000`) | Overall RPC request timeout; must be >= the connect timeout. |
+| `RPC_CONNECT_TIMEOUT_MS` | Optional | `5000` testnet / `10000` mainnet (min `100`, max `60000`) | TCP connect timeout. Mainnet's higher default accounts for materially higher p99 latency under real contract/event volume; see "Mainnet RPC timeout tuning" in `deployment.md`. |
+| `RPC_REQUEST_TIMEOUT_MS` | Optional | `30000` testnet / `45000` mainnet (min `500`, max `600000`) | Overall RPC request timeout; must be >= the connect timeout. |
 | `RPC_POOL_IDLE_TIMEOUT_MS` | Optional | `90000` (min `1000`, max `600000`) | Idle pooled-connection lifetime. |
 | `RPC_POOL_MAX_IDLE_PER_HOST` | Optional | `8` (min `1`, max `1024`) | Idle keep-alive connections retained per RPC host. |
 | `RPC_TCP_KEEPALIVE_MS` | Optional | `60000` (min `1000`, max `600000`) | TCP keep-alive probe interval. |

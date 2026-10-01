@@ -106,8 +106,8 @@ and consider a second endpoint for failover via `STELLAR_RPC_URLS` (see below).
 | Variable | Description |
 |---|---|
 | `STELLAR_RPC_URLS` | Prioritised, comma-separated RPC endpoints; the first is the primary. Overrides `STELLAR_RPC_URL`, which stays valid as a single-value alias |
-| `RPC_CONNECT_TIMEOUT_MS` | TCP connect timeout for RPC calls (default: `5000`) |
-| `RPC_REQUEST_TIMEOUT_MS` | Overall RPC request timeout; must be >= the connect timeout (default: `30000`) |
+| `RPC_CONNECT_TIMEOUT_MS` | TCP connect timeout for RPC calls (default: `5000` testnet / `10000` mainnet) |
+| `RPC_REQUEST_TIMEOUT_MS` | Overall RPC request timeout; must be >= the connect timeout (default: `30000` testnet / `45000` mainnet) |
 | `RPC_POOL_IDLE_TIMEOUT_MS` | How long an idle pooled connection is kept (default: `90000`) |
 | `RPC_POOL_MAX_IDLE_PER_HOST` | Idle keep-alive connections retained per RPC host (default: `8`) |
 | `RPC_TCP_KEEPALIVE_MS` | TCP keep-alive probe interval (default: `60000`) |
@@ -120,6 +120,47 @@ Without an explicit request timeout a stalled RPC connection blocks a poll
 indefinitely: the retry wrapper only reacts to returned errors, never to a call
 that never returns. Timeouts are classified retryable, so they engage backoff
 and count toward the failover threshold.
+
+#### Mainnet RPC timeout tuning
+
+`RPC_CONNECT_TIMEOUT_MS` / `RPC_REQUEST_TIMEOUT_MS` default higher on mainnet
+(`10000` / `45000`) than on testnet (`5000` / `30000`) when unset — set
+`NETWORK=mainnet` and the indexer picks these up automatically. This exists
+because the original static defaults were tuned against testnet latency and
+applied identically everywhere: mainnet RPC providers under real contract and
+event volume — especially shared-capacity third-party providers — commonly
+see materially higher p99 latency for large `getEvents` pages, and the
+testnet-tuned request timeout risks firing on a merely-slow-but-healthy
+response, which is misread as a provider failure and triggers unnecessary
+failover.
+
+The mainnet defaults above are a conservative starting point, not a
+substitute for measuring your actual provider. Latency varies significantly
+by provider, plan tier, and the page size you configure
+(`MAX_EVENTS_PER_POLL`), so measure before going live:
+
+```bash
+# Time a realistic getEvents call (a recent ledger range, your configured
+# page size) against the exact provider/plan you are deploying against.
+# Run this at least a dozen times and look at the tail (worst case), not the
+# average — p99 is what the timeout has to cover.
+for i in $(seq 1 20); do
+  START_LEDGER=$(curl -s -X POST "$STELLAR_RPC_URL" \
+    -H 'Content-Type: application/json' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"getLatestLedger"}' \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["sequence"] - 1000)')
+  curl -s -o /dev/null -w 'total=%{time_total}s connect=%{time_connect}s\n' \
+    -X POST "$STELLAR_RPC_URL" -H 'Content-Type: application/json' \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getEvents\",\"params\":{\"startLedger\":$START_LEDGER,\"filters\":[],\"pagination\":{\"limit\":200}}}"
+done
+```
+
+Set `RPC_REQUEST_TIMEOUT_MS` to a few multiples of the observed p99
+`time_total` (not the average) so transient tail latency doesn't trip a
+spurious timeout, and `RPC_CONNECT_TIMEOUT_MS` similarly off `time_connect`.
+A real provider outage is still caught: sustained failures past
+`RPC_BREAKER_FAILURE_THRESHOLD` open the circuit breaker regardless of how
+generous the per-call timeout is.
 
 #### Indexer replica count — single-writer by design
 
