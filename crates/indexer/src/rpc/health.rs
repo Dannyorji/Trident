@@ -25,6 +25,15 @@
 //! endpoints have the same score, prefer the one that was most recently
 //! successful (least recently updated in the recovery direction).
 //!
+//! Selection is sticky with hysteresis: the previously selected endpoint keeps
+//! serving until a challenger clears it by more than
+//! [`SWITCH_HYSTERESIS_MARGIN`] points. Under mainnet's much higher call
+//! volume (invocation-metrics and token-metadata fan-out per page) a provider
+//! can accrue or shed a few points on almost every call; without stickiness
+//! that is enough to flip the "best" endpoint request-to-request, defeating
+//! connection-pool reuse and paying a fresh TLS handshake exactly when load
+//! is highest.
+//!
 //! ## Persistence
 //!
 //! Scores are in-process only and reset to 100 on restart. This ensures a
@@ -61,6 +70,15 @@ const DEDUCT_RATE_LIMIT: u8 = 5;
 
 /// Score recovery amount on success.
 const RECOVER_SUCCESS: u8 = 5;
+
+/// Minimum point lead a challenger must hold over the currently selected
+/// endpoint before routing switches to it (issue: endpoint flapping under
+/// mainnet call volume). Set below the smallest "hard failure" deduction
+/// (`DEDUCT_NON_200` = 15) so a genuine failure still fails over immediately,
+/// but above the rate-limit deduction (`DEDUCT_RATE_LIMIT` = 5) and a lone
+/// `DEDUCT_RPC_ERROR` (10) so routine small deltas don't flip the active
+/// endpoint.
+const SWITCH_HYSTERESIS_MARGIN: u8 = 10;
 
 /// Threshold for considering a ledger stale (30 seconds).
 const STALE_LEDGER_THRESHOLD: Duration = Duration::from_secs(30);
@@ -119,6 +137,12 @@ pub struct RpcHealthScorer {
     /// maps above are keyed by URL and so have no stable ordering, which would
     /// otherwise make an all-equal selection depend on hash order.
     priority: Vec<String>,
+    /// Endpoint currently being routed to. Starts at the primary (index 0) so
+    /// the very first selection — before any call has run — is stable rather
+    /// than an unset value that trivially "switches" on the first real
+    /// deduction. Updated only when a challenger clears
+    /// [`SWITCH_HYSTERESIS_MARGIN`].
+    sticky: RwLock<String>,
 }
 
 impl RpcHealthScorer {
@@ -140,10 +164,14 @@ impl RpcHealthScorer {
             scores.insert(url.clone(), INITIAL_SCORE);
         }
 
+        // Safe to index: `urls` was already checked non-empty above.
+        let sticky = RwLock::new(urls[0].clone());
+
         Ok(Self {
             endpoints: RwLock::new(endpoints),
             scores: RwLock::new(scores),
             priority: urls,
+            sticky,
         })
     }
 
@@ -299,7 +327,22 @@ impl RpcHealthScorer {
             }
         }
 
-        best_url.expect("at least one endpoint").clone()
+        let best_url = best_url.expect("at least one endpoint");
+
+        // Hysteresis (endpoint flapping under mainnet call volume): only move
+        // off the currently active endpoint when the challenger's score beats
+        // it by more than the margin. A score that just ticks up and down by
+        // a few points per call must not flip the active endpoint
+        // request-to-request, since every switch pays a fresh connection
+        // instead of reusing the pooled one.
+        let mut sticky = self.sticky.write().expect("sticky lock poisoned");
+        if *sticky != *best_url {
+            let current_score = scores.get(sticky.as_str()).copied().unwrap_or(INITIAL_SCORE);
+            if best_score > current_score.saturating_add(SWITCH_HYSTERESIS_MARGIN) {
+                *sticky = best_url.clone();
+            }
+        }
+        sticky.clone()
     }
 
     /// Get the current score for a specific endpoint.
@@ -549,6 +592,34 @@ mod tests {
         s.record_connection_refused("https://backup1.example"); // 40
 
         assert_eq!(s.select_best_endpoint(), "https://backup2.example");
+    }
+
+    #[test]
+    fn hysteresis_keeps_endpoint_sticky_under_small_flapping_deltas() {
+        let s = scorer();
+        // A provider whose score moves by a few points per call (e.g. an
+        // occasional rate limit followed by recovery) must not flip the
+        // active endpoint on every call — exactly the mainnet call-volume
+        // flapping this guards against.
+        for _ in 0..10 {
+            s.record_rate_limited("https://primary.example");
+            assert_eq!(
+                s.select_best_endpoint(),
+                "https://primary.example",
+                "a small per-call score delta must not switch the active endpoint"
+            );
+            s.record_success("https://primary.example", None);
+            assert_eq!(s.select_best_endpoint(), "https://primary.example");
+        }
+    }
+
+    #[test]
+    fn hysteresis_still_fails_over_once_the_margin_is_cleared() {
+        let s = scorer();
+        // A single hard failure (-15, well past the 10-point margin) must
+        // still fail over immediately rather than being held sticky forever.
+        s.record_non_200("https://primary.example");
+        assert_eq!(s.select_best_endpoint(), "https://backup.example");
     }
 
     #[test]
