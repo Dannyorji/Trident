@@ -32,7 +32,7 @@ use crate::{
     config::Config,
     db, metrics,
     parser::Parser,
-    poll::{AdaptivePoll, AdaptivePollConfig},
+    poll::{apply_degraded_backoff, AdaptivePoll, AdaptivePollConfig},
     rpc::{filters::build_event_filters, retry_strategy, FilterPlan, RpcClient, RpcHttpSettings},
     token_metadata,
 };
@@ -521,6 +521,20 @@ impl Streamer {
             // poll fast while behind, back off once caught up (issue #198).
             let lag = self.last_chain_tip.saturating_sub(cursor);
             let interval = self.adaptive_poll.next_interval(lag);
+
+            // Lag alone says nothing about RPC health: a fully degraded
+            // endpoint set must not keep being hammered at the same request
+            // rate that likely caused the degradation. Widening here (rather
+            // than only surfacing `all_degraded` for alerting, as before)
+            // measurably reduces call volume against a degraded provider set.
+            let all_degraded = self.rpc.health_scorer().all_degraded();
+            let interval = apply_degraded_backoff(interval, all_degraded);
+            if all_degraded {
+                tracing::warn!(
+                    interval_ms = interval.as_millis() as u64,
+                    "All configured RPC endpoints critically degraded; widening poll interval"
+                );
+            }
             metrics::set_effective_poll_interval(interval.as_millis() as u64);
 
             // Stamp the heartbeat after every cycle — even failed ones — so the

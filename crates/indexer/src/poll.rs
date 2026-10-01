@@ -5,8 +5,36 @@
 //! `lag >= high_watermark` at the floor, and interpolates linearly in between.
 //! A hysteresis deadband suppresses interval changes for small lag jitter so
 //! the interval does not oscillate around a threshold.
+//!
+//! [`apply_degraded_backoff`] layers a second, independent signal on top: RPC
+//! endpoint health. Lag alone says nothing about whether every configured RPC
+//! endpoint is critically degraded — without this, a degraded-but-not-fully-down
+//! provider set keeps getting hammered at the same request rate that likely
+//! caused the degradation in the first place (plausibly provider-side rate
+//! limiting).
 
 use std::time::Duration;
+
+/// Multiplier applied to the adaptive interval when every configured RPC
+/// endpoint is critically degraded (`RpcHealthScorer::all_degraded`).
+/// Deliberately a flat multiplier rather than a separate set of
+/// floor/ceiling/watermark knobs — degradation is binary (all endpoints
+/// critically unhealthy, or not), so a single widening factor on top of
+/// whatever the lag-based interval already is keeps this simple to reason
+/// about and to tune.
+const ALL_DEGRADED_BACKOFF_MULTIPLIER: u32 = 4;
+
+/// Widen `interval` when every configured RPC endpoint is critically
+/// degraded, so a degraded provider set is polled at a measurably reduced
+/// rate instead of the same cadence as full health. A no-op when
+/// `all_degraded` is `false`.
+pub fn apply_degraded_backoff(interval: Duration, all_degraded: bool) -> Duration {
+    if all_degraded {
+        interval.saturating_mul(ALL_DEGRADED_BACKOFF_MULTIPLIER)
+    } else {
+        interval
+    }
+}
 
 /// Bounds and watermarks controlling the lag → interval mapping.
 #[derive(Debug, Clone, Copy)]
@@ -159,6 +187,34 @@ mod tests {
         let moved = ap.next_interval(80);
         assert_ne!(moved, first);
         assert!(moved < first, "more lag -> shorter interval");
+    }
+
+    #[test]
+    fn degraded_backoff_is_a_noop_when_healthy() {
+        assert_eq!(
+            apply_degraded_backoff(Duration::from_millis(250), false),
+            Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn degraded_backoff_widens_interval_when_all_degraded() {
+        let widened = apply_degraded_backoff(Duration::from_millis(250), true);
+        assert!(
+            widened > Duration::from_millis(250),
+            "a fully degraded endpoint set must poll slower than full health"
+        );
+        assert_eq!(widened, Duration::from_millis(1000));
+    }
+
+    #[test]
+    fn degraded_backoff_applies_on_top_of_whatever_interval_lag_already_chose() {
+        // The widening is independent of where in the floor/ceiling range the
+        // lag-based interval landed.
+        let at_floor = apply_degraded_backoff(Duration::from_millis(250), true);
+        let at_ceiling = apply_degraded_backoff(Duration::from_millis(5000), true);
+        assert_eq!(at_floor, Duration::from_millis(1000));
+        assert_eq!(at_ceiling, Duration::from_millis(20_000));
     }
 
     #[test]
