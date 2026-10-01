@@ -41,7 +41,8 @@ Open `.env` and set every value below. Do not leave defaults in production.
 | `REDIS_URL` | Redis connection string, e.g. `redis://redis:6379` |
 | `STELLAR_RPC_URL` | Soroban RPC endpoint for the chosen `NETWORK` — `https://soroban-testnet.stellar.org` for testnet; for mainnet a provider or self-hosted endpoint, see [Testnet vs. mainnet configuration](#testnet-vs-mainnet-configuration) |
 | `NETWORK` | One of `mainnet`, `testnet`, or `futurenet`; must match `STELLAR_RPC_URL` |
-| `POLL_INTERVAL_MS` | Ledger poll interval in milliseconds (default: `5000`) |
+| `POLL_INTERVAL_FLOOR_MS` | Shortest adaptive poll interval (ms), used while far behind the chain tip (default: `250`) |
+| `POLL_INTERVAL_CEILING_MS` | Longest adaptive poll interval (ms), used once caught up (default: `5000`) |
 | `INDEX_DIAGNOSTIC` | Set `false` in production (diagnostic events are high-volume) |
 | `LOG_LEVEL` | One of `error`, `warn`, `info`, `debug`, `trace` (use `info` in production) |
 | `PORT` | API listen port (default: `3000`) |

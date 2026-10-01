@@ -94,7 +94,6 @@ services:
       REDIS_URL: ${REDIS_URL}
       STELLAR_RPC_URL: ${STELLAR_RPC_URL}
       NETWORK: ${NETWORK}
-      POLL_INTERVAL_MS: ${POLL_INTERVAL_MS}
       INDEX_DIAGNOSTIC: ${INDEX_DIAGNOSTIC}
       # Rows per batched INSERT when a page is committed (statement size only —
       # the page is always one transaction).

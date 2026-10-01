@@ -127,7 +127,7 @@ indexer after changing environment variables.
    `GET /v1/ready` reports `indexer_lag`; tell downstream consumers the data
    window is delayed rather than incorrect.
 
-Do **not** raise `POLL_INTERVAL_MS`/ceiling, add API replicas, or tighten API
+Do **not** raise `POLL_INTERVAL_CEILING_MS`, add API replicas, or tighten API
 rate limits — none of them affect ingest, and API replicas add database
 connections that compete with the indexer.
 

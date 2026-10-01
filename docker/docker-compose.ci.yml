@@ -107,7 +107,7 @@ services:
     restart: "no"
 
   # ---------------------------------------------------------------------------
-  # Rust indexer — bypass PgBouncer, lower poll interval for faster startup.
+  # Rust indexer — bypass PgBouncer for faster startup.
   # ---------------------------------------------------------------------------
   indexer:
     restart: "no"
@@ -116,7 +116,6 @@ services:
       REDIS_URL: ${REDIS_URL}
       STELLAR_RPC_URL: ${STELLAR_RPC_URL}
       NETWORK: ${NETWORK:-testnet}
-      POLL_INTERVAL_MS: ${POLL_INTERVAL_MS:-5000}
       INDEX_DIAGNOSTIC: ${INDEX_DIAGNOSTIC:-false}
       METRICS_PORT: ${METRICS_PORT:-9090}
       LOG_LEVEL: ${LOG_LEVEL:-info}

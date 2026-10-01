@@ -21,7 +21,7 @@ services:
     environment:
       STELLAR_RPC_URL: http://host.docker.internal:8000/rpc
       # Poll aggressively so a just-invoked event is indexed within the E2E
-      # job's bounded wait instead of the production 5s default.
-      POLL_INTERVAL_MS: 500
+      # job's bounded wait instead of the production 5s ceiling.
+      POLL_INTERVAL_CEILING_MS: "500"
     extra_hosts:
       - "host.docker.internal:host-gateway"

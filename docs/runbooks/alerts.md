@@ -55,8 +55,9 @@ just slow.
 poll-loop iteration regardless of outcome — hasn't advanced in over 5
 minutes.
 
-**Why this threshold:** the heartbeat ticks once per loop iteration
-(typically every `POLL_INTERVAL_MS`, default 1s, capped at 60s). 5 minutes is
+**Why this threshold:** the heartbeat ticks once per loop iteration (the
+adaptive interval between `POLL_INTERVAL_FLOOR_MS`, default 250ms, and
+`POLL_INTERVAL_CEILING_MS`, default 5s, capped at 60s). 5 minutes is
 a large multiple of even the slowest configured poll interval, so staleness
 past that point means the loop itself is hung — deadlocked, panicked past a
 supervisor's catch, or blocked on I/O that will never return — not just
@@ -597,8 +598,9 @@ than provider down) that requires a different mitigation (raise quota vs fail
 over).
 
 **First steps:**
-1. Check the indexer's configured poll interval (`POLL_INTERVAL_MS`) — if
-   it's very aggressive (e.g., <1s), consider backing off slightly.
+1. Check the indexer's configured poll interval bounds
+   (`POLL_INTERVAL_FLOOR_MS`) — if the floor is very aggressive (e.g., <1s),
+   consider raising it slightly.
 2. Check `trident_indexer_rpc_call_duration_seconds_count` to estimate
    request rate — are we exceeding the provider's documented limits?
 3. Check the RPC provider's dashboard/billing page to see current quota usage
