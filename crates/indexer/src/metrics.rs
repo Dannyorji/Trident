@@ -88,6 +88,10 @@ pub const RECONCILE_DISCREPANT_LEDGERS: &str = "trident_indexer_reconcile_discre
 pub const RECONCILE_WINDOW_END_LEDGER: &str = "trident_indexer_reconcile_window_end_ledger";
 pub const OUTBOX_PUBLISHED_TOTAL: &str = "trident_indexer_outbox_published_total";
 pub const OUTBOX_PUBLISH_FAILURES_TOTAL: &str = "trident_indexer_outbox_publish_failures_total";
+/// Outbox rows the relay could not decode and dead-lettered instead of
+/// publishing (issue #739). Distinct from publish failures: a decode failure
+/// never reaches Redis, so retrying cannot help.
+pub const OUTBOX_UNDECODABLE_TOTAL: &str = "trident_indexer_outbox_undecodable_total";
 /// RPC call latency in seconds, labelled by `method` (e.g. `getEvents`) and
 /// `endpoint` (the pool index serving the call, `0` = primary). Covers every
 /// call regardless of outcome, so `_count` doubles as a per-method,
@@ -262,6 +266,10 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         "Outbox publish attempts that failed (issue #200)"
     );
     describe_counter!(
+        OUTBOX_UNDECODABLE_TOTAL,
+        "Outbox rows dead-lettered because their payload could not be decoded (issue #739)"
+    );
+    describe_counter!(
         UNEXPECTED_SCVAL_VARIANT_TOTAL,
         "ScVal variants decoded from event payloads where they should never appear (issue #506)"
     );
@@ -354,6 +362,7 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     counter!(RPC_FAILOVERS_TOTAL).increment(0);
     counter!(OUTBOX_PUBLISHED_TOTAL).increment(0);
     counter!(OUTBOX_PUBLISH_FAILURES_TOTAL).increment(0);
+    counter!(OUTBOX_UNDECODABLE_TOTAL).increment(0);
     counter!(LEDGER_GAPS_DETECTED_TOTAL).increment(0);
     counter!(LEDGER_GAPS_CLOSED_TOTAL).increment(0);
     counter!(UNEXPECTED_SCVAL_VARIANT_TOTAL).increment(0);
@@ -604,6 +613,13 @@ pub fn record_outbox_published() {
 /// Count a failed relay publish attempt (issue #200).
 pub fn record_outbox_publish_failure() {
     counter!(OUTBOX_PUBLISH_FAILURES_TOTAL).increment(1);
+}
+
+/// Count an outbox row the relay dead-lettered because its stored payload
+/// could not be decoded (issue #739). Nothing was published, so this is not a
+/// publish failure: the failure is permanent for that row.
+pub fn record_outbox_undecodable() {
+    counter!(OUTBOX_UNDECODABLE_TOTAL).increment(1);
 }
 
 /// Record one RPC call's latency, labelled by method and the endpoint pool

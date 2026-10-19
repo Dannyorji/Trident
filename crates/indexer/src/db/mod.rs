@@ -623,6 +623,68 @@ pub async fn upsert_contract_spec(
     Ok(())
 }
 
+/// One persisted contract spec, as the spec-sync seed reads it (issue #726).
+pub struct PersistedContractSpec {
+    pub contract_id: String,
+    pub code_hash: String,
+    /// Parsed functions, or `None` when the stored JSON cannot be parsed
+    /// (corrupt row). The code hash is still handed back in that case so a
+    /// redeploy stays detectable, while the missing functions make the next
+    /// pass re-fetch the WASM and rewrite the row.
+    pub functions: Option<Vec<crate::spec::SpecFunction>>,
+}
+
+/// Load every persisted contract spec for `network`, used to seed the
+/// spec-sync cache at startup (issue #726).
+///
+/// `known_code_hashes` used to live only in memory, so after a restart — or a
+/// downtime window in which a contract was redeployed — the first post-restart
+/// observation looked like the first ever for that contract, and stale token
+/// metadata was never invalidated. Seeding from `contract_specs` makes the
+/// first pass after a restart behave like a continuous run: any code hash
+/// mismatch against an existing row is detected and refreshes it.
+///
+/// The functions are cached by code hash, which is content-addressed, so an
+/// old row's functions remain valid for that hash; comparing hashes is what
+/// detects a redeploy.
+pub async fn load_contract_specs(
+    pool: &PgPool,
+    network: &str,
+) -> Result<Vec<PersistedContractSpec>, TridentError> {
+    let rows: Vec<(String, String, serde_json::Value)> = sqlx::query_as(
+        "SELECT contract_id, code_hash, functions FROM contract_specs WHERE network = $1",
+    )
+    .bind(network)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("load_contract_specs")))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(contract_id, code_hash, functions)| {
+            let functions =
+                match serde_json::from_value::<Vec<crate::spec::SpecFunction>>(functions) {
+                    Ok(functions) => Some(functions),
+                    Err(e) => {
+                        tracing::warn!(
+                            contract_id = %contract_id,
+                            code_hash,
+                            error = %e,
+                            "Stored contract spec functions unreadable; the next spec sync will \
+                             re-fetch this contract's WASM and rewrite the row"
+                        );
+                        None
+                    }
+                };
+            PersistedContractSpec {
+                contract_id,
+                code_hash,
+                functions,
+            }
+        })
+        .collect())
+}
+
 /// Latest persisted value for a single contract-storage key, if any (issue
 /// #270). Used to detect whether a freshly observed value has changed before
 /// writing a new snapshot row.

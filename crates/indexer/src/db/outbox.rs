@@ -40,7 +40,8 @@ impl OutboxRecord {
 /// Fetch the oldest unpublished rows in insertion order.
 ///
 /// `limit` bounds the batch so the relay can never monopolise the database or
-/// starve the poll loop.
+/// starve the poll loop. Dead-lettered rows are excluded: they are retained for
+/// audit, not retried (issue #739).
 pub async fn fetch_unpublished(
     pool: &PgPool,
     limit: i64,
@@ -49,7 +50,7 @@ pub async fn fetch_unpublished(
         r#"
         SELECT seq, event_id, payload
         FROM event_outbox
-        WHERE published = FALSE
+        WHERE published = FALSE AND dead_lettered_at IS NULL
         ORDER BY seq
         LIMIT $1
         "#,
@@ -94,13 +95,42 @@ pub async fn mark_published(pool: &PgPool, seqs: &[i64]) -> Result<(), TridentEr
     Ok(())
 }
 
+/// Mark an undecodable row as dead-lettered (issue #739).
+///
+/// The row is deliberately *not* marked published: nothing reached the Redis
+/// stream. `dead_lettered_at` is what removes it from [`fetch_unpublished`] and
+/// [`backlog`] so it cannot block the queue forever, while
+/// `dead_letter_reason` keeps the decode error for audit. The predicates make
+/// this idempotent and stop it from resurrecting a row that was published
+/// between fetch and update.
+pub async fn mark_dead_lettered(pool: &PgPool, seq: i64, reason: &str) -> Result<(), TridentError> {
+    sqlx::query(
+        r#"
+        UPDATE event_outbox
+        SET dead_lettered_at = NOW(), dead_letter_reason = $2
+        WHERE seq = $1 AND published = FALSE AND dead_lettered_at IS NULL
+        "#,
+    )
+    .bind(seq)
+    .bind(reason)
+    .execute(pool)
+    .await
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("mark_dead_lettered")))?;
+
+    Ok(())
+}
+
 /// Number of rows still awaiting publication. Exposed as a gauge so an
-/// unbounded backlog (a stuck relay, a down Redis) is alertable.
+/// unbounded backlog (a stuck relay, a down Redis) is alertable. Dead-lettered
+/// rows are excluded — they will never be published (issue #739).
 pub async fn backlog(pool: &PgPool) -> Result<i64, TridentError> {
-    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM event_outbox WHERE published = FALSE")
-        .fetch_one(pool)
-        .await
-        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("outbox backlog")))?;
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM event_outbox \
+         WHERE published = FALSE AND dead_lettered_at IS NULL",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("outbox backlog")))?;
 
     Ok(row.0)
 }

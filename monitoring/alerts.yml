@@ -655,6 +655,28 @@ groups:
             signal, firing before the backlog itself crosses a threshold.
           runbook_url: "docs/runbooks/alerts.md#tridentoutboxpublishfailureshigh"
 
+      - alert: TridentOutboxUndecodablePayloads
+        expr: |
+          increase(trident_indexer_outbox_undecodable_total[1h]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: "Trident indexer dead-lettered {{ $value | humanize }} undecodable outbox row(s) in the last hour"
+          description: >
+            trident_indexer_outbox_undecodable_total increased in the last
+            hour. The relay found a stored outbox payload it could not decode
+            (issue #739). Such a row can never be published, so it was
+            dead-lettered instead of being marked published: it is excluded
+            from the backlog gauge and retained in event_outbox for audit.
+            Subscribers never received that event. Check the relay's
+            "Undecodable outbox payload, dead-lettering" log line and the
+            row's dead_letter_reason; a cluster of these points at a producer
+            writing a payload shape the relay's SorobanEvent schema no longer
+            accepts.
+          runbook_url: "docs/runbooks/alerts.md#tridentoutboxundecodablepayloads"
+
       - alert: TridentDeadLetteredEventsHigh
         expr: |
           increase(trident_indexer_dead_lettered_total[1h]) > 0
