@@ -1308,7 +1308,10 @@ mod tests {
 
 /// Checks if the newest events partition is within `days_threshold` of its end bound.
 /// Returns true if an alert condition is triggered.
-pub async fn check_partition_bounds(pool: &sqlx::PgPool, days_threshold: i32) -> Result<bool, sqlx::Error> {
+pub async fn check_partition_bounds(
+    pool: &sqlx::PgPool,
+    days_threshold: i32,
+) -> Result<bool, sqlx::Error> {
     let row: (bool,) = sqlx::query_as(
         r#"
         SELECT EXISTS (
