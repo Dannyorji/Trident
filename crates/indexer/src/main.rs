@@ -3,13 +3,13 @@ use std::net::SocketAddr;
 use clap::{Parser, Subcommand};
 use opentelemetry_otlp::WithExportConfig;
 use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
 use std::time::Duration;
+use tokio::time;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
-use tokio::time;
-use sqlx::PgPool;
 
 mod alerting;
 mod config;
@@ -22,6 +22,7 @@ mod reconcile;
 mod redis_stream;
 mod rpc;
 mod spec;
+mod spec_sync;
 mod storage;
 mod streamer;
 /// Scheduled testnet ingest-correctness suite (issue #419). Test-only; compiled
@@ -479,6 +480,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             batch_size: cfg.outbox_batch_size,
             backlog_alert_threshold: cfg.outbox_backlog_alert_threshold,
             stream_maxlen: cfg.redis_stream_maxlen,
+            network: cfg.network.clone(),
         },
     );
     let relay_shutdown = shutdown.clone();

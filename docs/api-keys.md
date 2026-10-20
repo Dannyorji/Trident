@@ -80,6 +80,19 @@ To rotate an existing API key or revoke a compromised key without downtime:
 
 ---
 
+## Key Expiry (database-backed keys)
+
+`POST /v1/api-keys`, `POST /v1/api-keys/{id}/rotate` and
+`PATCH /v1/api-keys/{id}` accept an optional `expires_at` (RFC 3339, must be
+in the future; `null` on PATCH clears it). A key past `expires_at` is
+rejected on REST, WebSocket and GraphQL with `401` and error code
+`API_KEY_EXPIRED`. The auth cache TTL is capped at the time remaining, and a
+PATCH evicts the cached entry, so an expiry takes effect within the cache TTL
+at most. If the key lookup fails for infrastructure reasons the API returns
+`503 UNAVAILABLE` with `Retry-After` instead of `401`.
+
+---
+
 ## Phase 1 vs Phase 2 Architecture
 
 - **Phase 1 (Environment Variables)**: Static single or multi-key authentication via `API_KEY` / `API_KEY_HASHES` environment variables. Ideal for standalone or single-tenant deployments.

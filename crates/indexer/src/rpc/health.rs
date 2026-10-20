@@ -436,7 +436,10 @@ impl RpcHealthScorer {
         // instead of reusing the pooled one.
         let mut sticky = self.sticky.write().expect("sticky lock poisoned");
         if *sticky != *best_url {
-            let current_score = scores.get(sticky.as_str()).copied().unwrap_or(INITIAL_SCORE);
+            let current_score = scores
+                .get(sticky.as_str())
+                .copied()
+                .unwrap_or(INITIAL_SCORE);
             if best_score > current_score.saturating_add(SWITCH_HYSTERESIS_MARGIN) {
                 *sticky = best_url.clone();
             }

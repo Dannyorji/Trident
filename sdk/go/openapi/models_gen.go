@@ -62,18 +62,20 @@ type OpenAPIModels struct {
 }
 
 type APIKeyResponse struct {
-	CreatedAt                                  time.Time  `json:"created_at"`
-	CreatedBy                                  *string    `json:"created_by,omitempty"`
-	ID                                         string     `json:"id"`
-	// Raw key, returned only at creation time.           
-	Key                                        *string    `json:"key,omitempty"`
-	KeyPrefix                                  string     `json:"key_prefix"`
-	Label                                      string     `json:"label"`
-	LastUsedAt                                 time.Time  `json:"last_used_at"`
-	Network                                    Network    `json:"network"`
-	RateLimitTier                              string     `json:"rate_limit_tier"`
-	RequestCount                               int64      `json:"request_count"`
-	RevokedAt                                  *time.Time `json:"revoked_at,omitempty"`
+	CreatedAt                                                                  time.Time  `json:"created_at"`
+	CreatedBy                                                                  *string    `json:"created_by,omitempty"`
+	// When the key stops authenticating. Omitted for a key that never expires.           
+	ExpiresAt                                                                  *time.Time `json:"expires_at,omitempty"`
+	ID                                                                         string     `json:"id"`
+	// Raw key, returned only at creation time.                                           
+	Key                                                                        *string    `json:"key,omitempty"`
+	KeyPrefix                                                                  string     `json:"key_prefix"`
+	Label                                                                      string     `json:"label"`
+	LastUsedAt                                                                 time.Time  `json:"last_used_at"`
+	Network                                                                    Network    `json:"network"`
+	RateLimitTier                                                              string     `json:"rate_limit_tier"`
+	RequestCount                                                               int64      `json:"request_count"`
+	RevokedAt                                                                  *time.Time `json:"revoked_at,omitempty"`
 }
 
 type AdminKeyUsageResponse struct {
@@ -507,6 +509,7 @@ const (
 type Code string
 
 const (
+	APIKeyExpired   Code = "API_KEY_EXPIRED"
 	Conflict        Code = "CONFLICT"
 	Forbidden       Code = "FORBIDDEN"
 	Internal        Code = "INTERNAL"

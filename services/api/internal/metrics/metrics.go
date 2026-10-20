@@ -97,6 +97,30 @@ var (
 		Help: "Total requests allowed because a rate-limit backend check failed, by limiter.",
 	}, []string{"limiter"}) // limiter: per_key
 
+	// APIKeyUsageDroppedTotal counts usage updates dropped because the
+	// tracker channel was full (issue #753). request_count/last_used_at back
+	// GET /v1/usage, so any non-zero rate is under-counted billing data.
+	APIKeyUsageDroppedTotal = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "trident_api_key_usage_dropped_total",
+		Help: "Total API-key usage updates dropped because the tracker channel was full.",
+	})
+
+	// APIKeyUsageFlushFailuresTotal counts failed batched usage UPDATEs
+	// (issue #753). The pending counts are kept and retried on the next tick.
+	APIKeyUsageFlushFailuresTotal = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "trident_api_key_usage_flush_failures_total",
+		Help: "Total failed batched API-key usage flushes (counts are retained and retried).",
+	})
+
+	// AuthKeyLookupFailuresTotal counts API-key lookups that did not
+	// authenticate, by outcome (issue #751): not_found is a bad credential
+	// (401), unavailable is an infrastructure failure (503), expired is a
+	// key past expires_at (issue #752).
+	AuthKeyLookupFailuresTotal = promauto.With(Registry).NewCounterVec(prometheus.CounterOpts{
+		Name: "trident_auth_key_lookup_failures_total",
+		Help: "Total API-key lookups that failed to authenticate, by outcome.",
+	}, []string{"outcome"}) // outcome: not_found | unavailable | expired
+
 	// PanicsRecoveredTotal counts handler-chain panics caught by
 	// middleware.Recover (issue #610) — otherwise an invisible failure mode:
 	// the client sees a dropped connection, nothing is logged, nothing is

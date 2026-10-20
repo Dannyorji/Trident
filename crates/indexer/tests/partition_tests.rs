@@ -21,5 +21,8 @@ async fn test_partition_boundary_continuity(pool: PgPool) {
     .execute(&pool)
     .await;
 
-    assert!(insert_res.is_ok(), "inserts across partition boundaries must succeed");
+    assert!(
+        insert_res.is_ok(),
+        "inserts across partition boundaries must succeed"
+    );
 }

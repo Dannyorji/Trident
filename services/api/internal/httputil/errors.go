@@ -13,8 +13,12 @@ import (
 type ErrorCode string
 
 const (
-	NOT_FOUND        ErrorCode = "NOT_FOUND"
-	UNAUTHORIZED     ErrorCode = "UNAUTHORIZED"
+	NOT_FOUND    ErrorCode = "NOT_FOUND"
+	UNAUTHORIZED ErrorCode = "UNAUTHORIZED"
+	// API_KEY_EXPIRED is returned (401) when a key is past its expires_at
+	// (issue #752), so clients can tell it apart from an unknown or revoked
+	// key and rotate rather than retry.
+	API_KEY_EXPIRED  ErrorCode = "API_KEY_EXPIRED"
 	RATE_LIMITED     ErrorCode = "RATE_LIMITED"
 	INVALID_ARGUMENT ErrorCode = "INVALID_ARGUMENT"
 	UNAVAILABLE      ErrorCode = "UNAVAILABLE"

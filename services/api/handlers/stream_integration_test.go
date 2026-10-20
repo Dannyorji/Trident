@@ -168,6 +168,7 @@ func publishStreamEvent(t *testing.T, rdb *redis.Client, contractID, topic0, dat
 		Stream: "trident:events",
 		Values: map[string]any{
 			"contract_id":      contractID,
+			"network":          "testnet",
 			"ledger_sequence":  "42",
 			"ledger_timestamp": "2026-06-25T00:00:00Z",
 			"transaction_hash": "txhash",

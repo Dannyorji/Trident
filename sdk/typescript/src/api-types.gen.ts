@@ -360,7 +360,7 @@ export interface paths {
         head?: never;
         /**
          * Update an API key
-         * @description Update an API key's label and/or rate-limit tier (admin only). At least one of the two fields must be present. A tier change takes effect immediately — the shared tier cache is invalidated on success. Only active (non-revoked) keys can be updated.
+         * @description Update an API key's label, rate-limit tier and/or expiry (admin only). At least one field must be present. A tier change takes effect immediately — the shared tier cache is invalidated on success. Only active (non-revoked) keys can be updated.
          */
         patch: operations["updateApiKey"];
         trace?: never;
@@ -1033,6 +1033,11 @@ export interface components {
             request_count: number;
             /** Format: date-time */
             revoked_at?: string | null;
+            /**
+             * Format: date-time
+             * @description When the key stops authenticating. Omitted for a key that never expires.
+             */
+            expires_at?: string;
             /** Format: date-time */
             created_at: string;
         };
@@ -1233,7 +1238,7 @@ export interface components {
                  * @description Machine-readable error code. Matches httputil.ErrorCode exactly (services/api/internal/httputil/errors.go).
                  * @enum {string}
                  */
-                code: "NOT_FOUND" | "UNAUTHORIZED" | "RATE_LIMITED" | "INVALID_ARGUMENT" | "UNAVAILABLE" | "INTERNAL" | "PAYLOAD_TOO_LARGE" | "FORBIDDEN" | "CONFLICT";
+                code: "NOT_FOUND" | "UNAUTHORIZED" | "API_KEY_EXPIRED" | "RATE_LIMITED" | "INVALID_ARGUMENT" | "UNAVAILABLE" | "INTERNAL" | "PAYLOAD_TOO_LARGE" | "FORBIDDEN" | "CONFLICT";
                 /** @description Human-readable error message */
                 message: string;
                 /** @description Request ID for debugging */
@@ -1878,6 +1883,11 @@ export interface operations {
                      * @enum {string}
                      */
                     rate_limit_tier?: "free" | "standard" | "premium" | "internal";
+                    /**
+                     * Format: date-time
+                     * @description When the key stops authenticating (RFC 3339, must be in the future). Omit for a key that never expires. Requests with an expired key are rejected with 401 API_KEY_EXPIRED.
+                     */
+                    expires_at?: string | null;
                 };
             };
         };
@@ -1908,7 +1918,17 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody?: {
+            content: {
+                "application/json": {
+                    /**
+                     * Format: date-time
+                     * @description Expiry for the replacement key (RFC 3339, must be in the future). Omit for no expiry.
+                     */
+                    expires_at?: string;
+                };
+            };
+        };
         responses: {
             /** @description Replacement key created */
             201: {
@@ -1987,6 +2007,11 @@ export interface operations {
                     label?: string;
                     /** @description New rate-limit tier name */
                     rate_limit_tier?: string;
+                    /**
+                     * Format: date-time
+                     * @description New expiry (RFC 3339, must be in the future), or null to clear it. Omit to leave unchanged. Takes effect immediately - the key is evicted from the auth cache.
+                     */
+                    expires_at?: string | null;
                 };
             };
         };

@@ -6,15 +6,20 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/Depo-dev/trident/services/api/cursor"
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
+	"github.com/Depo-dev/trident/services/api/internal/metrics"
 	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/Depo-dev/trident/services/api/validation"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
@@ -58,7 +63,10 @@ type APIKeyResponse struct {
 	LastUsedAt    *string `json:"last_used_at"`
 	RequestCount  int64   `json:"request_count"`
 	RevokedAt     *string `json:"revoked_at,omitempty"`
-	CreatedAt     string  `json:"created_at"`
+	// ExpiresAt is when the key stops authenticating (issue #752); omitted
+	// for a key that never expires.
+	ExpiresAt *string `json:"expires_at,omitempty"`
+	CreatedAt string  `json:"created_at"`
 }
 
 // ListAPIKeysResponse is the response envelope for GET /v1/api-keys (issue
@@ -71,15 +79,73 @@ type ListAPIKeysResponse struct {
 }
 
 type createKeyRequest struct {
-	Label         string `json:"label"`
-	Network       string `json:"network"`
-	RateLimitTier string `json:"rate_limit_tier"`
-	CreatedBy     string `json:"created_by"`
+	Label         string         `json:"label"`
+	Network       string         `json:"network"`
+	RateLimitTier string         `json:"rate_limit_tier"`
+	CreatedBy     string         `json:"created_by"`
+	ExpiresAt     optionalExpiry `json:"expires_at"`
 }
 
 type updateKeyRequest struct {
-	Label         *string `json:"label"`
-	RateLimitTier *string `json:"rate_limit_tier"`
+	Label         *string        `json:"label"`
+	RateLimitTier *string        `json:"rate_limit_tier"`
+	ExpiresAt     optionalExpiry `json:"expires_at"`
+}
+
+type rotateKeyRequest struct {
+	ExpiresAt optionalExpiry `json:"expires_at"`
+}
+
+var errInvalidExpiry = errors.New("expires_at must be a future RFC 3339 timestamp or null")
+
+// optionalExpiry is an expires_at request field that distinguishes "absent"
+// (Set=false, leave unchanged) from an explicit null (Set=true, Value=nil,
+// clear the expiry) from a timestamp (Set=true, Value non-nil). A timestamp
+// must be in the future (issue #752).
+type optionalExpiry struct {
+	Set   bool
+	Value *time.Time
+}
+
+func (o *optionalExpiry) UnmarshalJSON(b []byte) error {
+	o.Set = true
+	if string(b) == "null" {
+		o.Value = nil
+		return nil
+	}
+	var raw string
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return errInvalidExpiry
+	}
+	t, err := time.Parse(time.RFC3339, raw)
+	if err != nil || !t.After(time.Now()) {
+		return errInvalidExpiry
+	}
+	t = t.UTC()
+	o.Value = &t
+	return nil
+}
+
+func formatExpiry(t *time.Time) *string {
+	if t == nil {
+		return nil
+	}
+	s := t.UTC().Format(time.RFC3339)
+	return &s
+}
+
+// writeBodyDecodeError reports a request-body decode failure with the right
+// status and message.
+func writeBodyDecodeError(w http.ResponseWriter, r *http.Request, err error) {
+	if middleware.IsBodyTooLarge(err) {
+		middleware.WriteBodyTooLarge(w, r)
+		return
+	}
+	msg := "invalid JSON body"
+	if errors.Is(err, errInvalidExpiry) {
+		msg = errInvalidExpiry.Error()
+	}
+	httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, msg)
 }
 
 // requireAdmin checks admin key and DB availability, writing an appropriate
@@ -112,11 +178,7 @@ func CreateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 
 		var req createKeyRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			if middleware.IsBodyTooLarge(err) {
-				middleware.WriteBodyTooLarge(w, r)
-				return
-			}
-			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "invalid JSON body")
+			writeBodyDecodeError(w, r, err)
 			return
 		}
 		network, verr := validation.ValidateNetwork("network", req.Network, "mainnet")
@@ -149,10 +211,10 @@ func CreateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 		var id string
 		var createdAt time.Time
 		err := cfg.DB.QueryRow(ctx,
-			`INSERT INTO api_keys (key_hash, key_prefix, label, network, rate_limit_tier, created_by)
-			 VALUES ($1, $2, $3, $4, $5, $6)
+			`INSERT INTO api_keys (key_hash, key_prefix, label, network, rate_limit_tier, created_by, expires_at)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7)
 			 RETURNING id, created_at`,
-			hash, prefix, req.Label, req.Network, req.RateLimitTier, createdBy,
+			hash, prefix, req.Label, req.Network, req.RateLimitTier, createdBy, req.ExpiresAt.Value,
 		).Scan(&id, &createdAt)
 		if err != nil {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to create api key")
@@ -169,6 +231,7 @@ func CreateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 			RateLimitTier: req.RateLimitTier,
 			CreatedBy:     createdBy,
 			CreatedAt:     ts,
+			ExpiresAt:     formatExpiry(req.ExpiresAt.Value),
 		})
 	}
 }
@@ -225,7 +288,7 @@ func ListAPIKeys(cfg APIKeyConfig) http.HandlerFunc {
 		// has_more is known without a separate COUNT query.
 		rows, err := cfg.DB.Query(ctx,
 			`SELECT id, key_prefix, label, network, rate_limit_tier, created_by,
-			        last_used_at, request_count, revoked_at, created_at
+			        last_used_at, request_count, revoked_at, created_at, expires_at
 			 FROM api_keys
 			 WHERE ($1::timestamptz IS NULL OR (created_at, id) < ($1::timestamptz, $2::uuid))
 			 ORDER BY created_at DESC, id DESC
@@ -245,15 +308,16 @@ func ListAPIKeys(cfg APIKeyConfig) http.HandlerFunc {
 		fetched := make([]row, 0, limit+1)
 		for rows.Next() {
 			var k APIKeyResponse
-			var lastUsedAt, revokedAt *time.Time
+			var lastUsedAt, revokedAt, expiresAt *time.Time
 			var createdAt time.Time
 			if err := rows.Scan(&k.ID, &k.KeyPrefix, &k.Label, &k.Network,
 				&k.RateLimitTier, &k.CreatedBy, &lastUsedAt, &k.RequestCount,
-				&revokedAt, &createdAt); err != nil {
+				&revokedAt, &createdAt, &expiresAt); err != nil {
 				httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "scan error")
 				return
 			}
 			k.CreatedAt = createdAt.UTC().Format(time.RFC3339)
+			k.ExpiresAt = formatExpiry(expiresAt)
 			if lastUsedAt != nil {
 				s := lastUsedAt.UTC().Format(time.RFC3339)
 				k.LastUsedAt = &s
@@ -296,7 +360,8 @@ func ListAPIKeys(cfg APIKeyConfig) http.HandlerFunc {
 
 // UpdateAPIKey handles PATCH /v1/api-keys/{id} (admin-only).
 //
-// Allows updating the label or rate_limit_tier of an active key.
+// Allows updating the label, rate_limit_tier or expires_at of an active key.
+// expires_at: null clears the expiry; omitting it leaves it unchanged.
 func UpdateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !requireAdmin(cfg, w, r) {
@@ -313,15 +378,11 @@ func UpdateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 
 		var req updateKeyRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			if middleware.IsBodyTooLarge(err) {
-				middleware.WriteBodyTooLarge(w, r)
-				return
-			}
-			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "invalid JSON body")
+			writeBodyDecodeError(w, r, err)
 			return
 		}
-		if req.Label == nil && req.RateLimitTier == nil {
-			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "at least one of label or rate_limit_tier is required")
+		if req.Label == nil && req.RateLimitTier == nil && !req.ExpiresAt.Set {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, "at least one of label, rate_limit_tier or expires_at is required")
 			return
 		}
 
@@ -329,19 +390,20 @@ func UpdateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 		defer cancel()
 
 		var k APIKeyResponse
-		var lastUsedAt *time.Time
+		var lastUsedAt, expiresAt *time.Time
 		var createdAt time.Time
 		var keyHash string
 		err := cfg.DB.QueryRow(ctx,
 			`UPDATE api_keys
 			 SET label           = COALESCE($2, label),
-			     rate_limit_tier = COALESCE($3, rate_limit_tier)
+			     rate_limit_tier = COALESCE($3, rate_limit_tier),
+			     expires_at      = CASE WHEN $4::boolean THEN $5::timestamptz ELSE expires_at END
 			 WHERE id = $1 AND revoked_at IS NULL
 			 RETURNING id, key_prefix, label, network, rate_limit_tier,
-			           last_used_at, request_count, created_at, key_hash`,
-			id, req.Label, req.RateLimitTier,
+			           last_used_at, request_count, created_at, key_hash, expires_at`,
+			id, req.Label, req.RateLimitTier, req.ExpiresAt.Set, req.ExpiresAt.Value,
 		).Scan(&k.ID, &k.KeyPrefix, &k.Label, &k.Network, &k.RateLimitTier,
-			&lastUsedAt, &k.RequestCount, &createdAt, &keyHash)
+			&lastUsedAt, &k.RequestCount, &createdAt, &keyHash, &expiresAt)
 		if err == pgx.ErrNoRows {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusNotFound, httputil.NOT_FOUND, "api key not found")
 			return
@@ -357,7 +419,14 @@ func UpdateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 			cfg.InvalidateTier(keyHash)
 		}
 
+		// An expiry change must evict the cached auth entry: it was cached
+		// with a TTL derived from the old expires_at (issue #752).
+		if req.ExpiresAt.Set && cfg.Redis != nil {
+			cfg.Redis.Del(r.Context(), fmt.Sprintf("apiauth:%s", keyHash))
+		}
+
 		k.CreatedAt = createdAt.UTC().Format(time.RFC3339)
+		k.ExpiresAt = formatExpiry(expiresAt)
 		if lastUsedAt != nil {
 			s := lastUsedAt.UTC().Format(time.RFC3339)
 			k.LastUsedAt = &s
@@ -380,6 +449,13 @@ func RotateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 		id := r.PathValue("id")
 		if verr := validation.ValidateUUID("id", id); verr != nil {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusBadRequest, httputil.INVALID_ARGUMENT, verr.Message)
+			return
+		}
+
+		// The body is optional: it only carries expires_at for the new key.
+		var req rotateKeyRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			writeBodyDecodeError(w, r, err)
 			return
 		}
 
@@ -418,10 +494,10 @@ func RotateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 		var resp APIKeyResponse
 		var createdAt time.Time
 		err = cfg.DB.QueryRow(ctx,
-			`INSERT INTO api_keys (key_hash, key_prefix, label, network, rate_limit_tier, created_by)
-			 VALUES ($1, $2, $3, $4, $5, $6)
+			`INSERT INTO api_keys (key_hash, key_prefix, label, network, rate_limit_tier, created_by, expires_at)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7)
 			 RETURNING id, key_prefix, label, network, rate_limit_tier, created_by, request_count, created_at`,
-			keyHash, keyPrefix, newLabel, oldNetwork, oldTier, oldCreatedBy,
+			keyHash, keyPrefix, newLabel, oldNetwork, oldTier, oldCreatedBy, req.ExpiresAt.Value,
 		).Scan(&resp.ID, &resp.KeyPrefix, &resp.Label, &resp.Network, &resp.RateLimitTier, &resp.CreatedBy, &resp.RequestCount, &createdAt)
 		if err != nil {
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusInternalServerError, httputil.INTERNAL, "failed to store rotated api key")
@@ -430,6 +506,7 @@ func RotateAPIKey(cfg APIKeyConfig) http.HandlerFunc {
 
 		resp.Key = &plainKey
 		resp.CreatedAt = createdAt.UTC().Format(time.RFC3339)
+		resp.ExpiresAt = formatExpiry(req.ExpiresAt.Value)
 		writeJSON(w, http.StatusCreated, resp)
 	}
 }
@@ -488,12 +565,24 @@ func sha256hex(s string) string {
 	return fmt.Sprintf("%x", h)
 }
 
+// usageExecer is the slice of *pgxpool.Pool the usage tracker needs.
+type usageExecer interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
 // NewAPIKeyUsageTracker returns a channel-based background aggregator for
 // issue #139. The caller should send a key UUID on the channel after every
 // successful auth. The aggregator batches pending updates and flushes them to
 // postgres every flushInterval (typically 5s). Call stop() on shutdown to
 // drain the channel before exit.
+//
+// A failed flush keeps the pending counts and retries them on the next tick
+// (issue #753); each failure is logged and counted.
 func NewAPIKeyUsageTracker(db *pgxpool.Pool, flushInterval time.Duration) (track chan<- string, stop func()) {
+	return newUsageTracker(db, flushInterval)
+}
+
+func newUsageTracker(db usageExecer, flushInterval time.Duration) (track chan<- string, stop func()) {
 	ch := make(chan string, 4096)
 
 	go func() {
@@ -522,8 +611,9 @@ func NewAPIKeyUsageTracker(db *pgxpool.Pool, flushInterval time.Duration) (track
 				 WHERE k.id = u.id`,
 				ids, counts,
 			); err != nil {
-				// Log but don't crash — usage tracking is non-critical.
-				_ = err
+				metrics.APIKeyUsageFlushFailuresTotal.Inc()
+				slog.Error("api key usage flush failed; will retry", "keys", len(ids), "error", err)
+				return
 			}
 			pending = map[string]int64{}
 		}

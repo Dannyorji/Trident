@@ -133,6 +133,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
     last_used_at     TIMESTAMPTZ,
     request_count    BIGINT      NOT NULL DEFAULT 0,
     revoked_at       TIMESTAMPTZ,                    -- NULL means active; set to revoke
+    expires_at       TIMESTAMPTZ,                    -- NULL means never expires (migration 0037)
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -216,7 +217,9 @@ CREATE TABLE IF NOT EXISTS event_outbox (
     payload      JSONB       NOT NULL,
     published    BOOLEAN     NOT NULL DEFAULT FALSE,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    published_at TIMESTAMPTZ
+    published_at TIMESTAMPTZ,
+    dead_lettered_at   TIMESTAMPTZ,
+    dead_letter_reason TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_event_outbox_unpublished

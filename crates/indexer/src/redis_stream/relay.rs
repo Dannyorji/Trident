@@ -9,6 +9,11 @@
 //! ordering is preserved and nothing is lost. The next pass resumes at the
 //! failed row. That makes delivery at-least-once — consumers dedupe by event
 //! id (see `db::outbox`).
+//!
+//! The one exception is a payload that cannot be decoded: no retry can fix it,
+//! so instead of blocking the queue forever the row is dead-lettered (issue
+//! #739). It stays `published = FALSE` — nothing reached Redis — and is
+//! excluded from the backlog once marked.
 
 use std::time::Duration;
 
@@ -31,6 +36,8 @@ pub struct RelayConfig {
     pub backlog_alert_threshold: i64,
     /// Redis stream trim length, mirrors the direct-publish path.
     pub stream_maxlen: u64,
+    /// Network written on every stream entry (issue #741).
+    pub network: String,
 }
 
 pub struct OutboxRelay {
@@ -123,15 +130,25 @@ impl OutboxRelay {
             let event = match record.event() {
                 Ok(event) => event,
                 Err(e) => {
-                    // A payload we cannot decode will never publish. Mark it so
-                    // it stops blocking the queue; the row is retained for audit.
+                    // A payload we cannot decode will never publish. Dead-letter
+                    // it so it stops blocking the queue without pretending it
+                    // reached Redis; the row is retained for audit (issue #739).
                     tracing::error!(
                         seq = record.seq,
                         event_id = %record.event_id,
                         error = %e,
-                        "Undecodable outbox payload, skipping"
+                        "Undecodable outbox payload, dead-lettering"
                     );
-                    published_seqs.push(record.seq);
+                    if let Err(mark_err) =
+                        outbox::mark_dead_lettered(&self.db, record.seq, &e.to_string()).await
+                    {
+                        // Could not record the dead letter: stop the batch so the
+                        // next pass retries it, but still mark what was already
+                        // delivered (as with a publish failure).
+                        failure = Some(mark_err);
+                        break;
+                    }
+                    metrics::record_outbox_undecodable();
                     continue;
                 }
             };
@@ -150,6 +167,7 @@ impl OutboxRelay {
                 &event,
                 stream_maxlen,
                 Some(&record.event_id.to_string()),
+                &self.config.network,
             )
             .await
             {

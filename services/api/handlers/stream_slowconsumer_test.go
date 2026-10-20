@@ -64,6 +64,7 @@ func (r *slowConsumerRedis) XRead(ctx context.Context, a *redis.XReadArgs) *redi
 					ID: "1-1",
 					Values: map[string]interface{}{
 						"contract_id": r.contractID,
+						"network":     "testnet",
 						"topics":      `["transfer"]`,
 						"padding":     string(big),
 					},
