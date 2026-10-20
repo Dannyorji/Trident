@@ -231,9 +231,11 @@ func newDB() (*sql.DB, error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	// database/sql dials lazily and re-dials after failures, so an unreachable
+	// database at boot is only a warning: the webhook handlers and worker keep
+	// working once Postgres comes back, without a restart.
 	if err := db.PingContext(ctx); err != nil {
-		_ = db.Close()
-		return nil, err
+		slog.Warn("webhook database not reachable at startup; will connect when it becomes available", "err", redactConnErr(err))
 	}
 	return db, nil
 }

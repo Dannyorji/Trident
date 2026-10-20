@@ -161,7 +161,9 @@ func main() {
 		p, err := newDBPool(ctx, dsn, dbPoolSizeFromEnv())
 		cancel()
 		if err != nil {
-			slog.Warn("could not connect to database; DB-backed endpoints will return 503", "err", redactConnErr(err))
+			// Only a malformed DSN lands here; an unreachable server does not,
+			// because the pool is created lazily (see newDBPool).
+			slog.Warn("invalid database configuration; DB-backed endpoints will return 503", "err", redactConnErr(err))
 		} else {
 			pool = p
 			defer pool.Close()
@@ -468,6 +470,12 @@ func buildPoolConfig(dsn string, poolSize int32) (*pgxpool.Config, error) {
 	return cfg, nil
 }
 
+// newDBPool builds the pool without requiring Postgres to be reachable.
+// pgxpool dials on demand and re-dials after failures, so a database that is
+// down or failing over at boot recovers on its own once it is back — the pod
+// does not have to be restarted, and every DB-backed component stays wired.
+// While the database is unreachable, requests fail (and /v1/ready reports it)
+// rather than the components being disabled for the life of the process.
 func newDBPool(ctx context.Context, dsn string, poolSize int32) (*pgxpool.Pool, error) {
 	cfg, err := buildPoolConfig(dsn, poolSize)
 	if err != nil {
@@ -478,8 +486,7 @@ func newDBPool(ctx context.Context, dsn string, poolSize int32) (*pgxpool.Pool, 
 		return nil, err
 	}
 	if err := pool.Ping(ctx); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("ping database: %w", err)
+		slog.Warn("database not reachable at startup; will connect when it becomes available", "err", redactConnErr(err))
 	}
 	return pool, nil
 }
