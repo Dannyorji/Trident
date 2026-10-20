@@ -1074,6 +1074,7 @@ impl Streamer {
                         // transient DB hiccup does not lose the audit record
                         // (issue #414).
                         let db = self.db.clone();
+                        let network = self.config.network.clone();
                         let payload = raw_payload.clone();
                         let errmsg = e.to_string();
                         let dead_letter_strategy = ExponentialBackoff::from_millis(100)
@@ -1081,11 +1082,17 @@ impl Streamer {
                             .take(3);
                         if let Err(db_err) = Retry::start(dead_letter_strategy, || {
                             let db = db.clone();
+                            let network = network.clone();
                             let payload = payload.clone();
                             let errmsg = errmsg.clone();
                             async move {
                                 db::insert_parse_error(
-                                    &db, ledger_seq, event_idx, &payload, &errmsg,
+                                    &db,
+                                    &network,
+                                    ledger_seq,
+                                    event_idx,
+                                    &payload,
+                                    &errmsg,
                                 )
                                 .await
                             }
@@ -1115,7 +1122,7 @@ impl Streamer {
             // operator replay (which shrinks the queue out-of-band) is
             // reflected without restarting the indexer. Best-effort: the
             // gauge is observability, not control flow.
-            if let Ok(depth) = db::count_pending_failed_events(&self.db).await {
+            if let Ok(depth) = db::count_pending_failed_events(&self.db, &self.config.network).await {
                 metrics::set_persist_dead_letter_backlog(depth);
             }
 
@@ -1712,14 +1719,14 @@ async fn commit_page_with_fallback(
                 attempts,
                 "Event failed to persist after per-event retries; dead-lettering"
             );
-            match db::insert_failed_event(db, event, &e.to_string(), attempts).await {
+            match db::insert_failed_event(db, network, event, &e.to_string(), attempts).await {
                 Ok(()) => {
                     // The PERSIST counter, not the parse one: these answer
                     // different operational questions (issue #508), and the
                     // backlog gauge refreshes immediately so the alert sees
                     // the new row without waiting for the next active cycle.
                     metrics::record_persist_dead_lettered();
-                    if let Ok(depth) = db::count_pending_failed_events(db).await {
+                    if let Ok(depth) = db::count_pending_failed_events(db, network).await {
                         metrics::set_persist_dead_letter_backlog(depth);
                     }
                 }
