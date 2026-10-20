@@ -1,0 +1,19 @@
+name: Set up Go
+description: Go toolchain pinned to the 1.25 line used by the Dockerfiles and go.mod files.
+
+inputs:
+  cache-dependency-path:
+    description: go.sum used as the module cache key.
+    default: services/api/go.sum
+  go-version:
+    description: Go version.
+    default: "1.25"
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Go
+      uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491 # v5.0.0
+      with:
+        go-version: ${{ inputs.go-version }}
+        cache-dependency-path: ${{ inputs.cache-dependency-path }}

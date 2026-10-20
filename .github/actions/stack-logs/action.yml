@@ -1,0 +1,35 @@
+name: Dump compose stack state
+description: Prints container status and recent logs for the CI Docker Compose stack (run on failure).
+
+inputs:
+  compose-files:
+    description: Space-separated compose files, relative to the repo root.
+    default: docker/docker-compose.yml docker/docker-compose.ci.yml
+  profile:
+    description: Optional compose profile to include (e.g. pgbouncer).
+    default: ""
+  services:
+    description: Services whose logs to print.
+    default: postgres redis grpc-api indexer api
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        COMPOSE_FILES: ${{ inputs.compose-files }}
+        PROFILE: ${{ inputs.profile }}
+        SERVICES: ${{ inputs.services }}
+      run: |
+        args=()
+        for f in $COMPOSE_FILES; do args+=(-f "$f"); done
+        args+=(--env-file .env.ci)
+        if [ -n "$PROFILE" ]; then args+=(--profile "$PROFILE"); fi
+        echo "::group::container status"
+        docker compose "${args[@]}" ps -a
+        echo "::endgroup::"
+        for svc in $SERVICES; do
+          echo "::group::${svc} logs"
+          docker compose "${args[@]}" logs --tail=120 "$svc" || true
+          echo "::endgroup::"
+        done

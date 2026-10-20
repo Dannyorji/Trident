@@ -1,0 +1,38 @@
+name: Wait for the Go API
+description: >-
+  Polls GET /v1/health until it returns 200. curl's own --retry gives up
+  immediately on exit 56 (connection accepted, then reset), which is exactly
+  the race docker's port forward produces just before the API binds its port,
+  so an explicit loop retries on any failure instead.
+
+inputs:
+  url:
+    description: Health URL.
+    default: http://localhost:3000/v1/health
+  attempts:
+    description: Number of attempts.
+    default: "40"
+  interval:
+    description: Seconds between attempts.
+    default: "3"
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        URL: ${{ inputs.url }}
+        ATTEMPTS: ${{ inputs.attempts }}
+        INTERVAL: ${{ inputs.interval }}
+      run: |
+        echo "Waiting for $URL to return 200..."
+        for attempt in $(seq 1 "$ATTEMPTS"); do
+          if curl --silent --fail --max-time 10 "$URL"; then
+            echo ""
+            echo "$URL returned 200 OK (attempt $attempt)"
+            exit 0
+          fi
+          sleep "$INTERVAL"
+        done
+        echo "::error::$URL did not return 200 within $((ATTEMPTS * INTERVAL))s"
+        exit 1

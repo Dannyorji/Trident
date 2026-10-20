@@ -1,0 +1,57 @@
+name: Build image
+description: >-
+  Builds one Trident image with Buildx and a per-image gha cache scope. Used by
+  integration.yml (build once, shared as artifacts), deploy.yml (staging push)
+  and release.yml (multi-arch release push).
+
+inputs:
+  file:
+    description: Dockerfile path (repo root is the build context).
+    required: true
+  tags:
+    description: Image tag(s), one per line.
+    required: true
+  scope:
+    description: gha cache scope. One scope per image so caches do not overwrite each other.
+    required: true
+  platforms:
+    description: Target platforms.
+    default: linux/amd64
+  push:
+    description: Push to a registry ("true"/"false").
+    default: "false"
+  load:
+    description: Load into the local Docker daemon ("true"/"false").
+    default: "false"
+  outputs:
+    description: Buildx --output value (e.g. type=docker,dest=/tmp/image.tar).
+    default: ""
+  build-args:
+    description: Build args, one per line.
+    default: ""
+
+outputs:
+  digest:
+    description: Image digest (when pushed).
+    value: ${{ steps.build.outputs.digest }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@2b51285047da1547ffb1b2203d8be4c0af6b1f20 # v3.2.0
+
+    - name: Build
+      id: build
+      uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
+      with:
+        context: .
+        file: ${{ inputs.file }}
+        platforms: ${{ inputs.platforms }}
+        push: ${{ inputs.push }}
+        load: ${{ inputs.load }}
+        outputs: ${{ inputs.outputs }}
+        tags: ${{ inputs.tags }}
+        build-args: ${{ inputs.build-args }}
+        cache-from: type=gha,scope=${{ inputs.scope }}
+        cache-to: type=gha,mode=max,scope=${{ inputs.scope }}

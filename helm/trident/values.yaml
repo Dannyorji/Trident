@@ -80,7 +80,7 @@ migrations:
     # templates/*.yaml, which fall back to .Chart.AppVersion). A self-hoster
     # deploying this chart with no overrides gets the version-pinned image
     # that ships with this chart release, not a floating tag that silently
-    # moves and defeats `helm rollback` (issue #622). staging-deploy.yml
+    # moves and defeats `helm rollback` (issue #622). deploy.yml
     # already overrides this with --set for the CI/CD path; this default is
     # what an unattended `helm install` with no overrides resolves to.
     tag: ""

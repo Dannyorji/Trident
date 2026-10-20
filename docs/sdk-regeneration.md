@@ -120,6 +120,6 @@ document.
 ## Publishing
 
 Actual publication (npm, PyPI, crates.io, pkg.go.dev, Go module proxy) is
-handled by `.github/workflows/publish-sdk.yml` and
+handled by `.github/workflows/release.yml` and
 `.github/workflows/release.yml` — this document covers regenerating and
 testing locally, not the release pipeline itself.

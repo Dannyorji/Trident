@@ -124,7 +124,7 @@ Key implications:
 | 9 | Response-side injection / clickjacking / MIME sniffing | Standard security headers (`X-Content-Type-Options`, `X-Frame-Options`, HSTS in production, `Referrer-Policy`) | `services/api/middleware/security.go` |
 | 10 | No audit trail for sensitive operations | Async, batched audit log writer capturing admin/API-key operations | `services/api/middleware/audit.go` |
 | 11 | Known-vulnerable dependencies shipping in a release | SBOM generation + image scanning (trivy) and dependency audits (`cargo audit`, `govulncheck`, `npm audit`, `pip-audit`) gating CI on push/PR to `dev`/`main` plus a weekly cron | `.github/workflows/security-scan.yml`, `docs/security-triage.md` (#311) |
-| 12 | Leaked secrets in commits/history | Dedicated secrets-scanning workflow | `.github/workflows/secrets-scan.yml` |
+| 12 | Leaked secrets in commits/history | Dedicated secrets-scanning workflow | `.github/workflows/security.yml` |
 | 13 | Connection-string credentials leaking into logs on a DB/Redis error | DSN userinfo redaction applied to logged connection errors | `services/api/main.go` (`redactConnErr`, issue #305) |
 | 14 | Malicious or compromised Soroban RPC endpoint feeding fabricated event data | RPC failover across configured endpoints (`RPC_FAILOVER_THRESHOLD`), defensive parsing of RPC responses; cross-endpoint response validation is not yet implemented (see "Open gaps" below) | `crates/indexer` |
 | 15 | SSRF via a registered webhook target URL | Not yet enforced at the application layer — see "Open gaps" | `services/api/webhooks.go` |

@@ -85,6 +85,9 @@ services:
   # together for smoke tests.
   # ---------------------------------------------------------------------------
   grpc-api:
+    # The :ci tags are what integration.yml's build-images job produces and
+    # shares as artifacts; the E2E jobs load them and run `up --no-build`.
+    image: trident-grpc-api:ci
     build:
       context: ..
       dockerfile: crates/api/Dockerfile
@@ -110,6 +113,7 @@ services:
   # Rust indexer — bypass PgBouncer for faster startup.
   # ---------------------------------------------------------------------------
   indexer:
+    image: trident-indexer:ci
     restart: "no"
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
@@ -138,6 +142,7 @@ services:
   # Go REST API — bypass PgBouncer, point gRPC at the grpc-api service.
   # ---------------------------------------------------------------------------
   api:
+    image: trident-go-api:ci
     restart: "no"
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
