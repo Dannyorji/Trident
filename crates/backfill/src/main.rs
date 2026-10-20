@@ -163,7 +163,7 @@ async fn backfill_range(
 /// `backfill_range` path the single-range CLI uses, and mark it done/failed.
 /// Runs until Ctrl-C.
 async fn run_from_queue(args: Args, db: PgPool) -> Result<(), Box<dyn std::error::Error>> {
-    let rpc = rpc_client::RpcClient::new(std::env::var("STELLAR_RPC_URL")?);
+    let rpc = rpc_client::RpcClient::new(std::env::var("STELLAR_RPC_URL")?)?;
     let parser = parser::Parser::new(false);
     let events_indexed = AtomicU64::new(0);
     let duplicates_skipped = AtomicU64::new(0);
@@ -287,7 +287,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let rpc = Arc::new(rpc_client::RpcClient::new(std::env::var(
         "STELLAR_RPC_URL",
-    )?));
+    )?)?);
 
     let rx = Arc::new(Mutex::new(rx));
     let mut handles = vec![];

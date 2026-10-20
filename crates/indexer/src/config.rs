@@ -10,14 +10,11 @@ pub struct Config {
     pub stellar_rpc_url: String,
     /// Prioritised RPC endpoints used for health-based failover (issue #213).
     pub stellar_rpc_urls: Vec<String>,
-    /// Consecutive failures on the active endpoint before failing over (issue #213).
-    /// Read only by rpc::endpoints, which is currently unreferenced — see the
-    /// note at the top of that module.
-    #[allow(dead_code)]
-    pub rpc_failover_threshold: u32,
-    /// How long a failed endpoint is parked before it is probed again (issue #213).
-    #[allow(dead_code)]
-    pub rpc_endpoint_cooldown: Duration,
+    /// Extra HTTP headers sent with every RPC request (issue #735): one
+    /// global set plus per-endpoint overrides aligned with
+    /// `stellar_rpc_urls`. Values are provider credentials, so this type's
+    /// `Debug` prints header *names* only.
+    pub rpc_headers: RpcHeaderConfig,
     /// Consecutive RPC-layer poll failures before the circuit breaker opens
     /// and the run loop stops attempting polls (issue #197).
     pub rpc_breaker_failure_threshold: u32,
@@ -33,11 +30,6 @@ pub struct Config {
     pub lag_high_watermark: u64,
     /// Hysteresis deadband (ledgers) suppressing interval churn on lag jitter.
     pub poll_hysteresis_ledgers: u64,
-    /// Maximum ledgers a detected reorg is allowed to rewind before the
-    /// streamer halts instead of auto-recovering (issue #196). A deeper
-    /// divergence than this is treated as something an operator should look
-    /// at, not something to silently delete and re-index.
-    pub max_reorg_rewind_depth: u64,
     /// Maximum gaps enqueued as backfill jobs per gap-scan run (issue #216).
     /// Bounds one scan's cost and DB write volume when the table is
     /// pathologically gappy; any gaps beyond this are picked up by the next
@@ -114,6 +106,59 @@ pub struct Config {
     pub event_retention_days: Option<u64>,
 }
 
+/// RPC provider auth headers (issue #735).
+///
+/// `global` applies to every endpoint; `per_endpoint[i]` applies on top of it
+/// to `stellar_rpc_urls[i]`, so a deployment can hold keys for several
+/// providers and fail over between them without putting secrets in URLs.
+///
+/// `Debug` is hand-written because values are credentials: a derived `Debug`
+/// would print them the first time anyone logs the effective configuration
+/// or formats a config error.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct RpcHeaderConfig {
+    pub global: Vec<(String, String)>,
+    pub per_endpoint: Vec<Vec<(String, String)>>,
+}
+
+impl RpcHeaderConfig {
+    /// The headers effective for the endpoint at `index`.
+    pub fn for_endpoint(&self, index: usize) -> Vec<(String, String)> {
+        trident_common::rpc_headers::merge(
+            self.global.clone(),
+            self.per_endpoint.get(index).cloned().unwrap_or_default(),
+        )
+    }
+
+    /// True when no header is configured anywhere.
+    pub fn is_empty(&self) -> bool {
+        self.global.is_empty() && self.per_endpoint.iter().all(Vec::is_empty)
+    }
+
+    /// Header names configured anywhere, values omitted.
+    pub fn header_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = trident_common::rpc_headers::redact(&self.global);
+        for headers in &self.per_endpoint {
+            names.extend(trident_common::rpc_headers::redact(headers));
+        }
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+}
+
+impl std::fmt::Debug for RpcHeaderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RpcHeaderConfig")
+            .field("header_names", &self.header_names())
+            .field(
+                "endpoints_with_headers",
+                &self.per_endpoint.iter().filter(|h| !h.is_empty()).count(),
+            )
+            .finish()
+    }
+}
+
 /// Default Postgres pool size for the indexer. It is a single writer with low
 /// write concurrency, so a small pool is correct (issue #87).
 const DEFAULT_DB_POOL_SIZE: u32 = 3;
@@ -160,11 +205,39 @@ impl Config {
             }
         };
 
-        let explicit_network = std::env::var("NETWORK").ok().filter(|v| !v.trim().is_empty());
-        let network = explicit_network
-            .clone()
-            .unwrap_or_else(|| "testnet".into());
+        // Provider auth headers (issue #735). Parsing and validation happen
+        // here, once, so a malformed header spec fails startup naming the
+        // variable instead of failing the first RPC call with a 401. Header
+        // values are never echoed in the error.
+        let rpc_headers = match parse_rpc_header_config(&stellar_rpc_urls) {
+            Ok(headers) => headers,
+            Err(e) => {
+                errors.push(e);
+                RpcHeaderConfig::default()
+            }
+        };
+
+        let explicit_network = std::env::var("NETWORK")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
         validate_network_against_rpc(explicit_network.as_deref(), &stellar_rpc_urls)?;
+        // Normalise exactly once, here (issue #736). Every later consumer —
+        // the cursor key, the network column on every write, the passphrase
+        // default and the RPC timeout defaults — reads this one value, so an
+        // alias like `pubnet` cannot produce a `latest_ledger_cursor:pubnet`
+        // lookup (migration 0033 seeds only the normalised key) or a row that
+        // violates the 0031 CHECK constraint. `normalize_network` is also what
+        // the replay subcommand uses, so daemon and replay accept exactly the
+        // same set; both are a subset of the constraint's values.
+        let network =
+            match normalize_network(explicit_network.as_deref().unwrap_or("testnet").trim()) {
+                Ok(normalised) => normalised,
+                Err(e) => {
+                    errors.push(e);
+                    // Placeholder: `errors` is non-empty, so from_env bails below.
+                    String::new()
+                }
+            };
 
         // Network passphrase for SAC contract id derivation (issue #262).
         let network_passphrase = match std::env::var("NETWORK_PASSPHRASE") {
@@ -205,6 +278,26 @@ impl Config {
             );
         }
 
+        // The same treatment for the three knobs that were parsed and
+        // bounds-checked but never read by the running indexer (#737):
+        // `MAX_REORG_REWIND_DEPTH` duplicated the rewind bound that #196
+        // actually enforces through `MAX_REORG_DEPTH`, and the RPC pair was
+        // only ever used by `rpc::endpoints`, a module nothing called. A
+        // custom value silently doing nothing is worse than a startup failure
+        // that says which knob to use instead.
+        for (key, replacement) in [
+            ("MAX_REORG_REWIND_DEPTH", "MAX_REORG_DEPTH"),
+            ("RPC_FAILOVER_THRESHOLD", "RPC_BREAKER_FAILURE_THRESHOLD"),
+            ("RPC_ENDPOINT_COOLDOWN_MS", "RPC_BREAKER_COOLDOWN_MS"),
+        ] {
+            if std::env::var(key).is_ok() {
+                errors.push(format!(
+                    "[indexer] {key} is no longer used — it never changed indexer behaviour. \
+                     Use {replacement} instead and remove {key} from your environment."
+                ));
+            }
+        }
+
         // ── Numeric ranges (all validated in one pass) ───────────────────────
         let max_events_per_poll = parse_bounded_u64("MAX_EVENTS_PER_POLL", 200, 1, 10_000);
         let db_batch_size = parse_bounded_u64("DB_BATCH_SIZE", 1_000, 1, 10_000);
@@ -214,12 +307,6 @@ impl Config {
         let lag_high_watermark = parse_bounded_u64("LAG_HIGH_WATERMARK", 100, 1, 100_000_000);
         let poll_hysteresis_ledgers =
             parse_bounded_u64("POLL_HYSTERESIS_LEDGERS", 10, 0, 1_000_000);
-        // Bounded reorg rewind (issue #196): Stellar reorgs in practice are
-        // shallow (a handful of ledgers); a divergence deeper than this
-        // default is far more likely to be an RPC serving inconsistent data
-        // than a genuine consensus rollback, so it halts for an operator
-        // rather than deleting a large swath of history automatically.
-        let max_reorg_rewind_depth = parse_bounded_u64("MAX_REORG_REWIND_DEPTH", 50, 1, 100_000);
         let gap_scan_max_per_run = parse_bounded_u64("GAP_SCAN_MAX_PER_RUN", 100, 1, 10_000);
         // Mainnet RPC providers see materially higher p99 latency than
         // testnet for large getEvents pages under real contract/event
@@ -254,14 +341,10 @@ impl Config {
         // call per transaction/contract touched in a page, back-to-back with
         // zero delay, since the poll interval only sleeps between cycles.
         let rpc_max_calls_per_sec = parse_bounded_u64("RPC_MAX_CALLS_PER_SEC", 50, 1, 10_000);
-        let rpc_failover_threshold = parse_bounded_u64("RPC_FAILOVER_THRESHOLD", 3, 1, 100);
-        let rpc_endpoint_cooldown_ms =
-            parse_bounded_u64("RPC_ENDPOINT_COOLDOWN_MS", 30_000, 1_000, 3_600_000);
-        // Circuit breaker for sustained RPC outages (issue #197). Distinct
-        // from RPC_FAILOVER_THRESHOLD above: failover picks a different
-        // endpoint from the configured pool, while the breaker stops polling
-        // altogether once the (possibly single) endpoint has failed enough
-        // consecutive times in a row.
+        // Circuit breaker for sustained RPC outages (issue #197). This is the
+        // one place failover/cooldown behaviour is tuned: the health scorer
+        // parks an endpoint after these many consecutive failures and retries
+        // it after this cooldown (#737).
         let rpc_breaker_failure_threshold =
             parse_bounded_u64("RPC_BREAKER_FAILURE_THRESHOLD", 5, 1, 1_000);
         let rpc_breaker_cooldown_ms =
@@ -313,7 +396,6 @@ impl Config {
             ),
             ("LAG_HIGH_WATERMARK", lag_high_watermark.as_ref()),
             ("POLL_HYSTERESIS_LEDGERS", poll_hysteresis_ledgers.as_ref()),
-            ("MAX_REORG_REWIND_DEPTH", max_reorg_rewind_depth.as_ref()),
             ("GAP_SCAN_MAX_PER_RUN", gap_scan_max_per_run.as_ref()),
             ("RPC_CONNECT_TIMEOUT_MS", rpc_connect_timeout_ms.as_ref()),
             ("RPC_REQUEST_TIMEOUT_MS", rpc_request_timeout_ms.as_ref()),
@@ -327,11 +409,6 @@ impl Config {
             ),
             ("RPC_TCP_KEEPALIVE_MS", rpc_tcp_keepalive_ms.as_ref()),
             ("RPC_MAX_CALLS_PER_SEC", rpc_max_calls_per_sec.as_ref()),
-            ("RPC_FAILOVER_THRESHOLD", rpc_failover_threshold.as_ref()),
-            (
-                "RPC_ENDPOINT_COOLDOWN_MS",
-                rpc_endpoint_cooldown_ms.as_ref(),
-            ),
             (
                 "RPC_BREAKER_FAILURE_THRESHOLD",
                 rpc_breaker_failure_threshold.as_ref(),
@@ -438,7 +515,6 @@ impl Config {
         let poll_interval_ceiling_ms = poll_interval_ceiling_ms.unwrap();
         let lag_high_watermark = lag_high_watermark.unwrap();
         let poll_hysteresis_ledgers = poll_hysteresis_ledgers.unwrap();
-        let max_reorg_rewind_depth = max_reorg_rewind_depth.unwrap();
         let gap_scan_max_per_run = gap_scan_max_per_run.unwrap() as i64;
         let rpc_connect_timeout_ms = rpc_connect_timeout_ms.unwrap();
         let rpc_request_timeout_ms = rpc_request_timeout_ms.unwrap();
@@ -446,8 +522,6 @@ impl Config {
         let rpc_pool_max_idle_per_host = rpc_pool_max_idle_per_host.unwrap() as usize;
         let rpc_tcp_keepalive_ms = rpc_tcp_keepalive_ms.unwrap();
         let rpc_max_calls_per_sec = rpc_max_calls_per_sec.unwrap() as u32;
-        let rpc_failover_threshold = rpc_failover_threshold.unwrap() as u32;
-        let rpc_endpoint_cooldown_ms = rpc_endpoint_cooldown_ms.unwrap();
         let rpc_breaker_failure_threshold = rpc_breaker_failure_threshold.unwrap() as u32;
         let rpc_breaker_cooldown_ms = rpc_breaker_cooldown_ms.unwrap();
         let outbox_poll_interval_ms = outbox_poll_interval_ms.unwrap();
@@ -469,8 +543,7 @@ impl Config {
             redis_url: redis_url.unwrap(),
             stellar_rpc_url: stellar_rpc_urls[0].clone(),
             stellar_rpc_urls,
-            rpc_failover_threshold,
-            rpc_endpoint_cooldown: Duration::from_millis(rpc_endpoint_cooldown_ms),
+            rpc_headers,
             rpc_breaker_failure_threshold,
             rpc_breaker_cooldown: Duration::from_millis(rpc_breaker_cooldown_ms),
             network,
@@ -478,7 +551,6 @@ impl Config {
             poll_interval_ceiling: Duration::from_millis(poll_interval_ceiling_ms),
             lag_high_watermark,
             poll_hysteresis_ledgers,
-            max_reorg_rewind_depth,
             gap_scan_max_per_run,
             rpc_connect_timeout: Duration::from_millis(rpc_connect_timeout_ms),
             rpc_request_timeout: Duration::from_millis(rpc_request_timeout_ms),
@@ -532,8 +604,9 @@ impl Config {
             poll_interval_floor_ms = self.poll_interval_floor.as_millis() as u64,
             poll_interval_ceiling_ms = self.poll_interval_ceiling.as_millis() as u64,
             lag_high_watermark = self.lag_high_watermark,
-            max_reorg_rewind_depth = self.max_reorg_rewind_depth,
             gap_scan_max_per_run = self.gap_scan_max_per_run,
+            rpc_headers_configured = !self.rpc_headers.is_empty(),
+            rpc_header_names = ?self.rpc_headers.header_names(),
             max_events_per_poll = self.max_events_per_poll,
             db_batch_size = self.db_batch_size,
             db_pool_size = self.db_pool_size,
@@ -730,7 +803,10 @@ fn validate_network_against_rpc(
     explicit_network: Option<&str>,
     urls: &[String],
 ) -> Result<(), TridentError> {
-    let hints: Vec<&'static str> = urls.iter().filter_map(|u| rpc_url_network_hint(u)).collect();
+    let hints: Vec<&'static str> = urls
+        .iter()
+        .filter_map(|u| rpc_url_network_hint(u))
+        .collect();
     let looks_mainnet = hints.contains(&"mainnet");
     let looks_testnet = hints.contains(&"testnet");
 
@@ -766,6 +842,61 @@ fn validate_network_against_rpc(
         }
         _ => Ok(()),
     }
+}
+
+/// Read RPC auth headers from `STELLAR_RPC_HEADERS` (every endpoint) and
+/// `STELLAR_RPC_HEADERS_<i>` (endpoint `i` only) into one configuration
+/// (issue #735).
+///
+/// Per-endpoint specs are merged over the global one by name, so a deployment
+/// that fails over between providers can hold a key for each without
+/// duplicating the shared `Content-Type`-style headers. An index with no
+/// matching endpoint is rejected rather than ignored — otherwise a typo
+/// leaves the operator convinced a key is being sent.
+fn parse_rpc_header_config(urls: &[String]) -> Result<RpcHeaderConfig, String> {
+    let global = match std::env::var("STELLAR_RPC_HEADERS") {
+        Ok(spec) => trident_common::rpc_headers::parse(&spec)
+            .map_err(|e| format!("[indexer] STELLAR_RPC_HEADERS: {e}"))?,
+        Err(_) => Vec::new(),
+    };
+
+    let mut per_endpoint = vec![Vec::new(); urls.len()];
+    for (index, slot) in per_endpoint.iter_mut().enumerate() {
+        let key = format!("STELLAR_RPC_HEADERS_{index}");
+        if let Ok(spec) = std::env::var(&key) {
+            *slot = trident_common::rpc_headers::parse(&spec)
+                .map_err(|e| format!("[indexer] {key}: {e}"))?;
+        }
+    }
+
+    validate_endpoint_header_indices(urls.len())?;
+
+    Ok(RpcHeaderConfig {
+        global,
+        per_endpoint,
+    })
+}
+
+/// Reject `STELLAR_RPC_HEADERS_<i>` for an `i` that has no endpoint.
+fn validate_endpoint_header_indices(endpoint_count: usize) -> Result<(), String> {
+    const PREFIX: &str = "STELLAR_RPC_HEADERS_";
+    for (name, _) in std::env::vars() {
+        let Some(suffix) = name.strip_prefix(PREFIX) else {
+            continue;
+        };
+        // A non-numeric suffix is a different variable (or a typo) and is not
+        // this function's concern.
+        let Ok(index) = suffix.parse::<usize>() else {
+            continue;
+        };
+        if index >= endpoint_count {
+            return Err(format!(
+                "[indexer] {name} is set but STELLAR_RPC_URLS configures {endpoint_count} \
+                 endpoint(s), so there is no endpoint at index {index}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Build the prioritised endpoint list from `STELLAR_RPC_URLS` (comma-separated)
@@ -887,6 +1018,26 @@ mod tests {
             ("REDIS_URL", "redis://localhost:6379"),
             ("STELLAR_RPC_URL", "https://soroban-testnet.stellar.org"),
         ]
+    }
+
+    /// Required vars pointing at a mainnet-looking endpoint, so the
+    /// network/RPC cross-check accepts both `mainnet` and its `pubnet` alias.
+    fn mainnet_vars(network: &'static str) -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("DATABASE_URL", "postgres://localhost/test"),
+            ("REDIS_URL", "redis://localhost:6379"),
+            ("STELLAR_RPC_URL", "https://soroban-mainnet.stellar.org"),
+            ("NETWORK", network),
+        ]
+    }
+
+    fn config_debug_for_network(network: &'static str) -> String {
+        let vars = mainnet_vars(network);
+        let mut rendered = String::new();
+        with_env(&vars, || {
+            rendered = format!("{:?}", Config::from_env().unwrap());
+        });
+        rendered
     }
 
     #[test]
@@ -1137,18 +1288,6 @@ mod tests {
     }
 
     #[test]
-    fn failover_knobs_have_defaults() {
-        let vars = required_vars();
-        with_env(&vars, || {
-            env::remove_var("RPC_FAILOVER_THRESHOLD");
-            env::remove_var("RPC_ENDPOINT_COOLDOWN_MS");
-            let cfg = Config::from_env().unwrap();
-            assert_eq!(cfg.rpc_failover_threshold, 3);
-            assert_eq!(cfg.rpc_endpoint_cooldown.as_millis(), 30_000);
-        });
-    }
-
-    #[test]
     fn breaker_knobs_have_defaults() {
         let vars = required_vars();
         with_env(&vars, || {
@@ -1289,13 +1428,39 @@ mod tests {
         });
     }
 
+    /// Issue #737: these three knobs used to be parsed, bounds-checked and
+    /// stored (or logged) without any code path reading them. An operator
+    /// tuning them got silence, so a set value now fails startup instead.
     #[test]
-    fn max_reorg_rewind_depth_defaults_to_50() {
-        let vars = required_vars();
+    fn removed_knobs_fail_startup_with_the_effective_alternative() {
+        for (key, replacement) in [
+            ("MAX_REORG_REWIND_DEPTH", "MAX_REORG_DEPTH"),
+            ("RPC_FAILOVER_THRESHOLD", "RPC_BREAKER_FAILURE_THRESHOLD"),
+            ("RPC_ENDPOINT_COOLDOWN_MS", "RPC_BREAKER_COOLDOWN_MS"),
+        ] {
+            let mut vars = required_vars();
+            vars.push((key, "10"));
+            with_env(&vars, || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    err.contains(key),
+                    "startup error must name the removed knob {key}: {err}"
+                );
+                assert!(
+                    err.contains(replacement),
+                    "startup error must point at {replacement}: {err}"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn max_reorg_depth_still_bounds_rewinds() {
+        let mut vars = required_vars();
+        vars.push(("MAX_REORG_DEPTH", "9"));
         with_env(&vars, || {
-            env::remove_var("MAX_REORG_REWIND_DEPTH");
             let cfg = Config::from_env().unwrap();
-            assert_eq!(cfg.max_reorg_rewind_depth, 50);
+            assert_eq!(cfg.max_reorg_depth, 9);
         });
     }
 
@@ -1306,26 +1471,6 @@ mod tests {
             env::remove_var("GAP_SCAN_MAX_PER_RUN");
             let cfg = Config::from_env().unwrap();
             assert_eq!(cfg.gap_scan_max_per_run, 100);
-        });
-    }
-
-    #[test]
-    fn max_reorg_rewind_depth_reads_custom_value() {
-        let mut vars = required_vars();
-        vars.push(("MAX_REORG_REWIND_DEPTH", "10"));
-        with_env(&vars, || {
-            let cfg = Config::from_env().unwrap();
-            assert_eq!(cfg.max_reorg_rewind_depth, 10);
-        });
-    }
-
-    #[test]
-    fn max_reorg_rewind_depth_zero_is_rejected() {
-        let mut vars = required_vars();
-        vars.push(("MAX_REORG_REWIND_DEPTH", "0"));
-        with_env(&vars, || {
-            let err = Config::from_env().unwrap_err();
-            assert!(err.to_string().contains("MAX_REORG_REWIND_DEPTH"));
         });
     }
 
@@ -1363,8 +1508,9 @@ mod tests {
 
     #[test]
     fn rpc_timeouts_use_higher_mainnet_defaults() {
-        let mut vars = required_vars();
-        vars.push(("NETWORK", "mainnet"));
+        // A mainnet-looking URL too: the NETWORK/RPC cross-check rejects
+        // `NETWORK=mainnet` pointed at a testnet endpoint.
+        let vars = mainnet_vars("mainnet");
         with_env(&vars, || {
             for key in ["RPC_CONNECT_TIMEOUT_MS", "RPC_REQUEST_TIMEOUT_MS"] {
                 env::remove_var(key);
@@ -1377,8 +1523,7 @@ mod tests {
 
     #[test]
     fn rpc_timeout_mainnet_default_is_still_overridable() {
-        let mut vars = required_vars();
-        vars.push(("NETWORK", "mainnet"));
+        let mut vars = mainnet_vars("mainnet");
         vars.push(("RPC_CONNECT_TIMEOUT_MS", "2000"));
         vars.push(("RPC_REQUEST_TIMEOUT_MS", "8000"));
         with_env(&vars, || {
@@ -1626,11 +1771,139 @@ mod tests {
 
     #[test]
     fn from_env_normalizes_pubnet_to_mainnet() {
-        let mut vars = required_vars();
-        vars.push(("NETWORK", "pubnet"));
+        let vars = mainnet_vars("pubnet");
         with_env(&vars, || {
             let cfg = Config::from_env().unwrap();
             assert_eq!(cfg.network, "mainnet");
+        });
+    }
+
+    /// Issue #736's done criterion: `NETWORK=pubnet` must behave exactly like
+    /// `NETWORK=mainnet` end to end. Every value either config carries comes
+    /// from the single normalised network, so an identical Debug rendering is
+    /// the strongest statement a config test can make.
+    #[test]
+    fn pubnet_config_is_indistinguishable_from_mainnet() {
+        assert_eq!(
+            config_debug_for_network("pubnet"),
+            config_debug_for_network("mainnet")
+        );
+    }
+
+    #[test]
+    fn pubnet_uses_mainnet_passphrase_and_timeouts() {
+        let vars = mainnet_vars("pubnet");
+        with_env(&vars, || {
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.network, "mainnet");
+            assert_eq!(
+                cfg.network_passphrase,
+                "Public Global Stellar Network ; September 2015"
+            );
+            assert_eq!(cfg.rpc_connect_timeout.as_millis(), 10_000);
+            assert_eq!(cfg.rpc_request_timeout.as_millis(), 45_000);
+        });
+    }
+
+    #[test]
+    fn from_env_rejects_futurenet() {
+        // The daemon and replay both go through `normalize_network`, so the
+        // accepted set is identical between them; futurenet is not indexed.
+        let mut vars = required_vars();
+        vars.push(("NETWORK", "futurenet"));
+        with_env(&vars, || {
+            let err = Config::from_env().unwrap_err().to_string();
+            assert!(err.contains("futurenet"), "{err}");
+        });
+    }
+
+    #[test]
+    fn rpc_headers_are_parsed_from_json() {
+        let mut vars = required_vars();
+        vars.push((
+            "STELLAR_RPC_HEADERS",
+            r#"{"x-api-key":"abc","Authorization":"Bearer token"}"#,
+        ));
+        with_env(&vars, || {
+            let cfg = Config::from_env().unwrap();
+            let headers = cfg.rpc_headers.for_endpoint(0);
+            assert!(headers
+                .iter()
+                .any(|(name, value)| name == "x-api-key" && value == "abc"));
+            assert!(headers
+                .iter()
+                .any(|(name, value)| name == "Authorization" && value == "Bearer token"));
+        });
+    }
+
+    #[test]
+    fn no_rpc_headers_configured_by_default() {
+        let vars = required_vars();
+        with_env(&vars, || {
+            let cfg = Config::from_env().unwrap();
+            assert!(cfg.rpc_headers.is_empty());
+            assert!(cfg.rpc_headers.for_endpoint(0).is_empty());
+        });
+    }
+
+    #[test]
+    fn per_endpoint_rpc_headers_override_the_global_set() {
+        let mut vars = required_vars();
+        vars.push((
+            "STELLAR_RPC_URLS",
+            "https://rpc-a.example.com,https://rpc-b.example.com",
+        ));
+        vars.push(("STELLAR_RPC_HEADERS", r#"{"x-api-key":"global"}"#));
+        vars.push((
+            "STELLAR_RPC_HEADERS_1",
+            r#"{"x-api-key":"second","x-tenant":"b"}"#,
+        ));
+        with_env(&vars, || {
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(
+                cfg.rpc_headers.for_endpoint(0),
+                vec![("x-api-key".to_string(), "global".to_string())]
+            );
+            let second = cfg.rpc_headers.for_endpoint(1);
+            assert!(second
+                .iter()
+                .any(|(name, value)| name == "x-api-key" && value == "second"));
+            assert!(second
+                .iter()
+                .any(|(name, value)| name == "x-tenant" && value == "b"));
+        });
+    }
+
+    #[test]
+    fn rpc_headers_never_leak_values_through_config_debug() {
+        let mut vars = required_vars();
+        vars.push(("STELLAR_RPC_HEADERS", r#"{"x-api-key":"topsecret"}"#));
+        with_env(&vars, || {
+            let cfg = Config::from_env().unwrap();
+            let rendered = format!("{cfg:?}");
+            assert!(rendered.contains("x-api-key"), "{rendered}");
+            assert!(!rendered.contains("topsecret"), "{rendered}");
+        });
+    }
+
+    #[test]
+    fn header_for_a_missing_endpoint_index_is_rejected() {
+        let mut vars = required_vars();
+        vars.push(("STELLAR_RPC_HEADERS_3", r#"{"x-api-key":"v"}"#));
+        with_env(&vars, || {
+            let err = Config::from_env().unwrap_err().to_string();
+            assert!(err.contains("STELLAR_RPC_HEADERS_3"), "{err}");
+        });
+    }
+
+    #[test]
+    fn invalid_rpc_header_spec_names_the_variable_only() {
+        let mut vars = required_vars();
+        vars.push(("STELLAR_RPC_HEADERS", r#"{"bad name":"leak-me"}"#));
+        with_env(&vars, || {
+            let err = Config::from_env().unwrap_err().to_string();
+            assert!(err.contains("STELLAR_RPC_HEADERS"), "{err}");
+            assert!(!err.contains("leak-me"), "{err}");
         });
     }
 

@@ -150,8 +150,9 @@ temporary changes you do not want long term (allowlist, topic filters).
   and `DB_BATCH_SIZE` so a p99 ledger fits in one or two pages.
 - **Use a dedicated or private RPC node.** Public endpoints rate-limit; a
   provider plan or self-hosted node with generous `getEvents` limits raises the
-  ceiling. Configure a second endpoint for failover (`RPC_FAILOVER_THRESHOLD`,
-  `RPC_ENDPOINT_COOLDOWN_MS`). See the mainnet RPC section of
+  ceiling. Configure a second endpoint for failover, and tune how quickly a
+  failing endpoint is parked with `RPC_BREAKER_FAILURE_THRESHOLD` /
+  `RPC_BREAKER_COOLDOWN_MS`. See the mainnet RPC section of
   [`../deployment.md`](../deployment.md).
 - **Watch RPC retention.** Soroban RPC only serves a bounded window of history.
   If lag grows past that window the missed ledgers cannot be fetched from that

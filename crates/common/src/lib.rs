@@ -1,5 +1,6 @@
 pub mod errors;
 pub mod logging;
+pub mod rpc_headers;
 pub mod scval;
 pub mod types;
 

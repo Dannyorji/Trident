@@ -208,6 +208,16 @@ pub struct PageCommit<'a> {
     pub cursor: Option<u64>,
     /// Ledger metadata row, written only when the cursor advanced.
     pub ledger: Option<LedgerMeta<'a>>,
+    /// Inclusive start of the ledger range this page covers
+    /// (issue #723): commit_page records one `ledger_metadata` row per
+    /// ledger in `[covered_from_ledger ..= ledger.meta.sequence]` instead
+    /// of only the page's last ledger. A `getEvents` page traverses every
+    /// ledger in that span — ledgers without matching events included —
+    /// so recording only the last one made every inter-page span look
+    /// like a hole to `scan_ledger_gaps` / `detect_ledger_gaps`. `None`
+    /// (per-event fallback commits, replays, tests) records only the
+    /// single `ledger` row, i.e. the pre-#723 behaviour.
+    pub covered_from_ledger: Option<u64>,
     /// Maximum rows per INSERT statement, bounding statement size and memory.
     pub batch_size: usize,
 }
@@ -804,16 +814,54 @@ pub async fn commit_page(pool: &PgPool, commit: PageCommit<'_>) -> Result<(), Tr
             TridentError::storage(anyhow::Error::new(e).context("ledger timestamp parse"))
         })?;
 
+        // Record every ledger this page traversed, not just its last one
+        // (issue #723). A getEvents page advances ledger-by-ledger within
+        // the span [first_ledger ..= last_ledger] — ledgers without
+        // matching events included — so a row only for `ledger.sequence`
+        // (the page's last ledger) left every ledger between two
+        // consecutive pages' last ledgers absent from `ledger_metadata`.
+        // The gap scanners read that table, so every inter-page span was
+        // falsely reported as a hole and enqueued for backfill.
+        //
+        // The span rows are placeholders (empty hash, timestamp of the
+        // page's closing ledger, event_count 0); the stretch between two
+        // pages with no events for this indexer's filter is genuinely
+        // traversed-and-empty, not unprocessed. A real hole — a ledger the
+        // poll loop never saw — still has no row at all and is still
+        // reported exactly by `scan_ledger_gaps` / `detect_ledger_gaps`.
+        //
+        // generate_series is server-side, so the cost is one statement
+        // per page instead of one per ledger, and the whole span lands
+        // in the same transaction as the cursor advance (#199/#200).
+        // `ON CONFLICT DO NOTHING` keeps replays, per-event fallback
+        // commits, and a backfill worker re-committing an overlapping
+        // range from clobbering a real row with a placeholder (or vice
+        // versa): first writer wins, matching the pre-#723 semantics.
+        // The page's last ledger always ends the span, and the real hash /
+        // event_count always attach to it; `covered_from_ledger` above it
+        // (never possible with a monotonic cursor, but public API) clamps
+        // to a single-row span rather than an inverted `generate_series`.
+        let span_start: i64 = commit
+            .covered_from_ledger
+            .unwrap_or(ledger.sequence)
+            .min(ledger.sequence) as i64;
+        let span_end: i64 = ledger.sequence as i64;
+
         sqlx::query(
             r#"
             INSERT INTO ledger_metadata (ledger_sequence, ledger_hash, ledger_timestamp, event_count)
-            VALUES ($1, $2, $3, $4)
+            SELECT seq,
+                CASE WHEN seq = $4::bigint THEN $2::text ELSE '' END,
+                $3::timestamptz,
+                CASE WHEN seq = $4::bigint THEN $5::int ELSE 0 END
+            FROM generate_series($1::bigint, $4::bigint) AS seq
             ON CONFLICT (ledger_sequence) DO NOTHING
             "#,
         )
-        .bind(ledger.sequence as i64)
+        .bind(span_start)
         .bind(ledger.hash)
         .bind(ts)
+        .bind(span_end)
         .bind(ledger.event_count)
         .execute(&mut *tx)
         .await
@@ -1005,6 +1053,14 @@ pub async fn get_cursor(pool: &PgPool, network: &str) -> Result<u64, TridentErro
 
 /// Fetch recent ledger sequences and hashes from `ledger_metadata` ordered by sequence descending.
 /// Used for reorg detection (issue #196).
+///
+/// Only rows that actually carry a hash are returned. Since issue #723,
+/// `commit_page` records a placeholder row (empty hash) for every ledger a
+/// page traversed, so the newest rows are usually placeholders; returning
+/// them would make the reorg check compare the RPC's real hash against `""`
+/// and report a reorg after every ordinary ingest. Backfill and page-ending
+/// ledgers do carry a hash, so the check still compares the newest known
+/// hashes — which is what a shallow reorg is detected against.
 pub async fn get_recent_ledger_metadata(
     pool: &PgPool,
     limit: i64,
@@ -1013,6 +1069,7 @@ pub async fn get_recent_ledger_metadata(
         r#"
         SELECT ledger_sequence, ledger_hash
         FROM ledger_metadata
+        WHERE ledger_hash <> ''
         ORDER BY ledger_sequence DESC
         LIMIT $1
         "#,
@@ -2527,6 +2584,7 @@ mod tests {
                 storage_snapshots: &[],
                 network: "testnet",
                 cursor: Some(900),
+                covered_from_ledger: None,
                 ledger: Some(LedgerMeta {
                     sequence: 900,
                     hash: "hash900",
@@ -2629,6 +2687,240 @@ mod tests {
         sqlx::query("DELETE FROM ledger_metadata WHERE ledger_sequence BETWEEN $1 AND $2")
             .bind(base as i64)
             .bind((base + 9) as i64)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// Issue #723: `commit_page` must record every ledger a page traversed,
+    /// not just the page's last one, so a normal multi-page ingest leaves the
+    /// gap scanners with nothing to report.
+    #[tokio::test]
+    async fn commit_page_span_leaves_no_gaps_for_a_multi_page_ingest() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        // Two pages of a normal ingest: [base..=base+4] then
+        // [base+5..=base+9]. Before #723 only base+4 and base+9 got a row,
+        // so base..=base+3 and base+5..=base+8 read as holes.
+        let base = 8_300_000u64;
+        // A job the old per-page writer falsely enqueued for an interior span
+        // of this ingest. It must be closed once the scan confirms the range is
+        // covered — "close the false jobs already enqueued" from #723.
+        let job_network = format!("span-test-{}", Uuid::new_v4());
+        enqueue_backfill_job(
+            &pool,
+            LedgerGap {
+                from_ledger: base + 5,
+                to_ledger: base + 8,
+            },
+            &job_network,
+        )
+        .await
+        .unwrap();
+
+        for (from, to, hash, event_count) in [
+            (base, base + 4, "span-hash-1", 3i32),
+            (base + 5, base + 9, "span-hash-2", 1i32),
+        ] {
+            commit_page(
+                &pool,
+                PageCommit {
+                    events: &[],
+                    token_events: &[],
+                    invocation_metrics: &[],
+                    storage_snapshots: &[],
+                    network: "testnet",
+                    cursor: Some(to),
+                    covered_from_ledger: Some(from),
+                    ledger: Some(LedgerMeta {
+                        sequence: to,
+                        hash,
+                        timestamp: "2024-01-01T00:00:00Z",
+                        event_count,
+                    }),
+                    batch_size: 50,
+                },
+            )
+            .await
+            .expect("commit_page failed");
+        }
+
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM ledger_metadata WHERE ledger_sequence BETWEEN $1 AND $2",
+        )
+        .bind(base as i64)
+        .bind((base + 9) as i64)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count.0, 10, "every traversed ledger must be recorded");
+
+        // Only the page's last ledger carries the real hash and event count;
+        // the ledgers in between are placeholders.
+        let hashed: Vec<i64> = sqlx::query_scalar(
+            "SELECT ledger_sequence FROM ledger_metadata \
+             WHERE ledger_sequence BETWEEN $1 AND $2 AND ledger_hash <> '' ORDER BY ledger_sequence",
+        )
+        .bind(base as i64)
+        .bind((base + 9) as i64)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(hashed, vec![(base + 4) as i64, (base + 9) as i64]);
+
+        let counts: Vec<(i64, i32)> = sqlx::query_as(
+            "SELECT ledger_sequence, event_count FROM ledger_metadata \
+             WHERE ledger_sequence BETWEEN $1 AND $2 ORDER BY ledger_sequence",
+        )
+        .bind(base as i64)
+        .bind((base + 9) as i64)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(counts[4], ((base + 4) as i64, 3));
+        assert_eq!(counts[9], ((base + 9) as i64, 1));
+        assert!(
+            counts[..4].iter().all(|(_, event_count)| *event_count == 0),
+            "interior ledgers must be traversed-and-empty, not fake event counts"
+        );
+
+        // Reorg detection compares the newest stored hashes against the RPC.
+        // Placeholder rows must never be returned, or every ordinary ingest
+        // would look like a hash mismatch (issue #723).
+        let recent = get_recent_ledger_metadata(&pool, 50).await.unwrap();
+        assert!(
+            recent
+                .iter()
+                .filter(|(sequence, _)| *sequence >= base && *sequence <= base + 9)
+                .all(|(_, hash)| !hash.is_empty()),
+            "reorg detection must only see real hashes: {recent:?}"
+        );
+        assert_eq!(
+            recent
+                .iter()
+                .find(|(sequence, _)| *sequence <= base + 9)
+                .map(|(sequence, _)| *sequence),
+            Some(base + 9),
+            "the newest known hash is the page's last ledger"
+        );
+
+        // The gauge and the enqueue path both read these two: neither may
+        // report anything for a fully covered range.
+        assert!(
+            detect_ledger_gaps(&pool, base, base + 9)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a normally ingested range must have no gaps"
+        );
+        let gaps = scan_ledger_gaps(&pool, 10_000).await.unwrap();
+        assert!(
+            !gaps
+                .iter()
+                .any(|gap| gap.from_ledger <= base + 9 && gap.to_ledger >= base),
+            "scan_ledger_gaps must not report a covered range: {gaps:?}"
+        );
+
+        let closed = close_filled_backfill_jobs(&pool, &job_network, &[])
+            .await
+            .unwrap();
+        assert_eq!(closed, 1, "the falsely enqueued job must be closed");
+        sqlx::query("DELETE FROM backfill_jobs WHERE network = $1")
+            .bind(&job_network)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::query("DELETE FROM ledger_metadata WHERE ledger_sequence BETWEEN $1 AND $2")
+            .bind(base as i64)
+            .bind((base + 9) as i64)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// Issue #723: a range the indexer deliberately skipped (e.g. adopting the
+    /// RPC's retained floor) must still be reported exactly — the span fix
+    /// records what was traversed, it does not paper over a real skip.
+    #[tokio::test]
+    async fn deliberately_skipped_range_is_still_reported_exactly() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let base = 8_400_000u64;
+        // First page covers base..=base+4, then the poll loop skips
+        // base+5..=base+9 (e.g. a retained-floor jump) and the next page
+        // covers base+10..=base+12.
+        for (from, to, hash) in [
+            (base, base + 4, "skip-hash-1"),
+            (base + 10, base + 12, "skip-hash-2"),
+        ] {
+            commit_page(
+                &pool,
+                PageCommit {
+                    events: &[],
+                    token_events: &[],
+                    invocation_metrics: &[],
+                    storage_snapshots: &[],
+                    network: "testnet",
+                    cursor: Some(to),
+                    covered_from_ledger: Some(from),
+                    ledger: Some(LedgerMeta {
+                        sequence: to,
+                        hash,
+                        timestamp: "2024-01-01T00:00:00Z",
+                        event_count: 0,
+                    }),
+                    batch_size: 50,
+                },
+            )
+            .await
+            .expect("commit_page failed");
+        }
+
+        let gaps: Vec<LedgerGap> = scan_ledger_gaps(&pool, 10_000)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|gap| gap.from_ledger >= base && gap.to_ledger <= base + 12)
+            .collect();
+        assert_eq!(
+            gaps,
+            vec![LedgerGap {
+                from_ledger: base + 5,
+                to_ledger: base + 9,
+            }],
+            "the deliberate skip must be reported exactly, and nothing else"
+        );
+
+        assert_eq!(
+            detect_ledger_gaps(&pool, base, base + 12).await.unwrap(),
+            (base + 5..=base + 9).collect::<Vec<u64>>(),
+            "the gauge sees exactly the skipped ledgers"
+        );
+
+        sqlx::query("DELETE FROM ledger_metadata WHERE ledger_sequence BETWEEN $1 AND $2")
+            .bind(base as i64)
+            .bind((base + 12) as i64)
             .execute(&pool)
             .await
             .unwrap();
@@ -3108,6 +3400,7 @@ mod tests {
                 storage_snapshots: &[],
                 network: "testnet",
                 cursor: Some(cursor),
+                covered_from_ledger: None,
                 ledger: None,
                 batch_size: 10,
             }
@@ -3204,6 +3497,7 @@ mod tests {
                 storage_snapshots: &[],
                 network: "testnet",
                 cursor: Some(cursor),
+                covered_from_ledger: None,
                 ledger: None,
                 batch_size: 10,
             }
@@ -3278,6 +3572,7 @@ mod tests {
                 storage_snapshots: &[],
                 network,
                 cursor: Some(cursor),
+                covered_from_ledger: None,
                 ledger: None,
                 batch_size: 10,
             }
@@ -3356,6 +3651,7 @@ mod tests {
                         storage_snapshots: &[],
                         network: "testnet",
                         cursor: Some(cursor),
+                        covered_from_ledger: None,
                         ledger: None,
                         batch_size: 10,
                     },
