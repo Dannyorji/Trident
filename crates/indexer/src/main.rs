@@ -289,35 +289,66 @@ fn init_tracer() -> Option<opentelemetry_sdk::trace::Tracer> {
 
 /// Runs `ensure_future_event_partitions` once per day so the events table's
 /// partition ceiling never catches up with the live chain tip (issue #431).
+/// Guarded by advisory lock to run on one replica (issue #731).
 async fn maintain_partitions(pool: PgPool) {
     let mut interval = time::interval(Duration::from_secs(86400)); // Once per day
+    // Delay first run to avoid re-running on every restart/crash-loop
+    tokio::time::sleep(Duration::from_secs(60)).await;
     loop {
-        interval.tick().await;
-        if let Err(e) = sqlx::query("SELECT ensure_future_event_partitions(3)")
-            .execute(&pool)
+        // Try to acquire advisory lock
+        let mut locked = false;
+        if let Ok(row) = sqlx::query_as::<_, (bool,)>("SELECT pg_try_advisory_lock(123456789, 1)")
+            .fetch_one(&pool)
             .await
         {
-            tracing::error!(error = %e, "failed to run ensure_future_event_partitions");
+            locked = row.0;
         }
+        if locked {
+            if let Err(e) = sqlx::query("SELECT ensure_future_event_partitions(3)")
+                .execute(&pool)
+                .await
+            {
+                tracing::error!(error = %e, "failed to run ensure_future_event_partitions");
+            }
+            let _ = sqlx::query("SELECT pg_advisory_unlock(123456789, 1)")
+                .execute(&pool)
+                .await;
+        }
+        interval.tick().await;
     }
 }
 
 /// Prunes `soroban_events` rows older than `days` once per day (issue #482).
+/// Guarded by advisory lock to run on one replica (issue #731).
 async fn run_retention_job(pool: PgPool, days: u64) {
     let mut interval = time::interval(Duration::from_secs(86400));
+    // Delay first run to avoid re-running on every restart/crash-loop
+    tokio::time::sleep(Duration::from_secs(90)).await;
     loop {
-        interval.tick().await;
-        match sqlx::query("SELECT prune_soroban_events($1)")
-            .bind(days as i64)
-            .execute(&pool)
+        let mut locked = false;
+        if let Ok(row) = sqlx::query_as::<_, (bool,)>("SELECT pg_try_advisory_lock(123456789, 2)")
+            .fetch_one(&pool)
             .await
         {
-            Ok(_) => metrics::record_retention_job_success(),
-            Err(e) => {
-                tracing::error!(error = %e, "retention job failed");
-                metrics::record_retention_job_failure();
-            }
+            locked = row.0;
         }
+        if locked {
+            match sqlx::query("SELECT prune_soroban_events($1)")
+                .bind(days as i64)
+                .execute(&pool)
+                .await
+            {
+                Ok(_) => metrics::record_retention_job_success(),
+                Err(e) => {
+                    tracing::error!(error = %e, "retention job failed");
+                    metrics::record_retention_job_failure();
+                }
+            }
+            let _ = sqlx::query("SELECT pg_advisory_unlock(123456789, 2)")
+                .execute(&pool)
+                .await;
+        }
+        interval.tick().await;
     }
 }
 
@@ -387,9 +418,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Database connected with timeout defaults"
     );
 
+    // Redis connection is owned by the outbox relay which can reconnect with backoff (issue #732).
     let redis_client = redis::Client::open(cfg.redis_url.as_str())?;
-    let redis_conn = redis_client.get_multiplexed_async_connection().await?;
-    tracing::info!("Redis connected");
+    let redis_conn = match redis_client.get_multiplexed_async_connection().await {
+        Ok(conn) => {
+            tracing::info!("Redis connected");
+            Some(conn)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Redis unreachable at startup; starting without Redis (relay will reconnect)");
+            None
+        }
+    };
 
     // Spawn health and readiness endpoints on HEALTH_PORT (default 8080, separate
     // from the Prometheus /metrics listener on METRICS_PORT) (#206).
@@ -428,12 +468,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shutdown_trigger.cancel();
     });
 
-    // Outbox relay (issue #200): the poll loop only commits events; this task
+    // Outbox relay (issue #200,#732): the poll loop only commits events; this task
     // delivers them to Redis. It runs alongside the streamer and stops on the
-    // same shutdown signal.
-    let mut relay = redis_stream::relay::OutboxRelay::new(
+    // same shutdown signal. Relay manages its own Redis connection with reconnect.
+    let mut relay = redis_stream::relay::OutboxRelay::new_with_config(
         db_pool.clone(),
-        redis_conn.clone(),
+        cfg.redis_url.clone(),
+        redis_conn,
         redis_stream::relay::RelayConfig {
             interval: cfg.outbox_poll_interval,
             batch_size: cfg.outbox_batch_size,
@@ -503,6 +544,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
+
+    // Flush OpenTelemetry spans on shutdown (issue #733)
+    opentelemetry::global::shutdown_tracer_provider();
+
     result?;
 
     tracing::info!("Trident indexer stopped");

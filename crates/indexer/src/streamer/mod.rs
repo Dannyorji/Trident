@@ -152,7 +152,7 @@ impl Streamer {
                          {} configured endpoint(s) ({:?}): {e}. Set \
                          RPC_STARTUP_CHECK_ENABLED=false to skip this check (not recommended).",
                         config.stellar_rpc_urls.len(),
-                        config.stellar_rpc_urls,
+                        crate::config::redact_rpc_urls(&config.stellar_rpc_urls),
                     )));
                 }
             }

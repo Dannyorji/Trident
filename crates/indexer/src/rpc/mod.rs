@@ -465,6 +465,14 @@ fn rpc_transport_error(err: reqwest::Error, context: &'static str) -> TridentErr
     TridentError::rpc(anyhow::Error::new(err).context(context))
 }
 
+fn rpc_transport_error_redacted(
+    err: reqwest::Error,
+    context: &'static str,
+    _url: &str,
+) -> TridentError {
+    rpc_transport_error(err, context)
+}
+
 /// Coarse error-type label for a non-2xx RPC HTTP response (issue #294).
 fn classify_http_status(status: reqwest::StatusCode) -> &'static str {
     match status.as_u16() {
@@ -654,7 +662,8 @@ impl RpcClient {
             };
             return Err(TridentError::rpc_kind(
                 anyhow::anyhow!(
-                    "{context}: endpoint {url} returned HTTP {} ({kind_label})",
+                    "{context}: endpoint {} returned HTTP {} ({kind_label})",
+                    crate::config::redact_rpc_urls(&[url.to_string()])[0],
                     status
                 ),
                 error_kind,

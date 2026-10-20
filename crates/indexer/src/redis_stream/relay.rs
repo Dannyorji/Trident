@@ -42,13 +42,42 @@ pub struct RelayConfig {
 
 pub struct OutboxRelay {
     db: PgPool,
-    redis: redis::aio::MultiplexedConnection,
+    redis_url: String,
+    redis: Option<redis::aio::MultiplexedConnection>,
     config: RelayConfig,
 }
 
 impl OutboxRelay {
     pub fn new(db: PgPool, redis: redis::aio::MultiplexedConnection, config: RelayConfig) -> Self {
-        Self { db, redis, config }
+        Self { db, redis_url: String::new(), redis: Some(redis), config }
+    }
+
+    pub fn new_with_config(
+        db: PgPool,
+        redis_url: String,
+        redis: Option<redis::aio::MultiplexedConnection>,
+        config: RelayConfig,
+    ) -> Self {
+        Self { db, redis_url, redis, config }
+    }
+
+    async fn ensure_redis(&mut self) -> Result<&mut redis::aio::MultiplexedConnection, TridentError> {
+        if self.redis.is_some() {
+            return Ok(self.redis.as_mut().unwrap());
+        }
+        // Try to reconnect with backoff logic
+        let client = redis::Client::open(self.redis_url.as_str()).map_err(|e| {
+            TridentError::rpc(anyhow::Error::new(e).context("Failed to create redis client"))
+        })?;
+        let conn = client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| {
+                TridentError::rpc(anyhow::Error::new(e).context("Failed to connect to redis"))
+            })?;
+        self.redis = Some(conn);
+        tracing::info!("Redis reconnected");
+        Ok(self.redis.as_mut().unwrap())
     }
 
     /// Run until `shutdown` is cancelled, publishing pending events every
@@ -124,10 +153,19 @@ impl OutboxRelay {
                 }
             };
 
+            let stream_maxlen = self.config.stream_maxlen;
+            let conn = match self.ensure_redis().await {
+                Ok(c) => c,
+                Err(e) => {
+                    metrics::record_outbox_publish_failure();
+                    failure = Some(e);
+                    break;
+                }
+            };
             match redis_stream::publish_event(
-                &mut self.redis,
+                conn,
                 &event,
-                self.config.stream_maxlen,
+                stream_maxlen,
                 Some(&record.event_id.to_string()),
                 &self.config.network,
             )
