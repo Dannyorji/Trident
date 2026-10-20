@@ -46,6 +46,10 @@ fn extract_context(metadata: &tonic::metadata::MetadataMap) -> opentelemetry::Co
 
 const REDIS_STREAM_KEY: &str = "trident:events";
 
+/// gRPC metadata key naming the network a StreamEvents subscriber may see. The
+/// API gateway sets it from the authenticated key's network (issue #741).
+const NETWORK_METADATA_KEY: &str = "x-trident-network";
+
 /// Default in-flight buffer per subscriber. Bounded so one slow consumer
 /// cannot make the server accumulate events without limit; when it fills, the
 /// consumer task blocks on send and stops reading Redis.
@@ -271,6 +275,8 @@ struct StreamSubscription {
     topic_0: Option<String>,
     /// Validated Redis stream ID to read from.
     start_id: String,
+    /// Network the subscriber is entitled to; `None` means unrestricted.
+    network: Option<String>,
 }
 
 /// Read one field of a stream entry as a string, defaulting to empty.
@@ -288,6 +294,24 @@ fn entry_field(entry: &redis::streams::StreamId, field: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Public event id of a stream entry: the event UUID the indexer wrote, so a
+/// streamed event can be correlated with `GET /v1/events/{id}` (issue #741).
+fn entry_event_id(entry: &redis::streams::StreamId) -> String {
+    let id = entry_field(entry, "id");
+    if id.is_empty() {
+        entry_field(entry, "event_id")
+    } else {
+        id
+    }
+}
+
+/// Whether an entry belongs to the subscriber's network. With no network
+/// requested every entry matches; with one requested, entries from another
+/// network (or written before the field existed) never do.
+fn network_matches(entry_network: &str, wanted: Option<&str>) -> bool {
+    wanted.is_none_or(|n| entry_network == n)
+}
+
 /// Consume the indexer's Redis stream and push matching events to one
 /// subscriber until the client goes away.
 ///
@@ -302,6 +326,7 @@ async fn run_stream_consumer(
         contract_id,
         topic_0,
         start_id,
+        network,
     } = subscription;
     let mut last_id = start_id;
 
@@ -326,6 +351,9 @@ async fn run_stream_consumer(
                         if entry_field(&entry, "contract_id") != contract_id {
                             continue;
                         }
+                        if !network_matches(&entry_field(&entry, "network"), network.as_deref()) {
+                            continue;
+                        }
 
                         let topics: Vec<String> =
                             serde_json::from_str(&entry_field(&entry, "topics"))
@@ -338,7 +366,7 @@ async fn run_stream_consumer(
                         }
 
                         let event = Event {
-                            id: String::new(),
+                            id: entry_event_id(&entry),
                             contract_id: entry_field(&entry, "contract_id"),
                             ledger_sequence: entry_field(&entry, "ledger_sequence")
                                 .parse()
@@ -518,6 +546,13 @@ impl Events for EventsServiceImpl {
         span.set_parent(parent_cx);
         let _entered = span.entered();
 
+        let network = request
+            .metadata()
+            .get(NETWORK_METADATA_KEY)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(str::to_string);
         let req = request.into_inner();
 
         if req.contract_id.is_empty() {
@@ -544,6 +579,7 @@ impl Events for EventsServiceImpl {
                 contract_id,
                 topic_0: topic_0_filter,
                 start_id: last_id,
+                network,
             },
         ));
 
@@ -1160,6 +1196,7 @@ mod tests {
                 contract_id: "CTEST_CANCEL".to_string(),
                 topic_0: None,
                 start_id: "$".to_string(),
+                network: None,
             },
         ));
 
@@ -1173,5 +1210,33 @@ mod tests {
             .await
             .expect("consumer did not stop after the receiver was dropped")
             .expect("consumer task panicked");
+    }
+
+    fn stream_entry(fields: &[(&str, &str)]) -> redis::streams::StreamId {
+        redis::streams::StreamId {
+            id: "1-0".into(),
+            map: fields
+                .iter()
+                .map(|(k, v)| (k.to_string(), redis::Value::Data(v.as_bytes().to_vec())))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn entry_event_id_prefers_id_then_event_id() {
+        assert_eq!(
+            entry_event_id(&stream_entry(&[("id", "a"), ("event_id", "b")])),
+            "a"
+        );
+        assert_eq!(entry_event_id(&stream_entry(&[("event_id", "b")])), "b");
+        assert_eq!(entry_event_id(&stream_entry(&[])), "");
+    }
+
+    #[test]
+    fn network_filter_blocks_other_networks() {
+        assert!(network_matches("mainnet", None));
+        assert!(network_matches("mainnet", Some("mainnet")));
+        assert!(!network_matches("testnet", Some("mainnet")));
+        assert!(!network_matches("", Some("mainnet")));
     }
 }

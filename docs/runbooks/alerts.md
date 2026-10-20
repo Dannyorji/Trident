@@ -359,6 +359,35 @@ absorbs on its own.
 3. As a mitigation, `GO_API_DB_POOL_SIZE` can be raised without a code
    change, but treat it as a stopgap if the root cause is a query regression.
 
+## TridentAPIKeyUsageUpdatesLost
+
+**Means:** `trident_api_key_usage_dropped_total` or
+`trident_api_key_usage_flush_failures_total` increased in the last 10 minutes.
+
+**Why it matters:** `request_count` / `last_used_at` back `GET /v1/usage`.
+A dropped update (tracker channel full) is lost for good; a failed flush is
+kept in memory and retried every tick, so it only loses data if the API
+restarts before the database recovers.
+
+**First steps:**
+1. Failed flushes: check Postgres health and the API's logs for
+   `api key usage flush failed`.
+2. Dropped updates: the 4096-slot channel is overflowing, meaning the flush
+   goroutine is stalled behind a slow database. Fix the database first.
+
+## TridentAPIAuthLookupUnavailable
+
+**Means:** API-key lookups are failing with an infrastructure error (timeout,
+pool exhaustion, failover), counted as
+`trident_auth_key_lookup_failures_total{outcome="unavailable"}`.
+
+**Impact:** clients whose key is not in the Redis auth cache get
+`503 UNAVAILABLE` with `Retry-After`, which SDKs retry. Unknown keys are
+counted separately as `outcome="not_found"` (401) and expired keys as
+`outcome="expired"`.
+
+**First steps:** see `TridentAPIDBPoolSaturated` and check Postgres health.
+
 
 ---
 
@@ -947,6 +976,42 @@ giving earlier warning than `TridentOutboxBacklogWarning` alone.
    is still flat before treating this as urgent.
 3. See `TridentOutboxBacklogWarning`/`TridentOutboxBacklogCritical` above
    for what to do once the backlog itself starts climbing.
+
+---
+
+## TridentOutboxUndecodablePayloads
+
+**Means:** `trident_indexer_outbox_undecodable_total` increased in the last
+hour. The relay found an `event_outbox` row whose stored JSON could not be
+decoded back into a `SorobanEvent` and dead-lettered it (issue #739).
+
+**Why this threshold:** such a row can never be published — retrying cannot
+turn an undecodable payload into a valid one — so the relay marks it instead
+of blocking the queue. The row stays `published = FALSE` (nothing reached
+Redis), is excluded from `trident_indexer_outbox_backlog`, and is retained in
+`event_outbox` with `dead_lettered_at`/`dead_letter_reason` for audit. The
+event is lost to live subscribers, so any increase is worth investigating.
+
+**First steps:**
+1. Find the dead-lettered rows:
+   `SELECT seq, event_id, created_at, dead_letter_reason FROM event_outbox
+   WHERE dead_lettered_at IS NOT NULL ORDER BY seq DESC LIMIT 20;`
+2. Check the relay log for `Undecodable outbox payload, dead-lettering` —
+   it carries the `seq`, `event_id` and full decode error.
+3. Compare the row's `payload` against the current `SorobanEvent` schema
+   (`crates/common/src/types.rs`). A single bad row may be a producer bug; a
+   burst right after a deploy usually means a payload-shape change shipped
+   without a migration or a versioned decoder.
+4. Do not delete the rows while investigating — they are the only copy of
+   the affected events outside `soroban_events`. The original event is still
+   in `soroban_events` (the outbox row references it by deterministic
+   `event_id`), so REST clients can still retrieve it; only stream delivery
+   was skipped.
+5. If the payload shape is understood and fixable, republish by clearing
+   `dead_lettered_at` after correcting the payload (or let a backfill
+   re-commit the event). Note that `published = FALSE AND dead_lettered_at
+   IS NULL` is the relay's fetch predicate, so clearing the marker alone is
+   enough to retry.
 
 ---
 

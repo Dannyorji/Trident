@@ -9,6 +9,11 @@
 //! ordering is preserved and nothing is lost. The next pass resumes at the
 //! failed row. That makes delivery at-least-once — consumers dedupe by event
 //! id (see `db::outbox`).
+//!
+//! The one exception is a payload that cannot be decoded: no retry can fix it,
+//! so instead of blocking the queue forever the row is dead-lettered (issue
+//! #739). It stays `published = FALSE` — nothing reached Redis — and is
+//! excluded from the backlog once marked.
 
 use std::time::Duration;
 
@@ -31,17 +36,48 @@ pub struct RelayConfig {
     pub backlog_alert_threshold: i64,
     /// Redis stream trim length, mirrors the direct-publish path.
     pub stream_maxlen: u64,
+    /// Network written on every stream entry (issue #741).
+    pub network: String,
 }
 
 pub struct OutboxRelay {
     db: PgPool,
-    redis: redis::aio::MultiplexedConnection,
+    redis_url: String,
+    redis: Option<redis::aio::MultiplexedConnection>,
     config: RelayConfig,
 }
 
 impl OutboxRelay {
     pub fn new(db: PgPool, redis: redis::aio::MultiplexedConnection, config: RelayConfig) -> Self {
-        Self { db, redis, config }
+        Self { db, redis_url: String::new(), redis: Some(redis), config }
+    }
+
+    pub fn new_with_config(
+        db: PgPool,
+        redis_url: String,
+        redis: Option<redis::aio::MultiplexedConnection>,
+        config: RelayConfig,
+    ) -> Self {
+        Self { db, redis_url, redis, config }
+    }
+
+    async fn ensure_redis(&mut self) -> Result<&mut redis::aio::MultiplexedConnection, TridentError> {
+        if self.redis.is_some() {
+            return Ok(self.redis.as_mut().unwrap());
+        }
+        // Try to reconnect with backoff logic
+        let client = redis::Client::open(self.redis_url.as_str()).map_err(|e| {
+            TridentError::rpc(anyhow::Error::new(e).context("Failed to create redis client"))
+        })?;
+        let conn = client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| {
+                TridentError::rpc(anyhow::Error::new(e).context("Failed to connect to redis"))
+            })?;
+        self.redis = Some(conn);
+        tracing::info!("Redis reconnected");
+        Ok(self.redis.as_mut().unwrap())
     }
 
     /// Run until `shutdown` is cancelled, publishing pending events every
@@ -94,24 +130,44 @@ impl OutboxRelay {
             let event = match record.event() {
                 Ok(event) => event,
                 Err(e) => {
-                    // A payload we cannot decode will never publish. Mark it so
-                    // it stops blocking the queue; the row is retained for audit.
+                    // A payload we cannot decode will never publish. Dead-letter
+                    // it so it stops blocking the queue without pretending it
+                    // reached Redis; the row is retained for audit (issue #739).
                     tracing::error!(
                         seq = record.seq,
                         event_id = %record.event_id,
                         error = %e,
-                        "Undecodable outbox payload, skipping"
+                        "Undecodable outbox payload, dead-lettering"
                     );
-                    published_seqs.push(record.seq);
+                    if let Err(mark_err) =
+                        outbox::mark_dead_lettered(&self.db, record.seq, &e.to_string()).await
+                    {
+                        // Could not record the dead letter: stop the batch so the
+                        // next pass retries it, but still mark what was already
+                        // delivered (as with a publish failure).
+                        failure = Some(mark_err);
+                        break;
+                    }
+                    metrics::record_outbox_undecodable();
                     continue;
                 }
             };
 
+            let stream_maxlen = self.config.stream_maxlen;
+            let conn = match self.ensure_redis().await {
+                Ok(c) => c,
+                Err(e) => {
+                    metrics::record_outbox_publish_failure();
+                    failure = Some(e);
+                    break;
+                }
+            };
             match redis_stream::publish_event(
-                &mut self.redis,
+                conn,
                 &event,
-                self.config.stream_maxlen,
+                stream_maxlen,
                 Some(&record.event_id.to_string()),
+                &self.config.network,
             )
             .await
             {

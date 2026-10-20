@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/sync/singleflight"
 )
@@ -275,11 +276,76 @@ func ResponseCache(rdb *redis.Client, ttl time.Duration, keyFn CacheKeyFunc) fun
 	}
 }
 
+const (
+	// cacheVersionTTL bounds how long an idle contract's version key lives
+	// (issue #750). It must stay well above the longest response-cache TTL
+	// (5 minutes today): every entry written under a version has expired
+	// before that version's counter can, so a reset counter never re-issues
+	// a number an old entry still carries. Refreshed on every bump.
+	cacheVersionTTL = 24 * time.Hour
+
+	// invalidatorLeaderKey is the Redis lease that elects the one replica
+	// whose invalidator consumes the stream (issue #750).
+	invalidatorLeaderKey = "cacheinvalidator:leader"
+
+	invalidatorLeaseTTL = 15 * time.Second
+)
+
+// bumpCacheVersions advances each distinct contract's cache version once for
+// the whole batch (issue #750) and refreshes its TTL, in one pipeline round
+// trip. N events for one contract cost one INCR, not N.
+func bumpCacheVersions(ctx context.Context, rdb *redis.Client, msgs []redis.XMessage) error {
+	seen := make(map[string]struct{}, len(msgs))
+	pipe := rdb.Pipeline()
+	for _, msg := range msgs {
+		contractID := contractIDFromStreamMessage(msg.Values)
+		if contractID == "" {
+			continue
+		}
+		if _, dup := seen[contractID]; dup {
+			continue
+		}
+		seen[contractID] = struct{}{}
+		key := cacheVersionKey(contractID)
+		pipe.Incr(ctx, key)
+		pipe.Expire(ctx, key, cacheVersionTTL)
+	}
+	if len(seen) == 0 {
+		return nil
+	}
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// holdInvalidatorLease acquires the leader lease, or renews it if this
+// replica (id) already holds it, and reports whether it is the leader.
+func holdInvalidatorLease(ctx context.Context, rdb *redis.Client, id string, lease time.Duration) bool {
+	ok, err := rdb.SetNX(ctx, invalidatorLeaderKey, id, lease).Result()
+	if err != nil {
+		return false
+	}
+	if ok {
+		return true
+	}
+	holder, err := rdb.Get(ctx, invalidatorLeaderKey).Result()
+	if err != nil || holder != id {
+		return false
+	}
+	return rdb.PExpire(ctx, invalidatorLeaderKey, lease).Err() == nil
+}
+
 // StartCacheInvalidator subscribes (best-effort, no consumer group) to the
 // Redis Stream the indexer publishes events to, and bumps each event's
 // contract's cache version (issue #221) so ResponseCache-wrapped endpoints
 // stop serving pre-event responses immediately rather than waiting out the
 // full TTL.
+//
+// It runs on every API replica but only the replica holding a short Redis
+// lease actually consumes the stream (issue #750), so an event costs one
+// INCR rather than one per replica; the others poll the lease and take over
+// if the holder dies. Within a read batch, events for the same contract are
+// coalesced into a single INCR. A new leader starts from the stream tail:
+// events in the hand-over gap just expire by TTL.
 //
 // Deliberately not a durable consumer group like ws.StartConsumer: a missed
 // message here just means an affected cache entry survives until its TTL
@@ -290,10 +356,23 @@ func ResponseCache(rdb *redis.Client, ttl time.Duration, keyFn CacheKeyFunc) fun
 //
 // Returns once ctx is cancelled.
 func StartCacheInvalidator(ctx context.Context, rdb *redis.Client, streamKey string) {
+	runCacheInvalidator(ctx, rdb, streamKey, invalidatorLeaseTTL)
+}
+
+func runCacheInvalidator(ctx context.Context, rdb *redis.Client, streamKey string, lease time.Duration) {
 	if rdb == nil {
 		return
 	}
+	id := uuid.NewString()
+	// The lease is renewed once per loop, so a blocking read must finish well
+	// inside it.
+	block := lease / 3
+	if block > 5*time.Second {
+		block = 5 * time.Second
+	}
+
 	lastID := "$" // start from "new messages only", like ws.StartConsumer's initial XGroupCreate position.
+	leader := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -301,9 +380,23 @@ func StartCacheInvalidator(ctx context.Context, rdb *redis.Client, streamKey str
 		default:
 		}
 
+		if !holdInvalidatorLease(ctx, rdb, id, lease) {
+			leader = false
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(block):
+			}
+			continue
+		}
+		if !leader {
+			leader = true
+			lastID = "$"
+		}
+
 		entries, err := rdb.XRead(ctx, &redis.XReadArgs{
 			Streams: []string{streamKey, lastID},
-			Block:   5 * time.Second,
+			Block:   block,
 			Count:   100,
 		}).Result()
 		if err != nil {
@@ -318,12 +411,12 @@ func StartCacheInvalidator(ctx context.Context, rdb *redis.Client, streamKey str
 		}
 
 		for _, stream := range entries {
-			for _, msg := range stream.Messages {
-				lastID = msg.ID
-				contractID := contractIDFromStreamMessage(msg.Values)
-				if contractID != "" {
-					rdb.Incr(ctx, cacheVersionKey(contractID))
-				}
+			if len(stream.Messages) == 0 {
+				continue
+			}
+			lastID = stream.Messages[len(stream.Messages)-1].ID
+			if err := bumpCacheVersions(ctx, rdb, stream.Messages); err != nil && ctx.Err() == nil {
+				slog.Warn("cache invalidation failed; entries expire by TTL", "error", err)
 			}
 		}
 	}

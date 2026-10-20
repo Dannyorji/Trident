@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -10,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
+	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/Depo-dev/trident/services/api/validation"
 	"github.com/redis/go-redis/v9"
 )
@@ -25,6 +25,11 @@ const (
 	sseWriteDeadline = 10 * time.Second
 )
 
+// sseHeartbeatInterval is how often an idle stream emits a comment frame. It
+// stays well under the 60s idle timeouts of the Helm nginx config and common
+// cloud load balancers.
+var sseHeartbeatInterval = 15 * time.Second
+
 type streamRedisClient interface {
 	XRead(ctx context.Context, a *redis.XReadArgs) *redis.XStreamSliceCmd
 	XRevRangeN(ctx context.Context, key, start, stop string, count int64) *redis.XMessageSliceCmd
@@ -35,8 +40,13 @@ type streamRedisClient interface {
 const eventStreamGapEvent = `event: gap\ndata: {"message":"requested Last-Event-ID is outside the retention window; resuming from oldest available"}\n\n`
 
 // Stream returns an SSE handler that forwards new Redis Stream events for one
-// contract. The handler owns the blocking read loop, so request cancellation
-// stops all streaming work without a detached goroutine.
+// contract. All connections share one blocking XREAD (see streamFanout), so
+// Redis connection use does not grow with the number of clients, and an idle
+// stream emits a `: ping` comment every sseHeartbeatInterval so proxies do not
+// time it out.
+//
+// Events are limited to the authenticated key's network, and every payload
+// carries the event UUID as `id` (issue #741).
 //
 // It honours the standard SSE Last-Event-ID header (issue #235):
 //   - On first connect: tail the stream from the latest id.
@@ -46,6 +56,7 @@ const eventStreamGapEvent = `event: gap\ndata: {"message":"requested Last-Event-
 //   - Every SSE event includes an `id:` field so the browser automatically sends
 //     Last-Event-ID on reconnect.
 func Stream(rdb streamRedisClient) http.HandlerFunc {
+	fanout := newStreamFanout(rdb)
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		if verr := validation.RejectUnknownParams(q, "contractId", "topic0"); verr != nil {
@@ -63,15 +74,27 @@ func Stream(rdb streamRedisClient) http.HandlerFunc {
 
 		rc := http.NewResponseController(w)
 
+		// Subscribe before resolving the resume point so nothing published
+		// while the replay runs is missed; live entries already replayed are
+		// dropped by id below.
+		sub, err := fanout.subscribe(r.Context())
+		if err != nil {
+			if r.Context().Err() != nil {
+				return
+			}
+			slog.Error("sse: failed to read Redis Stream tail", "err", err)
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "event stream is unavailable")
+			return
+		}
+		defer fanout.unsubscribe(sub)
+
 		// Honour Last-Event-ID for resumption (issue #235).
-		// If the header is present and non-empty, try to resume from that point.
-		lastID := ""
+		replayFrom := ""
 		if lastEventID := r.Header.Get("Last-Event-ID"); lastEventID != "" {
 			// Verify the requested id exists in the stream. If not, emit a gap
 			// signal and resume from the oldest available.
 			msgs, lookupErr := rdb.XRevRangeN(r.Context(), eventStreamKey, lastEventID, lastEventID, 1).Result()
 			if lookupErr != nil || len(msgs) == 0 {
-				// Emit a gap event so the client knows data was lost.
 				if _, writeErr := fmt.Fprint(w, eventStreamGapEvent); writeErr != nil {
 					slog.Warn("sse: write failed, disconnecting slow consumer", "contractId", contractID, "err", writeErr)
 					return
@@ -87,22 +110,9 @@ func Stream(rdb streamRedisClient) http.HandlerFunc {
 					httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "event stream is unavailable")
 					return
 				}
-				lastID = oldest
+				replayFrom = oldest
 			} else {
-				lastID = lastEventID
-			}
-		}
-
-		if lastID == "" {
-			var err error
-			lastID, err = latestStreamID(r.Context(), rdb)
-			if err != nil {
-				if r.Context().Err() != nil {
-					return
-				}
-				slog.Error("sse: failed to read Redis Stream tail", "err", err)
-				httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "event stream is unavailable")
-				return
+				replayFrom = lastEventID
 			}
 		}
 
@@ -118,59 +128,91 @@ func Stream(rdb streamRedisClient) http.HandlerFunc {
 		}
 
 		topic0 := q.Get("topic0")
+		network := middleware.NetworkFromContext(r.Context())
 
-		for {
-			streams, readErr := rdb.XRead(r.Context(), &redis.XReadArgs{
-				Streams: []string{eventStreamKey, lastID},
-				Count:   100,
-				Block:   streamReadWait,
-			}).Result()
+		// write emits one frame under the write deadline. It reports false when
+		// the client is gone or too slow and the handler must return.
+		write := func(frame string) bool {
+			if err := rc.SetWriteDeadline(time.Now().Add(sseWriteDeadline)); err != nil &&
+				!errors.Is(err, http.ErrNotSupported) {
+				slog.Warn("sse: failed to set write deadline", "err", err)
+			}
+			_, err := fmt.Fprint(w, frame)
+			if err == nil {
+				// The flush is where a stalled socket usually times out, so its
+				// error must count as a failed write too.
+				err = rc.Flush()
+			}
+			if err != nil {
+				metricSSESlowConsumerDisconnects.Add(1)
+				slog.Warn("sse: write failed, disconnecting slow consumer", "contractId", contractID, "err", err)
+				return false
+			}
+			return true
+		}
+		wanted := func(ev sseEvent) bool {
+			return ev.ContractID == contractID && ev.Network == network && (topic0 == "" || ev.Topic0 == topic0)
+		}
+		// Emit SSE id: field so browsers auto-send Last-Event-ID on reconnect.
+		send := func(ev sseEvent) bool {
+			return write(fmt.Sprintf("id: %s\ndata: %s\n\n", ev.StreamID, ev.Payload))
+		}
 
-			if readErr != nil {
-				if r.Context().Err() != nil {
-					return
+		lastSent := ""
+		if replayFrom != "" {
+			cursor := replayFrom
+			for {
+				streams, readErr := rdb.XRead(r.Context(), &redis.XReadArgs{
+					Streams: []string{eventStreamKey, cursor},
+					Count:   100,
+					Block:   -1,
+				}).Result()
+				if readErr != nil || len(streams) == 0 {
+					if readErr != nil && !errors.Is(readErr, redis.Nil) && r.Context().Err() == nil {
+						slog.Warn("sse: replay read failed", "err", readErr)
+					}
+					break
 				}
-				if errors.Is(readErr, redis.Nil) {
-					continue
+				progressed := false
+				for _, stream := range streams {
+					for _, msg := range stream.Messages {
+						cursor, lastSent, progressed = msg.ID, msg.ID, true
+						if ev, ok := newSSEEvent(msg); ok && wanted(ev) && !send(ev) {
+							return
+						}
+					}
 				}
-
-				slog.Warn("sse: Redis XREAD failed", "err", readErr)
-				select {
-				case <-r.Context().Done():
-					return
-				case <-time.After(time.Second):
-					continue
+				if !progressed {
+					break
 				}
 			}
+		}
 
-			for _, stream := range streams {
-				for _, msg := range stream.Messages {
-					lastID = msg.ID
-
-					if redisString(msg.Values["contract_id"]) != contractID {
-						continue
-					}
-					if topic0 != "" && !matchesTopic0(msg.Values, topic0) {
-						continue
-					}
-
-					payload, marshalErr := json.Marshal(msg.Values)
-					if marshalErr != nil {
-						slog.Warn("sse: failed to marshal stream event", "id", msg.ID, "err", marshalErr)
-						continue
-					}
-
-					if err := rc.SetWriteDeadline(time.Now().Add(sseWriteDeadline)); err != nil &&
-						!errors.Is(err, http.ErrNotSupported) {
-						slog.Warn("sse: failed to set write deadline", "err", err)
-					}
-					// Emit SSE id: field so browsers auto-send Last-Event-ID on reconnect.
-					if _, writeErr := fmt.Fprintf(w, "id: %s\ndata: %s\n\n", msg.ID, payload); writeErr != nil {
+		heartbeat := time.NewTicker(sseHeartbeatInterval)
+		defer heartbeat.Stop()
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-heartbeat.C:
+				// A comment frame keeps idle-timeout proxies and load
+				// balancers from closing a quiet stream.
+				if !write(": ping\n\n") {
+					return
+				}
+			case ev, ok := <-sub.ch:
+				if !ok {
+					if fanout.wasOverflowed(sub) {
 						metricSSESlowConsumerDisconnects.Add(1)
-						slog.Warn("sse: write failed, disconnecting slow consumer", "contractId", contractID, "err", writeErr)
-						return
+						slog.Warn("sse: client fell behind the shared reader, disconnecting", "contractId", contractID)
 					}
-					_ = rc.Flush()
+					return
+				}
+				if lastSent != "" && !streamIDAfter(ev.StreamID, lastSent) {
+					continue
+				}
+				if wanted(ev) && !send(ev) {
+					return
 				}
 			}
 		}
@@ -200,15 +242,6 @@ func earliestStreamID(ctx context.Context, rdb streamRedisClient) (string, error
 		return "0-0", nil
 	}
 	return messages[0].ID, nil
-}
-
-func matchesTopic0(values map[string]any, want string) bool {
-	var topics []string
-	if err := json.Unmarshal([]byte(redisString(values["topics"])), &topics); err != nil {
-		// Malformed topics cannot safely satisfy a server-side filter, so skip.
-		return false
-	}
-	return len(topics) > 0 && topics[0] == want
 }
 
 func redisString(value any) string {

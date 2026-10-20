@@ -137,6 +137,9 @@ class APIKeyResponse:
     rate_limit_tier: str
     request_count: int
     created_by: str | None = None
+    expires_at: str | None = None
+    """When the key stops authenticating. Omitted for a key that never expires."""
+
     key: str | None = None
     """Raw key, returned only at creation time."""
 
@@ -154,9 +157,10 @@ class APIKeyResponse:
         rate_limit_tier = from_str(obj.get("rate_limit_tier"))
         request_count = from_int(obj.get("request_count"))
         created_by = from_union([from_str, from_none], obj.get("created_by"))
+        expires_at = from_union([from_str, from_none], obj.get("expires_at"))
         key = from_union([from_str, from_none], obj.get("key"))
         revoked_at = from_union([from_str, from_none], obj.get("revoked_at"))
-        return APIKeyResponse(created_at, id, key_prefix, label, last_used_at, network, rate_limit_tier, request_count, created_by, key, revoked_at)
+        return APIKeyResponse(created_at, id, key_prefix, label, last_used_at, network, rate_limit_tier, request_count, created_by, expires_at, key, revoked_at)
 
     def to_dict(self) -> dict:
         result: dict = {}
@@ -170,6 +174,8 @@ class APIKeyResponse:
         result["request_count"] = from_int(self.request_count)
         if self.created_by is not None:
             result["created_by"] = from_union([from_str, from_none], self.created_by)
+        if self.expires_at is not None:
+            result["expires_at"] = from_union([from_str, from_none], self.expires_at)
         if self.key is not None:
             result["key"] = from_union([from_str, from_none], self.key)
         if self.revoked_at is not None:
@@ -657,6 +663,7 @@ class Code(Enum):
     """Machine-readable error code. Matches httputil.ErrorCode exactly
     (services/api/internal/httputil/errors.go).
     """
+    API_KEY_EXPIRED = "API_KEY_EXPIRED"
     CONFLICT = "CONFLICT"
     FORBIDDEN = "FORBIDDEN"
     INTERNAL = "INTERNAL"

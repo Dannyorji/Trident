@@ -33,6 +33,14 @@ Ordering within the stream follows the outbox `seq`. A batch stops at the first
 publish failure and only the rows published before it are marked, so the next
 pass resumes at the failed row rather than skipping past it.
 
+The one exception is a payload the relay cannot decode (issue #739). No retry
+can fix it, so the row is dead-lettered — `dead_lettered_at` and
+`dead_letter_reason` are set — instead of blocking the queue forever or being
+pretended into `published = TRUE`. It stays `published = FALSE` because nothing
+reached Redis, but it is excluded from both the fetch set and the backlog gauge,
+and it increments `trident_indexer_outbox_undecodable_total`. The row is
+retained for audit rather than deleted.
+
 ## Metrics
 
 | Metric | Type | Meaning |
@@ -40,6 +48,7 @@ pass resumes at the failed row rather than skipping past it.
 | `trident_indexer_outbox_backlog` | gauge | Committed events not yet published |
 | `trident_indexer_outbox_published_total` | counter | Events delivered to the stream by the relay |
 | `trident_indexer_outbox_publish_failures_total` | counter | Failed publish attempts |
+| `trident_indexer_outbox_undecodable_total` | counter | Rows whose stored payload could not be decoded and were dead-lettered (issue #739) |
 | `trident_indexer_rpc_timeouts_total` | counter | RPC calls aborted by the connect or request timeout |
 | `trident_indexer_rpc_active_endpoint` | gauge | Index of the RPC endpoint in use, `0` = primary |
 | `trident_indexer_rpc_failovers_total` | counter | Switches to a different RPC endpoint |
