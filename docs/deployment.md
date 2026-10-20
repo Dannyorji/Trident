@@ -47,6 +47,9 @@ Open `.env` and set every value below. Do not leave defaults in production.
 | `LOG_LEVEL` | One of `error`, `warn`, `info`, `debug`, `trace` (use `info` in production) |
 | `PORT` | API listen port (default: `3000`) |
 | `API_KEY_SALT` | Random secret for hashing API keys — **must be changed** |
+| `APP_ENV` | Set `production` in production — enables JSON structured logging and requires `IDEMPOTENCY_ENCRYPTION_KEY` to be set (the API refuses to start otherwise) |
+| `IDEMPOTENCY_ENCRYPTION_KEY` | 64 hex characters (32 bytes), e.g. `openssl rand -hex 32` — encrypts `Idempotency-Key` records at rest in Redis and lets every `api` replica read records any other replica wrote. Required when `APP_ENV=production`; with more than one replica, running without it means a retried `POST /v1/api-keys` or `POST /v1/webhooks` that lands on a different replica (or the same replica after a restart) cannot decrypt the first attempt's record and mints a second credential. See [Rotating `IDEMPOTENCY_ENCRYPTION_KEY`](#rotating-idempotency_encryption_key). |
+| `IDEMPOTENCY_ENCRYPTION_KEY_PREVIOUS` | Optional. Set only while rotating `IDEMPOTENCY_ENCRYPTION_KEY` — see below. |
 | `POSTGRES_USER` | PostgreSQL username |
 | `POSTGRES_PASSWORD` | PostgreSQL password |
 | `POSTGRES_DB` | PostgreSQL database name |
@@ -424,6 +427,33 @@ curl https://your-domain.com/v1/ready
      up -d --no-deps api indexer
    ```
 
+### `IDEMPOTENCY_ENCRYPTION_KEY` {#rotating-idempotency_encryption_key}
+
+Unlike the secrets above, this one supports a no-downtime overlap window:
+`IDEMPOTENCY_ENCRYPTION_KEY_PREVIOUS` lets every `api` replica keep decrypting
+records written under the old key while new records are written under the
+new one, so an in-flight retry doesn't fail to decrypt mid-rotation.
+
+1. Move the current value of `IDEMPOTENCY_ENCRYPTION_KEY` into
+   `IDEMPOTENCY_ENCRYPTION_KEY_PREVIOUS` in `.env`.
+2. Generate a new key and set it as `IDEMPOTENCY_ENCRYPTION_KEY`:
+   ```bash
+   openssl rand -hex 32
+   ```
+3. Restart every `api` replica (all of them — a replica still running the
+   old binary's env is fine, since it's still the same old key, but every
+   replica must pick up both new env vars before the old key is removed in
+   step 5):
+   ```bash
+   docker compose -f docker/docker-compose.yml -f docker/docker-compose.prod.yml \
+     up -d --no-deps api
+   ```
+4. Wait at least the idempotency record TTL (`DefaultIdempotencyTTL`, 24h by
+   default) so every record written under the old key has expired.
+5. Remove `IDEMPOTENCY_ENCRYPTION_KEY_PREVIOUS` from `.env` and restart `api`
+   again. Leaving a rotated-out key configured indefinitely keeps a decrypt
+   path open for no benefit.
+
 ---
 
 ## Monitoring
@@ -748,7 +778,8 @@ fly secrets set -a trident-indexer NETWORK="mainnet"
 fly secrets set -a trident-api \
   API_KEY_SALT="$(openssl rand -hex 32)" \
   ADMIN_API_KEY="$(openssl rand -hex 32)" \
-  API_KEY_HASHES="<hex(hmac_sha256(salt, key)) list, comma-separated>"
+  API_KEY_HASHES="<hex(hmac_sha256(salt, key)) list, comma-separated>" \
+  IDEMPOTENCY_ENCRYPTION_KEY="$(openssl rand -hex 32)"
 ```
 `services/api/main.go` does not hard-exit on a missing `DATABASE_URL` or
 `REDIS_URL` — it falls back to `redis://localhost:6379` and serves
@@ -757,6 +788,17 @@ check logs; always set both explicitly in production. `API_KEY_SALT` is
 read by `services/api/middleware/auth.go` to HMAC every incoming API key.
 `API_KEY_HASHES` is the legacy env-var auth allowlist; skip it only if every
 API key is issued through the DB-backed `/v1/admin/keys` endpoints instead.
+`IDEMPOTENCY_ENCRYPTION_KEY` is required because `fly/api.toml` sets
+`APP_ENV=production` in `[env]`, which makes
+`middleware.ValidateIdempotencyEncryptionConfig` exit the process at startup
+if it's unset — `trident-api` runs 2+ machines (see
+[Scaling](#scaling)), and without a shared key one machine can't decrypt an
+idempotency record another machine wrote, letting a retried
+`POST /v1/api-keys` or `POST /v1/webhooks` double-create. See
+[Rotating `IDEMPOTENCY_ENCRYPTION_KEY`](#rotating-idempotency_encryption_key)
+to rotate it without downtime (`fly secrets set` the old value as
+`IDEMPOTENCY_ENCRYPTION_KEY_PREVIOUS` alongside the new
+`IDEMPOTENCY_ENCRYPTION_KEY`, same procedure otherwise).
 Optional secrets: `STELLAR_RPC_URL` (enables the admin contract-call
 endpoint) and `PGBOUNCER_ADMIN_URL` (enables `GET /v1/admin/db`).
 
