@@ -438,6 +438,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             batch_size: cfg.outbox_batch_size,
             backlog_alert_threshold: cfg.outbox_backlog_alert_threshold,
             stream_maxlen: cfg.redis_stream_maxlen,
+            network: cfg.network.clone(),
         },
     );
     let relay_shutdown = shutdown.clone();

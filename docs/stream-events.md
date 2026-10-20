@@ -13,6 +13,15 @@ directly — the Go layer fans it out over SSE and WebSocket.
 | `topic_0`     | Optional. Only events whose first topic matches are pushed.    |
 | `start_id`    | Optional resume point. Empty means live tail.                  |
 
+## Network and event id
+
+Every stream entry carries `network` and the event UUID (`id`, also written as
+`event_id`), so a streamed event's `id` equals the id returned by
+`GET /v1/events/{id}`. Send the subscriber key's network in the
+`x-trident-network` request metadata; entries from any other network are never
+pushed. SSE applies the authenticated key's network the same way, and sends a
+`: ping` comment every 15 seconds on an idle stream so proxies do not close it.
+
 ## Resuming
 
 `start_id` is a Redis stream entry ID — `<millis>-<seq>` — normally the last ID
