@@ -380,9 +380,10 @@ func main() {
 	defer profiling.Shutdown(pprofSrv)
 
 	// Internal Prometheus metrics server on METRICS_PORT (default 9091,
-	// issue #58) — separate port from the public API and from the legacy
-	// /metrics route mounted above.
-	metricsSrv := metrics.Start()
+	// issue #58) — the only place metrics are served. The public listener has
+	// no /metrics route; the hand-rolled legacy metrics live at
+	// /metrics/legacy on this port.
+	metricsSrv := metrics.Start(handlers.MetricsHandler(pool, redisClient))
 	defer metrics.Shutdown(metricsSrv)
 
 	// Grace period mirrors Helm terminationGracePeriodSeconds (default 30s).

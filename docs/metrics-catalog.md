@@ -46,9 +46,12 @@ port `9090`, set via `METRICS_PORT`). Defined in
 
 ## Go API (`services/api`)
 
-Scrapeable at `GET http://<api-host>:<PORT>/metrics` (default port `3000`,
-`PORT` env var; no auth required — `/metrics` is on the public-path
-allowlist in `middleware.NewDBAuth`). Defined across
+Scrapeable only on the API's internal metrics port,
+`GET http://<api-host>:<METRICS_PORT>/metrics` (default `9091`) — the public
+API port (`PORT`) does not serve `/metrics`, and nginx returns 404 for it. The
+hand-rolled metrics described below (indexer freshness, webhook, rate-limit and
+concurrency counters, DB pool and Redis stream length) are on the same internal
+port at `/metrics/legacy`; Prometheus should scrape both paths. Defined across
 [`services/api/handlers/stats.go`](../services/api/handlers/stats.go),
 [`services/api/middleware/metrics.go`](../services/api/middleware/metrics.go),
 and
@@ -68,7 +71,7 @@ and
 | `trident_api_db_pool_total_connections` | gauge | — | connections | Idle + acquired. |
 | `trident_api_db_pool_max_connections` | gauge | — | connections | Configured pool ceiling (`GO_API_DB_POOL_SIZE`, default 5). |
 | `trident_api_redis_stream_length` | gauge | — | messages | `XLEN` of the `trident:events` Redis Stream — the indexer→API consumer backlog (#201). Omitted from the scrape if Redis is unreachable at scrape time. |
-| `trident_retention_rows_deleted_total` | counter | `table` | rows | Rows deleted by the periodic retention job (`startRetentionJob`, `services/api/main.go`) per table (issue #604). Makes a disk-growth alert's remediation observable: a flat counter alongside a still-firing disk alert means the job is running but not keeping up, not that it silently stopped. **Note:** unlike the rest of this table, this metric is on the separate `internal/metrics` registry (`METRICS_PORT`, default `9091`), not the public `/metrics` endpoint above — that registry has no catalog section of its own yet. |
+| `trident_retention_rows_deleted_total` | counter | `table` | rows | Rows deleted by the periodic retention job (`startRetentionJob`, `services/api/main.go`) per table (issue #604). Makes a disk-growth alert's remediation observable: a flat counter alongside a still-firing disk alert means the job is running but not keeping up, not that it silently stopped. **Note:** unlike the rest of this table, this metric is on the `internal/metrics` registry served at `/metrics` on `METRICS_PORT` (default `9091`), not the hand-rolled `/metrics/legacy` set above — that registry has no catalog section of its own yet. |
 
 ## Internal gRPC events backend (`crates/api`)
 

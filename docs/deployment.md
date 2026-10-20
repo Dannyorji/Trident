@@ -823,7 +823,7 @@ lasting change.
   `crates/indexer/src/health.rs`). These are also wired into `fly/indexer.toml`
   under the top-level `[checks]` section so Fly restarts the machine if
   readiness fails, not just if the TCP port stops accepting connections.
-- **Go API metrics**: `GET /metrics` on the public `trident-api` endpoint
+- **Go API metrics**: `GET /metrics` and `GET /metrics/legacy` on the internal `METRICS_PORT` (default 9091) — reachable on the 6PN only; the public `trident-api` endpoint does not serve `/metrics`
 - **Go API health check**: `GET /v1/ready` (used by Fly's HTTP service check
   in `fly/api.toml` to gate traffic routing). `/v1/ready` verifies
   Postgres/Redis/gRPC reachability, unlike `/v1/health`, which is a cheap

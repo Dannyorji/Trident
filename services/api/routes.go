@@ -234,9 +234,6 @@ func routeBindings() []routeBinding {
 		documented("POST", "/v1/webhooks/{id}/dead-letters/{deliveryId}/replay", func(d routeDeps) http.Handler {
 			return replayDeadLetterHandler(d.webhookDB)
 		}),
-		documented("GET", "/metrics", func(d routeDeps) http.Handler {
-			return handlers.MetricsHandler(d.pool, d.redisClient)
-		}),
 		internalOnly("GET", "/internal/status", "operator-facing internals, not part of the public v1 surface",
 			func(d routeDeps) http.Handler { return handlers.InternalStatus() }),
 		internalOnly("", "/ws", "WebSocket upgrade endpoint; documented in the WebSocket guide, not representable as an OpenAPI operation",

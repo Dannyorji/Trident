@@ -867,8 +867,9 @@ jobs:
         run: |
           chmod +x scripts/verify-alert-metrics.sh
           ./scripts/verify-alert-metrics.sh \
-            http://localhost:3000/metrics \
-            http://localhost:9090/metrics
+            http://localhost:9091/metrics \
+            http://localhost:9090/metrics \
+            http://localhost:9091/metrics/legacy
 
       - name: Validate every documented operation against OpenAPI
         working-directory: services/api

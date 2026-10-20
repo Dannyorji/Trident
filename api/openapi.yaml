@@ -1736,24 +1736,6 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
-  /metrics:
-    get:
-      summary: Prometheus metrics
-      description: Exposes Prometheus-formatted metrics
-      operationId: getMetrics
-      tags:
-        - Metrics
-      security: []
-      responses:
-        "200":
-          description: Prometheus metrics
-          content:
-            # Must match what handlers/stats.go actually sets, charset
-            # included — the live contract suite compares the header verbatim.
-            text/plain; version=0.0.4; charset=utf-8:
-              schema:
-                type: string
-
 components:
   schemas:
     SorobanEvent:
@@ -3003,8 +2985,6 @@ tags:
     description: API key management (admin only)
   - name: Admin
     description: Admin endpoints
-  - name: Metrics
-    description: Monitoring and metrics
   - name: Contracts
     description: Contract schema, spec, storage, and simulation endpoints
   - name: Webhooks

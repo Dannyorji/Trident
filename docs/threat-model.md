@@ -46,12 +46,15 @@ Every place an external actor's input reaches the system:
   and, longer-term, by cross-validating against multiple endpoints
   (`RPC_FAILOVER_THRESHOLD` today provides failover, not cross-validation).
 - **Internal-only endpoints** — `GET /internal/status` (process/dependency
-  health with more detail than the public `/v1/health`) and `GET /metrics`
-  (Prometheus text exposition). Both are mounted on the same mux as the
-  public routes in `main.go` and are **not** protected by network policy at
-  the application layer today — they rely on the deployment topology (nginx
-  only proxying `/`, `/ws`, `/v1/events/stream`; see `docker/nginx/nginx.conf`)
-  keeping them off the public network. `PPROF_ENABLED` (see
+  health with more detail than the public `/v1/health`) and the Prometheus
+  metrics. `/internal/status` is mounted on the same mux as the public routes
+  in `main.go` and is **not** protected by network policy at the application
+  layer today — it relies on the deployment topology (nginx denying
+  `/internal/`; see `docker/nginx/nginx.conf`) keeping it off the public
+  network. Metrics are not on the public mux at all: `GET /metrics` and
+  `GET /metrics/legacy` are served only by the separate `METRICS_PORT` server
+  (default 9091), and nginx also returns 404 for `/metrics` as defence in
+  depth. `PPROF_ENABLED` (see
   `services/api/internal/profiling/profiling.go`) is opt-in and, when
   enabled, must never be exposed publicly — it allows arbitrary memory/goroutine
   introspection and CPU profiling of the live process.

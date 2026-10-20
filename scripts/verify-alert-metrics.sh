@@ -3,12 +3,17 @@
 # exists in the live /metrics endpoints (issue #393).
 #
 # Usage:
-#   ./scripts/verify-alert-metrics.sh <api-metrics-url> <indexer-metrics-url>
+#   ./scripts/verify-alert-metrics.sh <api-metrics-url> <indexer-metrics-url> [<api-legacy-metrics-url>]
+#
+# The API serves metrics only on its internal METRICS_PORT: /metrics (client_golang
+# registry) and /metrics/legacy (hand-rolled set). Pass the legacy URL as the
+# optional third argument; its payload is merged with the API metrics.
 #
 # Example (local docker compose):
 #   ./scripts/verify-alert-metrics.sh \
-#     http://localhost:3000/metrics \
-#     http://localhost:9090/metrics
+#     http://localhost:9091/metrics \
+#     http://localhost:9090/metrics \
+#     http://localhost:9091/metrics/legacy
 #
 # Example (staging):
 #   ./scripts/verify-alert-metrics.sh \
@@ -22,22 +27,30 @@
 
 set -euo pipefail
 
-if [ $# -ne 2 ]; then
-  echo "Usage: $0 <api-metrics-url> <indexer-metrics-url>" >&2
+if [ $# -lt 2 ] || [ $# -gt 3 ]; then
+  echo "Usage: $0 <api-metrics-url> <indexer-metrics-url> [<api-legacy-metrics-url>]" >&2
   echo "" >&2
   echo "Example:" >&2
-  echo "  $0 http://localhost:3000/metrics http://localhost:9090/metrics" >&2
+  echo "  $0 http://localhost:9091/metrics http://localhost:9090/metrics http://localhost:9091/metrics/legacy" >&2
   exit 2
 fi
 
 API_METRICS_URL="$1"
 INDEXER_METRICS_URL="$2"
+API_LEGACY_METRICS_URL="${3:-}"
 
 echo "=== Fetching live metrics ==="
 API_METRICS=$(curl --silent --fail --max-time 10 "$API_METRICS_URL" || {
   echo "ERROR: failed to fetch $API_METRICS_URL" >&2
   exit 2
 })
+if [ -n "$API_LEGACY_METRICS_URL" ]; then
+  API_LEGACY_METRICS=$(curl --silent --fail --max-time 10 "$API_LEGACY_METRICS_URL" || {
+    echo "ERROR: failed to fetch $API_LEGACY_METRICS_URL" >&2
+    exit 2
+  })
+  API_METRICS="$API_METRICS"$'\n'"$API_LEGACY_METRICS"
+fi
 INDEXER_METRICS=$(curl --silent --fail --max-time 10 "$INDEXER_METRICS_URL" || {
   echo "ERROR: failed to fetch $INDEXER_METRICS_URL" >&2
   exit 2
