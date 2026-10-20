@@ -1046,10 +1046,95 @@ following require you to provision them once:
 3. Merging into `main` does not itself deploy anything — production deploys
    are tag-triggered: `git tag vX.Y.Z && git push origin vX.Y.Z` runs
    `release.yml`, which builds and pushes the same three images tagged with
-   that version and `latest` (issue #302).
-4. Roll out to production the same way as any other release — see
-   [Updating (Rolling Update)](#updating-rolling-update) above — pointing
-   `helm/trident/values.yaml` (production defaults, no `-staging` overlay) at
-   the new tag.
+   that version and `latest`, then publishes a GitHub Release (issue #302).
+4. Publishing that Release triggers `production-deploy.yml` automatically
+   (or run it via `workflow_dispatch` with the tag, to promote a specific
+   already-published release by hand) — see
+   [Production Deploy](#production) below for the full gate.
 5. If a smoke test on `dev` fails, treat the branch as un-promotable until
    fixed — do not cut a `main` PR or tag from a red `dev`.
+
+## Production Deploy {#production}
+
+`.github/workflows/production-deploy.yml` promotes a published GitHub
+Release to production through an approval gate — the thing a manual
+`helm upgrade` from someone's laptop never had: a recorded approver, a
+post-deploy smoke test, and automatic rollback on failure.
+
+### Triggers
+
+- **`release: published`** — fires automatically when `release.yml` finishes
+  building images for a `vX.Y.Z` tag and publishes the GitHub Release.
+- **`workflow_dispatch`** with a `tag` input — promote a specific,
+  already-published release by hand (e.g. retrying a promotion after a
+  transient smoke-test failure, without cutting a new release).
+
+### One-time setup: the `production` Environment
+
+The approval gate itself is a GitHub Environment protection rule, which a
+workflow file cannot create — a repo admin configures it once:
+
+1. **Settings → Environments → New environment**, name it `production`.
+2. Under **Deployment protection rules**, add **Required reviewers** and
+   name at least one person/team who must approve every run before
+   `deploy-production` (and `rollback-production`) execute.
+3. Add the secrets and variables below to the `production` Environment (not
+   repo-wide, so only an approved run of this workflow can read them):
+   - `PRODUCTION_KUBECONFIG` (secret, required) — base64-encoded kubeconfig
+     scoped to the production namespace.
+   - `PRODUCTION_DATABASE_URL` (variable, required) — only checked for
+     presence by `check-production-config`; the actual migration run reads
+     `DATABASE_URL` from `global.existingSecret` inside the cluster via the
+     Helm pre-upgrade hook Job, not from this variable directly.
+   - `PRODUCTION_API_KEY` (secret, optional) — used by the authenticated
+     `GET /v1/events` smoke test; the check is skipped (not failed) if unset.
+   - `PRODUCTION_URL` (variable, required for the smoke test stage) — public
+     URL of the production API. `smoke-test-production` is skipped entirely
+     when this is unset, same `check-staging-config`-style "skip is explicit,
+     not silent" posture as staging.
+   - `PRODUCTION_NAMESPACE` (variable, optional, defaults to `trident-prod`).
+   - `PRODUCTION_ALERT_WEBHOOK_URL` (secret, optional) — failure notification.
+
+Until the required-reviewers rule is configured, `environment: production`
+still scopes the secrets above to this workflow but does not pause for
+approval — the rule is what makes this an approval gate.
+
+### What the workflow does
+
+1. **`resolve-tag`** — picks the tag from whichever trigger fired.
+2. **`verify-images`** — confirms `release.yml` actually published every
+   image (`trident-indexer`, `trident-grpc-api`, `trident-go-api`,
+   `trident-migrate`) under that tag, so a failed or partial release fails
+   here with a clear message instead of a confusing `ImagePullBackOff` later.
+3. **`check-production-config`** — fails loudly (not a silent skip) if
+   `PRODUCTION_KUBECONFIG`/`PRODUCTION_DATABASE_URL` aren't configured, same
+   `check-staging-config` pattern (issue #395): a deploy that did not happen
+   must not report green.
+4. **`deploy-production`** — waits for Environment approval, then
+   `helm upgrade --install trident helm/trident -f values.yaml -f
+   values-prod.yaml --set *.image.tag=<the release tag>`. Migrations run
+   first because they're a Helm pre-upgrade hook Job
+   (`helm/trident/templates/migration-job.yaml`, `helm.sh/hook-weight: "-5"`)
+   — the same `helm upgrade` call blocks the app Deployments on it, no
+   separate migration step needed.
+5. **`smoke-test-production`** — health, readiness, an authenticated
+   `GET /v1/events` read, public `GET /v1/stats/indexer`, and an
+   invalid-key → `401` check against `PRODUCTION_URL`.
+6. **`rollback-production`** — on any failure above, `helm rollback trident
+   0` in the production namespace, then confirms the rolled-back
+   Deployments actually come back healthy. Per
+   [docs/ROLLBACK_RUNBOOK.md](./ROLLBACK_RUNBOOK.md), this covers an
+   additive schema change; a breaking migration still needs a human-reviewed
+   reverse script.
+7. **`alert-on-failure`** — posts to `PRODUCTION_ALERT_WEBHOOK_URL` if any
+   job above failed.
+
+### Deployment record
+
+Every run of `deploy-production` and `rollback-production` is recorded by
+GitHub's Deployments API because they declare `environment: production` —
+the triggering ref/sha, the reviewer(s) who approved and when, and the
+resulting status are all visible under the repo's **Environments** tab and
+the run's own Deployments sidebar, with no extra workflow code. That record
+is what answers "who approved this production deploy, and when" after the
+fact.
