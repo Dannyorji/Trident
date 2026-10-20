@@ -18,13 +18,6 @@ use trident_common::TridentError;
 use crate::rpc::RpcClient;
 use crate::spec::contract_address;
 
-/// Maximum keys the Soroban RPC accepts in a single `getLedgerEntries`
-/// request. Unlike `getEvents` (`filters::MAX_CONTRACT_IDS_PER_FILTER`), the
-/// RPC has no documented per-call constant for this method, so this value is
-/// the commonly observed provider cap; exceeding it fails the whole call
-/// (issue #662).
-pub const MAX_LEDGER_ENTRY_KEYS_PER_REQUEST: usize = 200;
-
 /// One observed contract-storage value, ready to diff against the last
 /// persisted snapshot and insert if it changed.
 #[derive(Debug)]
@@ -98,15 +91,11 @@ pub async fn fetch_balance_snapshots(
         keys.push((holder, key_b64s.last().unwrap().clone()));
     }
 
-    // Chunk against the RPC's key-count cap the same way getEvents filters
-    // are chunked against MAX_CONTRACT_IDS_PER_FILTER (issue #662) — a page
-    // of transfer events can realistically produce more unique holders than
-    // one getLedgerEntries call accepts, and exceeding it fails the whole
-    // call rather than just the excess keys.
-    let mut entries = Vec::with_capacity(key_b64s.len());
-    for chunk in key_b64s.chunks(MAX_LEDGER_ENTRY_KEYS_PER_REQUEST) {
-        entries.extend(rpc.get_ledger_entries(chunk).await?);
-    }
+    // One call: the transport splits it against
+    // MAX_LEDGER_ENTRY_KEYS_PER_REQUEST itself (issue #725), so a page of
+    // transfer events can produce more unique holders than one request
+    // accepts without this call site re-implementing the cap (issue #662).
+    let entries = rpc.get_ledger_entries(&key_b64s).await?;
 
     // getLedgerEntries only returns entries that exist, so match results back
     // to holders by the (base64) key it was requested with.
@@ -221,7 +210,7 @@ mod tests {
 
         let rpc = RpcClient::with_settings(server.uri(), &RpcHttpSettings::default()).unwrap();
 
-        let holder_count = MAX_LEDGER_ENTRY_KEYS_PER_REQUEST + 50;
+        let holder_count = crate::rpc::MAX_LEDGER_ENTRY_KEYS_PER_REQUEST + 50;
         let holders: Vec<String> = (0..holder_count).map(distinct_holder).collect();
 
         let observations = fetch_balance_snapshots(&rpc, TEST_CONTRACT, &holders)

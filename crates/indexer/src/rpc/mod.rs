@@ -14,6 +14,16 @@ pub mod filters;
 
 pub use filters::{EventFilter, FilterPlan};
 
+/// Maximum keys the Soroban RPC accepts in a single `getLedgerEntries`
+/// request (issues #662, #725). Unlike `getEvents`
+/// (`filters::MAX_CONTRACT_IDS_PER_FILTER`), the RPC has no documented
+/// per-call constant for this method, so this value is the commonly observed
+/// provider cap; exceeding it fails the whole call.
+///
+/// Owned by this transport layer because [`RpcClient::get_ledger_entries`]
+/// enforces it for every caller — storage snapshots and spec sync alike.
+pub const MAX_LEDGER_ENTRY_KEYS_PER_REQUEST: usize = 200;
+
 use crate::metrics;
 use health::RpcHealthScorer;
 
@@ -831,9 +841,19 @@ impl RpcClient {
     /// present on-chain (e.g. never written, or archived) are simply absent
     /// from the returned list rather than erroring.
     ///
+    /// Keys beyond [`MAX_LEDGER_ENTRY_KEYS_PER_REQUEST`] are split across
+    /// several requests and the results concatenated (issue #725), so callers
+    /// can hand over an unbounded key set — every tracked contract's instance
+    /// entry in one spec-sync pass, for instance — instead of each call site
+    /// re-implementing the cap. Exceeding it fails the whole call rather than
+    /// just the excess keys (issue #662), so the transport enforcing it is
+    /// what makes the guarantee unconditional.
+    ///
     /// Retried with the same full-jittered backoff as `getEvents` (issue
     /// #660): a transient failure here previously permanently dropped the
     /// balance-snapshot write for every token contract touched in the page.
+    /// The retry wraps one request at a time, so a later chunk still runs
+    /// after an earlier one failed rather than the whole batch being re-sent.
     pub async fn get_ledger_entries(
         &self,
         keys: &[String],
@@ -841,14 +861,19 @@ impl RpcClient {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-        tokio_retry::Retry::start(retry_strategy(), || async {
-            let params = GetLedgerEntriesParams { keys };
-            let result: GetLedgerEntriesResult = self
-                .call("getLedgerEntries", 5, params, "getLedgerEntries")
+
+        let mut entries = Vec::with_capacity(keys.len());
+        for chunk in keys.chunks(MAX_LEDGER_ENTRY_KEYS_PER_REQUEST) {
+            let result: GetLedgerEntriesResult =
+                tokio_retry::Retry::start(retry_strategy(), || async {
+                    let params = GetLedgerEntriesParams { keys: chunk };
+                    self.call("getLedgerEntries", 5, params, "getLedgerEntries")
+                        .await
+                })
                 .await?;
-            Ok(result.entries.unwrap_or_default())
-        })
-        .await
+            entries.extend(result.entries.unwrap_or_default());
+        }
+        Ok(entries)
     }
 }
 
@@ -1274,6 +1299,57 @@ mod tests {
             .await
             .expect("must recover after retrying past the transient failures");
         assert!(result.is_empty());
+    }
+
+    /// A key set past the provider's per-call cap is split across requests and
+    /// concatenated, rather than sent as one oversized call the provider
+    /// rejects outright (issue #725: spec sync hands over every tracked
+    /// contract's instance key at once).
+    #[tokio::test]
+    async fn get_ledger_entries_chunks_keys_at_the_per_request_cap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use wiremock::{Request, Respond};
+
+        struct CountingEmptyResponder {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl Respond for CountingEmptyResponder {
+            fn respond(&self, _req: &Request) -> ResponseTemplate {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "result": { "entries": [] }
+                }))
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(CountingEmptyResponder {
+                calls: calls.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let client = RpcClient::with_settings(server.uri(), &fast_timeout_settings()).unwrap();
+        let keys: Vec<String> = (0..MAX_LEDGER_ENTRY_KEYS_PER_REQUEST * 2 + 1)
+            .map(|i| format!("key-{i}"))
+            .collect();
+
+        let entries = client
+            .get_ledger_entries(&keys)
+            .await
+            .expect("chunked fetch must succeed");
+        assert!(entries.is_empty());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "401 keys must split into 3 requests, not one oversized call"
+        );
     }
 
     /// The self-imposed outbound rate limiter (issue #661) measurably spreads

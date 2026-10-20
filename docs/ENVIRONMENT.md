@@ -67,6 +67,7 @@ description is accurate. Keep this file honest by hand.
 | `DB_STATEMENT_TIMEOUT_MS` | Optional | `30000` | Postgres per-statement timeout bound. |
 | `DB_IDLE_IN_TRANSACTION_TIMEOUT_MS` | Optional | `10000` | Postgres `idle_in_transaction_session_timeout` bound. |
 | `TOKEN_METADATA_REFRESH_INTERVAL_SECS` | Optional | `86400` | How often cached token metadata refreshes. |
+| `EVENT_RETENTION_DAYS` | Optional | unset (pruning disabled) | Days of event history the daily pruning job keeps before deleting older `soroban_events` rows (issue #482). Unset disables pruning; a set value must be an integer in `[1, 3650]` and anything else fails startup (issue #738). |
 
 ### Inferred network passphrases
 
