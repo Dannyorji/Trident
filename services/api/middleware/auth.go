@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
+	"github.com/Depo-dev/trident/services/api/internal/metrics"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/redis/go-redis/v9"
@@ -36,9 +38,8 @@ type DBAuthConfig struct {
 
 // trackUsage sends idStr on track without blocking the request: the channel
 // is large (4096) and drained every few seconds, but a request must never
-// wait on it, and a full channel must never be treated as an error, usage
-// tracking is explicitly non-critical (NewAPIKeyUsageTracker's own doc
-// comment).
+// wait on it. A full channel is not an error for the request, but it is
+// counted (issue #753) because the dropped update is lost billing data.
 func trackUsage(track chan<- string, idStr string) {
 	if track == nil {
 		return
@@ -46,10 +47,72 @@ func trackUsage(track chan<- string, idStr string) {
 	select {
 	case track <- idStr:
 	default:
+		metrics.APIKeyUsageDroppedTotal.Inc()
 	}
 }
 
 const authCacheTTL = 5 * time.Minute
+
+// authUnavailableRetryAfterSeconds is the Retry-After sent with a 503 when
+// the API-key lookup fails for an infrastructure reason (issue #751).
+const authUnavailableRetryAfterSeconds = "1"
+
+// errAPIKeyExpired is returned by lookupAPIKey for a key whose expires_at is
+// in the past (issue #752).
+var errAPIKeyExpired = errors.New("api key expired")
+
+// apiKeyQuerier is the slice of a pgx pool lookupAPIKey needs.
+type apiKeyQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// lookupAPIKey resolves a key hash against api_keys for every transport
+// (REST, WebSocket, GraphQL). It returns pgx.ErrNoRows for an unknown or
+// revoked key, errAPIKeyExpired for an expired one, and any other error
+// unchanged so callers can treat it as an infrastructure failure.
+func lookupAPIKey(ctx context.Context, db apiKeyQuerier, hash string) (id, network string, expiresAt *time.Time, err error) {
+	dbCtx, cancel := context.WithTimeout(ctx, authDBQueryTimeout)
+	defer cancel()
+
+	err = db.QueryRow(dbCtx,
+		`SELECT id, network, expires_at FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL`,
+		hash,
+	).Scan(&id, &network, &expiresAt)
+	if err != nil {
+		return "", "", nil, err
+	}
+	if expiresAt != nil && !time.Now().Before(*expiresAt) {
+		return "", "", nil, errAPIKeyExpired
+	}
+	return id, network, expiresAt, nil
+}
+
+// authCacheTTLFor caps the auth cache TTL at the time remaining until the
+// key expires, so a cached entry never outlives the key (issue #752).
+func authCacheTTLFor(expiresAt *time.Time) time.Duration {
+	if expiresAt == nil {
+		return authCacheTTL
+	}
+	if remaining := time.Until(*expiresAt); remaining < authCacheTTL {
+		return remaining
+	}
+	return authCacheTTL
+}
+
+// recordLookupFailure counts a failed lookup and reports whether it was an
+// infrastructure failure rather than a rejected credential.
+func recordLookupFailure(err error) (infra bool) {
+	switch {
+	case errors.Is(err, errAPIKeyExpired):
+		metrics.AuthKeyLookupFailuresTotal.WithLabelValues("expired").Inc()
+	case errors.Is(err, pgx.ErrNoRows):
+		metrics.AuthKeyLookupFailuresTotal.WithLabelValues("not_found").Inc()
+	default:
+		metrics.AuthKeyLookupFailuresTotal.WithLabelValues("unavailable").Inc()
+		return true
+	}
+	return false
+}
 
 // authDBQueryTimeout bounds the DB fallback lookup in NewDBAuth (issue #238)
 // — this runs on nearly every request, so it gets a tight deadline rather
@@ -163,11 +226,13 @@ func withLegacyAuthenticatedKey(ctx context.Context) context.Context {
 
 // NewDBAuth returns an authentication middleware that:
 //  1. Looks up the hashed API key in Redis cache (5 min TTL).
-//  2. Falls back to the api_keys database table (active keys only).
+//  2. Falls back to the api_keys database table (active, unexpired keys).
 //  3. Falls back to legacy HMAC-SHA256 env-var authentication (API_KEY_HASHES).
 //
 // On success, api_key_id and network are attached to the request context.
-// Unauthenticated requests receive 401 unless the path is excluded.
+// Unauthenticated requests receive 401 unless the path is excluded; an expired
+// key gets 401 API_KEY_EXPIRED, and a lookup that fails for infrastructure
+// reasons gets 503 UNAVAILABLE with Retry-After so clients retry (issue #751).
 func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -217,26 +282,26 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 			}
 
 			// ── 2. Database lookup ──────────────────────────────────────────
+			dbUnavailable := false
 			if cfg.DB != nil {
-				dbCtx, cancel := context.WithTimeout(r.Context(), authDBQueryTimeout)
-				defer cancel()
-
-				var id, network string
-				err := cfg.DB.QueryRow(dbCtx,
-					`SELECT id, network FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL`,
-					dbHash,
-				).Scan(&id, &network)
+				id, network, expiresAt, err := lookupAPIKey(r.Context(), cfg.DB, dbHash)
 				if err == nil {
 					// Populate Redis cache so the next request is O(1).
 					if cfg.Redis != nil {
 						cfg.Redis.Set(r.Context(), authRedisCacheKey(dbHash),
-							id+":"+network, authCacheTTL)
+							id+":"+network, authCacheTTLFor(expiresAt))
 					}
 					trackUsage(cfg.UsageTrack, id)
 					ctx := withAuthenticatedKey(r.Context(), id, network)
 					next.ServeHTTP(w, r.WithContext(ctx))
 					return
 				}
+				if errors.Is(err, errAPIKeyExpired) {
+					recordLookupFailure(err)
+					httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.API_KEY_EXPIRED, "API key has expired")
+					return
+				}
+				dbUnavailable = recordLookupFailure(err)
 			}
 
 			// ── 3. Legacy env-var fallback (API_KEY_HASHES) ────────────────
@@ -247,6 +312,12 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 					next.ServeHTTP(w, r.WithContext(ctx))
 					return
 				}
+			}
+
+			if dbUnavailable {
+				w.Header().Set("Retry-After", authUnavailableRetryAfterSeconds)
+				httputil.WriteErrorCtx(r.Context(), w, http.StatusServiceUnavailable, httputil.UNAVAILABLE, "authentication temporarily unavailable")
+				return
 			}
 
 			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, "Unauthorized")

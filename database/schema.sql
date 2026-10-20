@@ -133,6 +133,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
     last_used_at     TIMESTAMPTZ,
     request_count    BIGINT      NOT NULL DEFAULT 0,
     revoked_at       TIMESTAMPTZ,                    -- NULL means active; set to revoke
+    expires_at       TIMESTAMPTZ,                    -- NULL means never expires (migration 0037)
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

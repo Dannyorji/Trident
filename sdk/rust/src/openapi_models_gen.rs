@@ -127,6 +127,9 @@ pub struct ApiKeyResponse {
 
     pub created_by: Option<String>,
 
+    /// When the key stops authenticating. Omitted for a key that never expires.
+    pub expires_at: Option<String>,
+
     pub id: String,
 
     /// Raw key, returned only at creation time.
@@ -401,6 +404,9 @@ pub struct Error {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Code {
+    #[serde(rename = "API_KEY_EXPIRED")]
+    ApiKeyExpired,
+
     Conflict,
 
     Forbidden,

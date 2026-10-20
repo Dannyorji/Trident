@@ -36,6 +36,8 @@ pub struct RelayConfig {
     pub backlog_alert_threshold: i64,
     /// Redis stream trim length, mirrors the direct-publish path.
     pub stream_maxlen: u64,
+    /// Network written on every stream entry (issue #741).
+    pub network: String,
 }
 
 pub struct OutboxRelay {
@@ -127,6 +129,7 @@ impl OutboxRelay {
                 &event,
                 self.config.stream_maxlen,
                 Some(&record.event_id.to_string()),
+                &self.config.network,
             )
             .await
             {

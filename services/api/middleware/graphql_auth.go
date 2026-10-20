@@ -71,20 +71,14 @@ func GraphQLDBAuth(cfg DBAuthConfig) func(ctx context.Context, key string) (stri
 			return "", "", false
 		}
 
-		dbCtx, cancel := context.WithTimeout(ctx, authDBQueryTimeout)
-		defer cancel()
-
-		var id, network string
-		err := cfg.DB.QueryRow(dbCtx,
-			`SELECT id, network FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL`,
-			dbHash,
-		).Scan(&id, &network)
+		id, network, expiresAt, err := lookupAPIKey(ctx, cfg.DB, dbHash)
 		if err != nil {
+			recordLookupFailure(err)
 			return "", "", false
 		}
 
 		if cfg.Redis != nil {
-			cfg.Redis.Set(ctx, authRedisCacheKey(dbHash), id+":"+network, authCacheTTL)
+			cfg.Redis.Set(ctx, authRedisCacheKey(dbHash), id+":"+network, authCacheTTLFor(expiresAt))
 		}
 		if network == "" {
 			network = "testnet"

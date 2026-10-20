@@ -359,6 +359,35 @@ absorbs on its own.
 3. As a mitigation, `GO_API_DB_POOL_SIZE` can be raised without a code
    change, but treat it as a stopgap if the root cause is a query regression.
 
+## TridentAPIKeyUsageUpdatesLost
+
+**Means:** `trident_api_key_usage_dropped_total` or
+`trident_api_key_usage_flush_failures_total` increased in the last 10 minutes.
+
+**Why it matters:** `request_count` / `last_used_at` back `GET /v1/usage`.
+A dropped update (tracker channel full) is lost for good; a failed flush is
+kept in memory and retried every tick, so it only loses data if the API
+restarts before the database recovers.
+
+**First steps:**
+1. Failed flushes: check Postgres health and the API's logs for
+   `api key usage flush failed`.
+2. Dropped updates: the 4096-slot channel is overflowing, meaning the flush
+   goroutine is stalled behind a slow database. Fix the database first.
+
+## TridentAPIAuthLookupUnavailable
+
+**Means:** API-key lookups are failing with an infrastructure error (timeout,
+pool exhaustion, failover), counted as
+`trident_auth_key_lookup_failures_total{outcome="unavailable"}`.
+
+**Impact:** clients whose key is not in the Redis auth cache get
+`503 UNAVAILABLE` with `Retry-After`, which SDKs retry. Unknown keys are
+counted separately as `outcome="not_found"` (401) and expired keys as
+`outcome="expired"`.
+
+**First steps:** see `TridentAPIDBPoolSaturated` and check Postgres health.
+
 
 ---
 
