@@ -58,7 +58,8 @@ jobs:
         env:
           TRIDENT_TESTNET_API_URL: https://api.testnet.trident.dev
           TRIDENT_MAINNET_API_URL: https://api.mainnet.trident.dev
-          EXPLORER_API_KEY: ci-smoke-test-key
+          EXPLORER_TESTNET_API_KEY: ci-smoke-test-testnet-key
+          EXPLORER_MAINNET_API_KEY: ci-smoke-test-mainnet-key
           PORT: 4321
         run: |
           node dist/server/entry.mjs &

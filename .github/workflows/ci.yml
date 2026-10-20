@@ -233,14 +233,19 @@ jobs:
         env:
           TRIDENT_TESTNET_API_URL: http://localhost:9999
           TRIDENT_MAINNET_API_URL: http://localhost:9999
-          EXPLORER_API_KEY: ci-dummy-key
+          EXPLORER_TESTNET_API_KEY: ci-dummy-testnet-key
+          EXPLORER_MAINNET_API_KEY: ci-dummy-mainnet-key
+
+      - name: Test
+        run: npm test
 
       - name: Build
         run: npm run build
         env:
           TRIDENT_TESTNET_API_URL: http://localhost:9999
           TRIDENT_MAINNET_API_URL: http://localhost:9999
-          EXPLORER_API_KEY: ci-dummy-key
+          EXPLORER_TESTNET_API_KEY: ci-dummy-testnet-key
+          EXPLORER_MAINNET_API_KEY: ci-dummy-mainnet-key
 
   # ---------------------------------------------------------------------------
   # SDKs — run the per-language client SDK test suites that were previously

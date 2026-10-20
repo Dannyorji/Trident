@@ -36,7 +36,7 @@ jobs:
         working-directory: explorer
         env:
           API_URL: ${{ github.event.inputs.api_url || 'https://api.testnet.trident.dev' }}
-          API_KEY: ${{ secrets.EXPLORER_API_KEY }}
+          API_KEY: ${{ secrets.EXPLORER_TESTNET_API_KEY }}
         run: |
           npm run perf-test -- \
             --api-url "$API_URL" \
