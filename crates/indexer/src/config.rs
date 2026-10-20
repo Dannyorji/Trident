@@ -524,9 +524,9 @@ impl Config {
     /// alone (issue #215).
     pub fn log_effective_config(&self) {
         tracing::info!(
-            database_url = %redact_url(&self.database_url),
-            redis_url = %redact_url(&self.redis_url),
-            stellar_rpc_urls = ?self.stellar_rpc_urls,
+            database_url = %crate::config::redact_url(&self.database_url),
+            redis_url = %crate::config::redact_url(&self.redis_url),
+            stellar_rpc_urls = ?redact_rpc_urls(&self.stellar_rpc_urls),
             network = %self.network,
             network_passphrase_configured = !self.network_passphrase.is_empty(),
             poll_interval_floor_ms = self.poll_interval_floor.as_millis() as u64,
@@ -561,7 +561,7 @@ impl Config {
 /// logged. `DATABASE_URL`/`REDIS_URL` commonly embed credentials directly, and
 /// a startup log line is otherwise the easiest way for a secret to leak into
 /// log aggregation (issue #215).
-fn redact_url(url: &str) -> String {
+pub(crate) fn redact_url(url: &str) -> String {
     let Some(scheme_end) = url.find("://") else {
         return url.to_string();
     };
@@ -576,10 +576,80 @@ fn redact_url(url: &str) -> String {
     // rfind, not find: '@' is legal inside a password and common in generated
     // secrets. Splitting on the FIRST '@' in "user:p@ssw0rd@host" yields
     // "***@ssw0rd@host" — the tail of the password logged in plaintext.
-    match authority.rfind('@') {
-        Some(at) => format!("{scheme}***@{}{tail}", &authority[at + 1..]),
-        None => url.to_string(),
+    let redacted_authority = match authority.rfind('@') {
+        Some(at) => format!("***@{}", &authority[at + 1..]),
+        None => authority.to_string(),
+    };
+
+    let had_creds = authority.contains('@');
+    if !had_creds {
+        // No credentials in authority - check for RPC-style URLs with tokens in path/query (issue #734)
+        if tail.is_empty() || tail == "/" {
+            return url.to_string();
+        }
+        if scheme.starts_with("http") {
+            if let Some(qmark) = tail.find('?') {
+                let (path_part, _query_part) = tail.split_at(qmark);
+                if path_part != "/" && !path_part.is_empty() && path_part.len() > 1 {
+                    return format!("{scheme}{authority}/[REDACTED]?***");
+                }
+                if !_query_part.is_empty() && _query_part != "?" {
+                    return format!("{scheme}{authority}{path_part}?***");
+                }
+            } else if tail.starts_with('/') && tail.len() > 1 {
+                return format!("{scheme}{authority}/[REDACTED]");
+            }
+        }
+        return url.to_string();
     }
+
+    // Has credentials in authority
+    if tail.is_empty() {
+        return format!("{scheme}{redacted_authority}");
+    }
+
+    // For DB/Redis URLs, preserve full tail structure (path, query) when redacting creds
+    if let Some(qmark) = tail.find('?') {
+        // Check if this is an RPC-style URL that might need special handling?
+        // For now preserve for DB URLs as before
+        let (path_part, query_part) = tail.split_at(qmark);
+        // But issue #734 says redact path tokens and query strings for RPC URLs
+        // This function is used generally - but tests expect specific behavior
+        // Tests are for postgres URLs - don't change those
+        if scheme.starts_with("postgres") || scheme.starts_with("redis") {
+            return format!("{scheme}{redacted_authority}{tail}");
+        }
+        let redacted_path = if path_part == "/" || path_part.is_empty() {
+            path_part.to_string()
+        } else {
+            "/[REDACTED]".to_string()
+        };
+        format!("{scheme}{redacted_authority}{redacted_path}?***")
+    } else if let Some(hash) = tail.find('#') {
+        let (path_part, frag) = tail.split_at(hash);
+        if scheme.starts_with("postgres") || scheme.starts_with("redis") {
+            return format!("{scheme}{redacted_authority}{tail}");
+        }
+        let redacted_path = if path_part == "/" || path_part.is_empty() {
+            path_part.to_string()
+        } else {
+            "/[REDACTED]".to_string()
+        };
+        format!("{scheme}{redacted_authority}{redacted_path}#{frag}")
+    } else {
+        if tail == "/" || tail.is_empty() {
+            format!("{scheme}{redacted_authority}{tail}")
+        } else if scheme.starts_with("postgres") || scheme.starts_with("redis") {
+            format!("{scheme}{redacted_authority}{tail}")
+        } else {
+            format!("{scheme}{redacted_authority}/[REDACTED]")
+        }
+    }
+}
+
+/// Redact a list of RPC URLs for safe logging (issue #734).
+pub(crate) fn redact_rpc_urls(urls: &[String]) -> Vec<String> {
+    urls.iter().map(|u| redact_url(u)).collect()
 }
 
 /// Validates `NETWORK` against the allowed set and normalises the `pubnet`
