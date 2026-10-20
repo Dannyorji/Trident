@@ -708,6 +708,7 @@ mod tests {
                 pool_max_idle_per_host: 8,
                 tcp_keepalive: std::time::Duration::from_secs(60),
                 max_calls_per_sec: 50,
+                ..crate::rpc::RpcHttpSettings::default()
             },
         )
         .expect("rpc client");
@@ -829,6 +830,7 @@ mod tests {
                 pool_max_idle_per_host: 8,
                 tcp_keepalive: std::time::Duration::from_secs(60),
                 max_calls_per_sec: 50,
+                ..crate::rpc::RpcHttpSettings::default()
             },
         )
         .expect("rpc client");

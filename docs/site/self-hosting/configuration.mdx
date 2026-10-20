@@ -79,8 +79,8 @@ Variables marked **REQUIRED** must be set before the service starts. Variables m
 | `RPC_POOL_IDLE_TIMEOUT_MS`  | OPTIONAL | integer | `90000` | How long an idle pooled connection is kept. |
 | `RPC_POOL_MAX_IDLE_PER_HOST`| OPTIONAL | integer | `8`     | Idle keep-alive connections retained per RPC host. |
 | `RPC_TCP_KEEPALIVE_MS`      | OPTIONAL | integer | `60000` | TCP keep-alive probe interval. |
-| `RPC_FAILOVER_THRESHOLD`    | OPTIONAL | integer | `3`     | Parsed but currently unused by the running indexer; see the deployment guide. |
-| `RPC_ENDPOINT_COOLDOWN_MS`  | OPTIONAL | integer | `30000` | Parsed but currently unused by the running indexer; see the deployment guide. |
+| `RPC_FAILOVER_THRESHOLD`    | REMOVED  | integer | —       | Removed in issue #737 (it never changed behaviour); setting it is a startup error. Use `RPC_BREAKER_FAILURE_THRESHOLD`. |
+| `RPC_ENDPOINT_COOLDOWN_MS`  | REMOVED  | integer | —       | Removed in issue #737 (it never changed behaviour); setting it is a startup error. Use `RPC_BREAKER_COOLDOWN_MS`. |
 
 ### Outbox relay
 

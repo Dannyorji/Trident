@@ -44,20 +44,23 @@ description is accurate. Keep this file honest by hand.
 |---|---|---|---|
 | `STELLAR_RPC_URL` | Required unless `STELLAR_RPC_URLS` set | — | Single Soroban RPC endpoint. |
 | `STELLAR_RPC_URLS` | Optional | — | Prioritised, comma-separated RPC endpoints for failover; overrides `STELLAR_RPC_URL` (which stays valid as a single-value alias). |
-| `NETWORK` | Optional | `testnet` | One of `mainnet` \| `testnet` \| `futurenet`. |
+| `STELLAR_RPC_HEADERS` | Optional | none | JSON object of HTTP headers sent with **every** RPC request, for providers that authenticate by header (issue #735), e.g. `{"Authorization":"Bearer …","x-api-key":"…"}`. Values are secrets: they are never logged, and a malformed spec fails startup naming the header only. |
+| `STELLAR_RPC_HEADERS_<N>` | Optional | none | JSON object of headers for endpoint `N` (0-based, matching `STELLAR_RPC_URLS`), merged over `STELLAR_RPC_HEADERS` by name. An index with no matching endpoint is a startup error. Also read by the backfill worker (`STELLAR_RPC_HEADERS_0`) and the Go API, which call a single endpoint. |
+| `NETWORK` | Optional | `testnet` | One of `mainnet` \| `testnet`, or the `pubnet` alias for `mainnet`. The value is normalised once at startup (so `pubnet` behaves identically to `mainnet` everywhere: cursor key, row tagging, passphrase and timeouts). `futurenet` is not supported by the indexer and is a startup error. |
 | `NETWORK_PASSPHRASE` | Required for non-standard networks | inferred for testnet/mainnet/pubnet (see below) | Stellar network passphrase, used to derive SAC contract ids for `TRACKED_SAC_ASSETS`. |
 | `POLL_INTERVAL_MS` | Removed | — | No longer read by the poll loop (it never actually was — only the adaptive floor/ceiling/watermark below control pacing). Setting it is a hard startup error naming `POLL_INTERVAL_FLOOR_MS`/`POLL_INTERVAL_CEILING_MS` instead of being silently ignored. |
 | `POLL_INTERVAL_FLOOR_MS` | Optional | `250` (min `50`, max `60000`) | Adaptive-poll floor (issue #198): fastest interval, used when lag is high. |
 | `POLL_INTERVAL_CEILING_MS` | Optional | `5000` (min `100`, max `600000`) | Adaptive-poll ceiling: slowest interval, used when caught up. |
 | `LAG_HIGH_WATERMARK` | Optional | `100` (min `1`, max `100000000`) | Ledger lag at/above which the floor interval applies. |
 | `POLL_HYSTERESIS_LEDGERS` | Optional | `10` (min `0`, max `1000000`) | Hysteresis deadband to prevent oscillation around the watermark. |
-| `MAX_REORG_REWIND_DEPTH` | Optional | `50` (min `1`, max `100000`) | Maximum ledgers a detected reorg may auto-repair; a deeper divergence halts the streamer for an operator (issue #196). |
+| `MAX_REORG_REWIND_DEPTH` | Removed | — | Never affected behaviour (issue #737): reorg rewinds are bounded by `MAX_REORG_DEPTH`. Setting it is a hard startup error naming the replacement instead of being silently ignored. |
 | `GAP_SCAN_MAX_PER_RUN` | Optional | `100` (min `1`, max `10000`) | Maximum gaps enqueued as `backfill_jobs` rows per periodic `ledger_metadata` gap scan (issue #216). |
 | `MAX_EVENTS_PER_POLL` | Optional | `200` (min `1`, max `10000`) | Max events fetched per `getEvents` RPC call. |
 | `DB_BATCH_SIZE` | Optional | `1000` (min `1`, max `10000`) | Max rows per batched INSERT when a page commits. |
 | `INDEXER_DB_POOL_SIZE` | Optional | `3` | Indexer's own Postgres pool size. |
 | `INDEX_TOPIC_FILTERS` | Optional | none (no narrowing) | Comma-separated topic patterns pushed into the RPC filter alongside the contract allowlist. |
 | `INDEX_DIAGNOSTIC` | Optional | `false` | Store Soroban diagnostic events (high-volume; keep `false` in production). |
+| `EVENT_RETENTION_DAYS` | Optional | unset (no pruning) | Days of `soroban_events` history to retain before the retention job prunes older rows (issue #482). |
 | `RPC_STARTUP_CHECK_ENABLED` | Optional | `true` | Verify RPC connectivity before the poll loop starts; disabling it means an unreachable endpoint only surfaces once polling begins (issue #687). |
 | `TRACKED_SAC_ASSETS` | Optional | none | Assets to derive SAC contract ids for and track. |
 | `REDIS_STREAM_MAXLEN` | Optional | `10000` | Max events kept in the Redis stream before trimming. |
@@ -93,8 +96,8 @@ guessing would silently derive wrong SAC contract ids.
 | `RPC_POOL_IDLE_TIMEOUT_MS` | Optional | `90000` (min `1000`, max `600000`) | Idle pooled-connection lifetime. |
 | `RPC_POOL_MAX_IDLE_PER_HOST` | Optional | `8` (min `1`, max `1024`) | Idle keep-alive connections retained per RPC host. |
 | `RPC_TCP_KEEPALIVE_MS` | Optional | `60000` (min `1000`, max `600000`) | TCP keep-alive probe interval. |
-| `RPC_FAILOVER_THRESHOLD` | Optional | `3` (min `1`, max `100`) | Parsed but currently unused in the running indexer — see [`deployment.md`'s note](deployment.md#indexer-rpc-transport-and-failover). |
-| `RPC_ENDPOINT_COOLDOWN_MS` | Optional | `30000` (min `1000`, max `3600000`) | Parsed but currently unused in the running indexer — see [`deployment.md`'s note](deployment.md#indexer-rpc-transport-and-failover). |
+| `RPC_FAILOVER_THRESHOLD` | Removed | — | Never affected behaviour (issue #737); `RPC_BREAKER_FAILURE_THRESHOLD` is the effective knob. Setting it is a hard startup error. |
+| `RPC_ENDPOINT_COOLDOWN_MS` | Removed | — | Never affected behaviour (issue #737); `RPC_BREAKER_COOLDOWN_MS` is the effective knob. Setting it is a hard startup error. |
 | `RPC_BREAKER_FAILURE_THRESHOLD` | Optional | `5` (min `1`, max `1000`) | Consecutive RPC-layer poll failures before the circuit breaker opens and the run loop stops attempting polls (issue #197). |
 | `RPC_BREAKER_COOLDOWN_MS` | Optional | `30000` (min `1000`, max `3600000`) | How long the breaker stays open before allowing a single probe poll through. |
 

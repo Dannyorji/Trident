@@ -198,6 +198,12 @@ async fn run_partition_check(min_headroom_ledgers: i64) -> Result<(), Box<dyn st
             pool_max_idle_per_host: cfg.rpc_pool_max_idle_per_host,
             tcp_keepalive: cfg.rpc_tcp_keepalive,
             max_calls_per_sec: cfg.rpc_max_calls_per_sec,
+            headers: Vec::new(),
+            // Merge the global and per-endpoint sets once, at construction:
+            // each endpoint then gets exactly the headers it should send.
+            endpoint_headers: (0..cfg.stellar_rpc_urls.len())
+                .map(|index| cfg.rpc_headers.for_endpoint(index))
+                .collect(),
         },
     )?;
     let tip = rpc.get_latest_ledger().await?;
@@ -502,6 +508,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 pool_max_idle_per_host: cfg.rpc_pool_max_idle_per_host,
                 tcp_keepalive: cfg.rpc_tcp_keepalive,
                 max_calls_per_sec: cfg.rpc_max_calls_per_sec,
+                headers: Vec::new(),
+                endpoint_headers: (0..cfg.stellar_rpc_urls.len())
+                    .map(|index| cfg.rpc_headers.for_endpoint(index))
+                    .collect(),
             },
         )?;
         let reconciler = reconcile::Reconciler::new(&cfg, db_pool.clone(), reconcile_rpc);

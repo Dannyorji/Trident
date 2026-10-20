@@ -128,6 +128,10 @@ impl Streamer {
                 pool_max_idle_per_host: config.rpc_pool_max_idle_per_host,
                 tcp_keepalive: config.rpc_tcp_keepalive,
                 max_calls_per_sec: config.rpc_max_calls_per_sec,
+                headers: Vec::new(),
+                endpoint_headers: (0..config.stellar_rpc_urls.len())
+                    .map(|index| config.rpc_headers.for_endpoint(index))
+                    .collect(),
             },
         )?;
         tracing::info!(
@@ -741,6 +745,11 @@ impl Streamer {
             let recent_ledgers = db::get_recent_ledger_metadata(&self.db, check_count).await?;
 
             for (seq, stored_hash) in recent_ledgers {
+                // Placeholder rows (#723) have no hash to compare; the query
+                // already excludes them, this keeps the invariant local.
+                if stored_hash.is_empty() {
+                    continue;
+                }
                 if let Ok(Some(rpc_hash)) = self.rpc.get_ledger(seq).await {
                     if rpc_hash != stored_hash {
                         tracing::warn!(
@@ -1261,6 +1270,11 @@ impl Streamer {
                 &storage_snapshots,
                 &self.config.network,
                 next_cursor,
+                // The page covers every ledger from just past the cursor it
+                // advanced to its new last ledger (issue #723): recording the
+                // whole span is what keeps `scan_ledger_gaps` from reporting
+                // inter-page stretches as holes.
+                next_cursor.map(|_| *cursor + 1),
                 next_cursor.map(|_| db::LedgerMeta {
                     sequence: ledger_sequence,
                     hash: &ledger_hash,
@@ -1549,6 +1563,7 @@ async fn commit_page_with_fallback(
     storage_snapshots: &[db::StorageSnapshotRow<'_>],
     network: &str,
     cursor: Option<u64>,
+    covered_from_ledger: Option<u64>,
     ledger: Option<db::LedgerMeta<'_>>,
     batch_size: usize,
 ) -> Result<(), TridentError> {
@@ -1573,6 +1588,7 @@ async fn commit_page_with_fallback(
                 storage_snapshots,
                 network,
                 cursor,
+                covered_from_ledger,
                 ledger: ledger.as_ref().map(|l| db::LedgerMeta {
                     sequence: l.sequence,
                     hash: l.hash,
@@ -1623,6 +1639,7 @@ async fn commit_page_with_fallback(
                         network,
                         cursor: None,
                         ledger: None,
+                        covered_from_ledger: None,
                         batch_size,
                     },
                 )
@@ -1711,6 +1728,7 @@ async fn commit_page_with_fallback(
             storage_snapshots,
             network,
             cursor,
+            covered_from_ledger,
             ledger,
             batch_size,
         },
@@ -2098,11 +2116,9 @@ mod tests {
             poll_interval_ceiling: Duration::from_millis(500),
             lag_high_watermark: 100,
             poll_hysteresis_ledgers: 10,
-            max_reorg_rewind_depth: 50,
             gap_scan_max_per_run: 100,
             stellar_rpc_urls: vec![rpc_url],
-            rpc_failover_threshold: 3,
-            rpc_endpoint_cooldown: Duration::from_secs(30),
+            rpc_headers: crate::config::RpcHeaderConfig::default(),
             rpc_breaker_failure_threshold: 5,
             rpc_breaker_cooldown: Duration::from_secs(30),
             rpc_connect_timeout: Duration::from_secs(5),

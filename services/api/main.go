@@ -299,7 +299,14 @@ func main() {
 	// through and panicking on first use.
 	var sorobanCaller handlers.SorobanRPCCaller
 	if rpcURL := os.Getenv("STELLAR_RPC_URL"); rpcURL != "" {
-		sorobanCaller = sorobanrpc.NewClient(rpcURL)
+		rpcClient, err := sorobanrpc.NewClient(rpcURL)
+		if err != nil {
+			// A malformed STELLAR_RPC_HEADERS must not silently start an
+			// unauthenticated client that 401s every contract call.
+			slog.Error("invalid Stellar RPC configuration", "err", err)
+			os.Exit(1)
+		}
+		sorobanCaller = rpcClient
 	}
 	var rlDB middleware.TierDB
 	if pool != nil {

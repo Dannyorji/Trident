@@ -1,7 +1,7 @@
-pub mod endpoints;
 pub mod health;
 
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -401,6 +401,13 @@ pub struct RpcHttpSettings {
     /// per-contract fan-out in `fetch_invocation_metrics` and storage
     /// snapshotting.
     pub max_calls_per_sec: u32,
+    /// Headers sent with every request to every endpoint (issue #735).
+    /// Typically a provider credential (`x-api-key` / `Authorization`);
+    /// values must never be logged.
+    pub headers: Vec<(String, String)>,
+    /// Per-endpoint header overrides, aligned with the endpoint list given to
+    /// [`RpcClient::with_endpoints`] and merged over `headers` by name.
+    pub endpoint_headers: Vec<Vec<(String, String)>>,
 }
 
 impl Default for RpcHttpSettings {
@@ -412,11 +419,51 @@ impl Default for RpcHttpSettings {
             pool_max_idle_per_host: 8,
             tcp_keepalive: Duration::from_secs(60),
             max_calls_per_sec: 50,
+            headers: Vec::new(),
+            endpoint_headers: Vec::new(),
         }
     }
 }
 
 impl RpcHttpSettings {
+    /// Build one `HeaderMap` per endpoint: the global set with that endpoint's
+    /// overrides merged on top (issue #735). Header names and values are
+    /// validated here, at construction, so a bad spec fails startup naming the
+    /// header rather than failing every call with an opaque 401.
+    fn build_headers(
+        &self,
+        urls: &[String],
+    ) -> Result<HashMap<String, reqwest::header::HeaderMap>, TridentError> {
+        let mut maps = HashMap::with_capacity(urls.len());
+        for (index, url) in urls.iter().enumerate() {
+            let mut map = reqwest::header::HeaderMap::new();
+            let overrides = self
+                .endpoint_headers
+                .get(index)
+                .cloned()
+                .unwrap_or_default();
+            for (name, value) in trident_common::rpc_headers::merge(self.headers.clone(), overrides)
+            {
+                let header_name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|_| {
+                        TridentError::config(anyhow::anyhow!(
+                            "[indexer] RPC header name {name:?} is not a valid HTTP token"
+                        ))
+                    })?;
+                let header_value =
+                    reqwest::header::HeaderValue::from_str(&value).map_err(|_| {
+                        TridentError::config(anyhow::anyhow!(
+                            "[indexer] RPC header {name:?} has a value that is not a valid \
+                             HTTP header value"
+                        ))
+                    })?;
+                map.insert(header_name, header_value);
+            }
+            maps.insert(url.clone(), map);
+        }
+        Ok(maps)
+    }
+
     /// Build the shared `reqwest::Client`: bounded connect/request timeouts plus
     /// keep-alive and idle-pool tuning so successive polls reuse connections
     /// instead of paying a fresh TCP + TLS handshake each time.
@@ -492,6 +539,10 @@ pub struct RpcClient {
     /// gives each endpoint the positional index used to label per-endpoint
     /// latency metrics (issue #294).
     endpoints: Vec<String>,
+    /// Header set per endpoint URL — global headers plus that endpoint's
+    /// overrides (issue #735). Keyed by URL because `execute` is handed the
+    /// selected URL, not its index.
+    headers: HashMap<String, reqwest::header::HeaderMap>,
     /// Self-imposed outbound rate limit, shared across every call this
     /// client makes (issue #661).
     rate_limiter: RateLimiter,
@@ -512,11 +563,16 @@ impl RpcClient {
         settings: &RpcHttpSettings,
     ) -> Result<Self, TridentError> {
         let scorer = Arc::new(RpcHealthScorer::new(urls.clone())?);
+        // Built before moving `urls` into the struct, and before the client is
+        // returned, so an invalid header fails `with_endpoints` rather than
+        // the first RPC call.
+        let headers = settings.build_headers(&urls)?;
 
         Ok(Self {
             http: settings.build_client()?,
             scorer,
             endpoints: urls,
+            headers,
             rate_limiter: RateLimiter::new(settings.max_calls_per_sec),
         })
     }
@@ -642,9 +698,17 @@ impl RpcClient {
         // each call site needing its own limiter.
         self.rate_limiter.acquire().await;
 
-        let resp = self
-            .http
-            .post(url)
+        // Provider auth headers, if configured for this endpoint (issue #735).
+        // Cloned per call: the map holds only the few headers a provider
+        // needs, and `RequestBuilder` takes ownership.
+        let mut request = self.http.post(url);
+        if let Some(headers) = self.headers.get(url) {
+            if !headers.is_empty() {
+                request = request.headers(headers.clone());
+            }
+        }
+
+        let resp = request
             .json(req)
             .send()
             .await
@@ -961,6 +1025,92 @@ mod tests {
     #[test]
     fn settings_build_a_client() {
         assert!(RpcHttpSettings::default().build_client().is_ok());
+    }
+
+    /// Issue #735: `STELLAR_RPC_HEADERS_<i>` must scope to endpoint `i`, and
+    /// the global set must still apply to endpoints without overrides.
+    #[test]
+    fn build_headers_scopes_per_endpoint_overrides() {
+        let settings = RpcHttpSettings {
+            headers: vec![("x-api-key".to_string(), "global".to_string())],
+            endpoint_headers: vec![
+                vec![("x-api-key".to_string(), "first".to_string())],
+                vec![("x-tenant".to_string(), "b".to_string())],
+            ],
+            ..RpcHttpSettings::default()
+        };
+
+        let maps = settings
+            .build_headers(&["https://a.example".into(), "https://b.example".into()])
+            .unwrap();
+
+        assert_eq!(maps["https://a.example"]["x-api-key"], "first");
+        assert_eq!(maps["https://b.example"]["x-api-key"], "global");
+        assert_eq!(maps["https://b.example"]["x-tenant"], "b");
+    }
+
+    /// A bad header must fail client construction (startup) and must not echo
+    /// the value, which is a provider credential.
+    #[test]
+    fn build_headers_rejects_invalid_names_without_leaking_values() {
+        let settings = RpcHttpSettings {
+            headers: vec![("bad name".to_string(), "leak-me".to_string())],
+            ..RpcHttpSettings::default()
+        };
+
+        let err = settings
+            .build_headers(&["https://a.example".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("bad name"), "{err}");
+        assert!(!err.contains("leak-me"), "{err}");
+    }
+
+    /// Issue #735's done criterion: against a mock RPC that requires a header,
+    /// a configured client succeeds and an unconfigured one fails clearly.
+    #[tokio::test]
+    async fn auth_header_is_sent_and_required_by_the_endpoint() {
+        use wiremock::matchers::header;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("x-api-key", "provider-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "events": [], "latestLedger": 100 }
+            })))
+            .mount(&server)
+            .await;
+        // Any request without the header is rejected the way a real provider
+        // rejects a missing key. Lower priority than the match above.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401))
+            .with_priority(10)
+            .mount(&server)
+            .await;
+
+        let configured = RpcClient::with_settings(
+            server.uri(),
+            &RpcHttpSettings {
+                headers: vec![("x-api-key".to_string(), "provider-key".to_string())],
+                ..fast_timeout_settings()
+            },
+        )
+        .unwrap();
+        let page = configured
+            .get_events(Some(1), None, 10, &[])
+            .await
+            .expect("a configured header must authenticate the call");
+        assert_eq!(page.latest_ledger, 100);
+
+        let unconfigured =
+            RpcClient::with_settings(server.uri(), &fast_timeout_settings()).unwrap();
+        let err = unconfigured
+            .get_events(Some(1), None, 10, &[])
+            .await
+            .expect_err("a missing header must fail, not silently succeed");
+        assert!(err.to_string().contains("401"), "{err}");
     }
 
     fn raw_event_json(ledger: serde_json::Value) -> serde_json::Value {
