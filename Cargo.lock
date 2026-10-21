@@ -4032,6 +4032,7 @@ dependencies = [
  "tracing-subscriber",
  "trident-common",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
