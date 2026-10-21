@@ -339,6 +339,7 @@ async fn maintain_partitions(pool: PgPool) {
                 .await
             {
                 tracing::error!(error = %e, "failed to run ensure_future_event_partitions");
+                metrics::record_partition_maintenance_failure();
             }
             let _ = sqlx::query("SELECT pg_advisory_unlock(123456789, 1)")
                 .execute(&pool)
