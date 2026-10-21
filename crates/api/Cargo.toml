@@ -15,7 +15,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 
 # OpenTelemetry distributed tracing (issue #81)
 opentelemetry = { version = "0.22", features = ["trace"] }
-opentelemetry-otlp = { version = "0.15", features = ["grpc-tonic"] }
+opentelemetry-otlp = { version = "0.15", features = ["grpc-tonic", "tls"] }
 opentelemetry_sdk = { version = "0.22", features = ["rt-tokio"] }
 tracing-opentelemetry = "0.23"
 
