@@ -4,13 +4,12 @@
 # sustained (not a blip) — both must breach before paging.
 #
 # Validate with: promtool check rules observability/burn-rate-alerts.yml
-# (not run as part of this change — promtool wasn't available in the
-# environment this was authored in).
 #
-# Only SLO 1 (ingest freshness) has live metrics today. SLO 2/3 (API
-# latency/availability) are stubbed below and gated on issue #295 shipping
-# the underlying RED metrics — do not enable them until those metrics
-# actually exist, or every rule evaluation will just return no data.
+# SLO 1 (ingest freshness) and SLO 2/3 (API latency/availability) all have
+# live metrics today. #295 shipped trident_api_http_requests_total and
+# trident_api_http_request_duration_seconds (services/api/middleware/
+# metrics.go), unblocking the SLO 2/3 rules that were previously stubbed
+# out here (#770).
 
 groups:
   - name: trident-slo-ingest-freshness
@@ -108,21 +107,214 @@ groups:
             the cause.
           runbook_url: "docs/runbooks/alerts.md#tridentingestlagsustainedhigh"
 
-  # ---------------------------------------------------------------------------
-  # Stubbed — do not enable until issue #295 (RED metrics for services/api)
-  # ships the full set of labels needed for SLO 2/3. The metrics exist today
-  # as trident_api_http_requests_total and
-  # trident_api_http_request_duration_seconds (services/api/middleware/metrics.go),
-  # but are still being validated against production traffic patterns before
-  # burn-rate thresholds can be confidently set. See docs/slo.md SLO 2 / SLO 3.
-  # ---------------------------------------------------------------------------
-  # - name: trident-slo-api-latency-availability
-  #   rules:
-  #     - record: trident:api_availability_error_ratio5m
-  #       expr: |
-  #         1 - (
-  #           sum(rate(trident_api_http_requests_total{status!~"5.."}[5m]))
-  #           /
-  #           sum(rate(trident_api_http_requests_total[5m]))
-  #         )
-  #     # ... mirror the fast/slow burn pattern above once the metric exists.
+  - name: trident-slo-api-availability
+    rules:
+      # Error ratio: fraction of requests returning 5xx, over the windows the
+      # multi-burn-rate check below compares. docs/slo.md SLO 3 target: 99.5%
+      # non-5xx over a rolling 28-day window (0.5% error budget).
+      - record: trident:api_availability_error_ratio5m
+        expr: |
+          1 - (
+            sum(rate(trident_api_http_requests_total{status!~"5.."}[5m]))
+            /
+            sum(rate(trident_api_http_requests_total[5m]))
+          )
+      - record: trident:api_availability_error_ratio1h
+        expr: |
+          1 - (
+            sum(rate(trident_api_http_requests_total{status!~"5.."}[1h]))
+            /
+            sum(rate(trident_api_http_requests_total[1h]))
+          )
+      - record: trident:api_availability_error_ratio30m
+        expr: |
+          1 - (
+            sum(rate(trident_api_http_requests_total{status!~"5.."}[30m]))
+            /
+            sum(rate(trident_api_http_requests_total[30m]))
+          )
+      - record: trident:api_availability_error_ratio6h
+        expr: |
+          1 - (
+            sum(rate(trident_api_http_requests_total{status!~"5.."}[6h]))
+            /
+            sum(rate(trident_api_http_requests_total[6h]))
+          )
+
+      # Fast burn: 14.4x the 0.5%-error-budget SLO — exhausts the 28-day
+      # budget in ~2 days if sustained. Same window pattern as ingest
+      # freshness above.
+      - alert: APIAvailabilityFastBurn
+        expr: |
+          trident:api_availability_error_ratio5m > (14.4 * 0.005)
+          and
+          trident:api_availability_error_ratio1h > (14.4 * 0.005)
+        for: 2m
+        labels:
+          severity: page
+          slo: api-availability
+        annotations:
+          summary: "API availability SLO fast-burn — 5xx rate consuming error budget quickly"
+          description: >-
+            Over {{ $value | humanizePercentage }} of API requests returned a
+            5xx status in both the last 5m and the last 1h. At this burn rate
+            the 28-day error budget (docs/slo.md SLO 3, target 99.5%) is
+            exhausted in under 2 days. This is the same underlying signal as
+            TridentAPIHTTP5xxRateHigh/Critical (monitoring/alerts.yml), framed
+            as error-budget consumption instead of a flat threshold.
+          runbook_url: "docs/runbooks/alerts.md#apiavailabilityfastburn"
+
+      # Slow burn: 6x — exhausts the budget in ~5 days if sustained.
+      - alert: APIAvailabilitySlowBurn
+        expr: |
+          trident:api_availability_error_ratio30m > (6 * 0.005)
+          and
+          trident:api_availability_error_ratio6h > (6 * 0.005)
+        for: 15m
+        labels:
+          severity: ticket
+          slo: api-availability
+        annotations:
+          summary: "API availability SLO slow-burn — sustained elevated 5xx rate"
+          description: >-
+            Over {{ $value | humanizePercentage }} of API requests returned a
+            5xx status for a sustained share of both the last 30m and the
+            last 6h. Not urgent enough to page, but investigate before it
+            becomes a fast burn.
+          runbook_url: "docs/runbooks/alerts.md#apiavailabilityslowburn"
+
+  - name: trident-slo-api-latency
+    rules:
+      # p95 latency SLO, split by method since there is no class="read"|"write"
+      # label yet (docs/slo.md SLO 2): GET targets 500ms, non-GET targets 1s.
+      # Expressed as an error ratio (share of requests in the bucket at/under
+      # the le=target bucket boundary) rather than a raw histogram_quantile,
+      # so it composes with the same fast/slow burn-rate math as the other
+      # two SLOs.
+      - record: trident:api_read_latency_error_ratio5m
+        expr: |
+          1 - (
+            sum(rate(trident_api_http_request_duration_seconds_bucket{method="GET",le="0.5"}[5m]))
+            /
+            sum(rate(trident_api_http_request_duration_seconds_count{method="GET"}[5m]))
+          )
+      - record: trident:api_read_latency_error_ratio1h
+        expr: |
+          1 - (
+            sum(rate(trident_api_http_request_duration_seconds_bucket{method="GET",le="0.5"}[1h]))
+            /
+            sum(rate(trident_api_http_request_duration_seconds_count{method="GET"}[1h]))
+          )
+      - record: trident:api_read_latency_error_ratio30m
+        expr: |
+          1 - (
+            sum(rate(trident_api_http_request_duration_seconds_bucket{method="GET",le="0.5"}[30m]))
+            /
+            sum(rate(trident_api_http_request_duration_seconds_count{method="GET"}[30m]))
+          )
+      - record: trident:api_read_latency_error_ratio6h
+        expr: |
+          1 - (
+            sum(rate(trident_api_http_request_duration_seconds_bucket{method="GET",le="0.5"}[6h]))
+            /
+            sum(rate(trident_api_http_request_duration_seconds_count{method="GET"}[6h]))
+          )
+
+      - record: trident:api_write_latency_error_ratio5m
+        expr: |
+          1 - (
+            sum(rate(trident_api_http_request_duration_seconds_bucket{method!="GET",le="1"}[5m]))
+            /
+            sum(rate(trident_api_http_request_duration_seconds_count{method!="GET"}[5m]))
+          )
+      - record: trident:api_write_latency_error_ratio1h
+        expr: |
+          1 - (
+            sum(rate(trident_api_http_request_duration_seconds_bucket{method!="GET",le="1"}[1h]))
+            /
+            sum(rate(trident_api_http_request_duration_seconds_count{method!="GET"}[1h]))
+          )
+      - record: trident:api_write_latency_error_ratio30m
+        expr: |
+          1 - (
+            sum(rate(trident_api_http_request_duration_seconds_bucket{method!="GET",le="1"}[30m]))
+            /
+            sum(rate(trident_api_http_request_duration_seconds_count{method!="GET"}[30m]))
+          )
+      - record: trident:api_write_latency_error_ratio6h
+        expr: |
+          1 - (
+            sum(rate(trident_api_http_request_duration_seconds_bucket{method!="GET",le="1"}[6h]))
+            /
+            sum(rate(trident_api_http_request_duration_seconds_count{method!="GET"}[6h]))
+          )
+
+      - alert: APIReadLatencyFastBurn
+        expr: |
+          trident:api_read_latency_error_ratio5m > (14.4 * 0.05)
+          and
+          trident:api_read_latency_error_ratio1h > (14.4 * 0.05)
+        for: 2m
+        labels:
+          severity: page
+          slo: api-latency
+        annotations:
+          summary: "API read-route p95 latency SLO fast-burn — GET routes slower than 500ms"
+          description: >-
+            Over {{ $value | humanizePercentage }} of GET requests exceeded
+            the 500ms p95 target (docs/slo.md SLO 2) in both the last 5m and
+            the last 1h. At this burn rate the 28-day error budget (33.6h) is
+            exhausted in under 2 days.
+          runbook_url: "docs/runbooks/alerts.md#apireadlatencyfastburn"
+
+      - alert: APIReadLatencySlowBurn
+        expr: |
+          trident:api_read_latency_error_ratio30m > (6 * 0.05)
+          and
+          trident:api_read_latency_error_ratio6h > (6 * 0.05)
+        for: 15m
+        labels:
+          severity: ticket
+          slo: api-latency
+        annotations:
+          summary: "API read-route p95 latency SLO slow-burn — sustained elevated latency"
+          description: >-
+            Over {{ $value | humanizePercentage }} of GET requests exceeded
+            the 500ms p95 target for a sustained share of both the last 30m
+            and the last 6h.
+          runbook_url: "docs/runbooks/alerts.md#apireadlatencyslowburn"
+
+      - alert: APIWriteLatencyFastBurn
+        expr: |
+          trident:api_write_latency_error_ratio5m > (14.4 * 0.05)
+          and
+          trident:api_write_latency_error_ratio1h > (14.4 * 0.05)
+        for: 2m
+        labels:
+          severity: page
+          slo: api-latency
+        annotations:
+          summary: "API write-route p95 latency SLO fast-burn — non-GET routes slower than 1s"
+          description: >-
+            Over {{ $value | humanizePercentage }} of non-GET requests
+            exceeded the 1s p95 target (docs/slo.md SLO 2) in both the last 5m
+            and the last 1h. At this burn rate the 28-day error budget is
+            exhausted in under 2 days.
+          runbook_url: "docs/runbooks/alerts.md#apiwritelatencyfastburn"
+
+      - alert: APIWriteLatencySlowBurn
+        expr: |
+          trident:api_write_latency_error_ratio30m > (6 * 0.05)
+          and
+          trident:api_write_latency_error_ratio6h > (6 * 0.05)
+        for: 15m
+        labels:
+          severity: ticket
+          slo: api-latency
+        annotations:
+          summary: "API write-route p95 latency SLO slow-burn — sustained elevated latency"
+          description: >-
+            Over {{ $value | humanizePercentage }} of non-GET requests
+            exceeded the 1s p95 target for a sustained share of both the last
+            30m and the last 6h.
+          runbook_url: "docs/runbooks/alerts.md#apiwritelatencyslowburn"

@@ -474,6 +474,9 @@ jobs:
       - name: Validate observability/burn-rate-alerts.yml
         run: ./promtool check rules observability/burn-rate-alerts.yml
 
+      - name: Test observability/burn-rate-alerts.yml
+        run: ./promtool test rules observability/burn-rate-alerts.test.yml
+
       - name: Validate observability/rpc-alerts.yml
         run: ./promtool check rules observability/rpc-alerts.yml
 
