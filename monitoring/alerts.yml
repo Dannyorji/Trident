@@ -198,26 +198,6 @@ groups:
             but missing from soroban_events until replayed.
           runbook_url: "docs/runbooks/alerts.md#tridentindexerpersistdeadletterbacklog"
 
-      # A non-empty persist dead-letter queue is data missing from
-      # soroban_events until someone replays it — a silently growing DLQ is
-      # the same as data loss. Rows leave the pending state only through the
-      # documented replay procedure, so this fires for as long as any exist.
-      - alert: TridentIndexerPersistDeadLetterBacklog
-        expr: trident_indexer_persist_dead_letter_backlog > 0
-        for: 5m
-        labels:
-          severity: warning
-          service: indexer
-        annotations:
-          summary: "Trident indexer has {{ $value | humanize }} event(s) pending replay in failed_events"
-          description: >
-            failed_events has pending rows: at least one well-formed event's
-            database commit failed through its full retry budget and was
-            captured for replay rather than blocking the ingest cursor
-            (issue #508). Data is safe but missing from soroban_events until
-            replayed — see the runbook for the replay procedure.
-          runbook_url: "docs/runbooks/alerts.md#tridentindexerpersistdeadletterbacklog"
-
   # ---------------------------------------------------------------------------
   # Ledger-range reconciliation against the RPC source (#511).
   # ---------------------------------------------------------------------------
