@@ -32,8 +32,14 @@ struct Args {
     #[arg(long)]
     dry_run: bool,
 
-    #[arg(long, default_value_t = String::from("testnet"))]
-    network: String,
+    /// Validated against trident_common::Network's known set
+    /// (mainnet/testnet/futurenet/sandbox), the same set
+    /// chk_soroban_events_network enforces at the database layer (migration
+    /// 0031). Previously a bare String accepted anything and the typo only
+    /// surfaced as a check-constraint violation on the first insert, deep
+    /// into a potentially long-running backfill (#773).
+    #[arg(long, default_value_t = trident_common::types::Network::Testnet)]
+    network: trident_common::types::Network,
 
     /// Run as a long-lived worker that claims ranges from `backfill_jobs`
     /// (issue #216) instead of backfilling a single --from-ledger/--to-ledger
@@ -339,7 +345,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let any_range_failed = any_range_failed.clone();
         let pb = pb.clone();
         let rpc_delay = args.rpc_delay_ms;
-        let network = args.network.clone();
+        let network = args.network.as_str().to_string();
 
         let handle = tokio::spawn(async move {
             while let Some((s, e)) = rx.lock().await.recv().await {
@@ -493,5 +499,54 @@ mod tests {
             "only the two events at or below to_ledger (100, 101) should be counted, \
              not the one at 102 that the page happened to also include"
         );
+    }
+
+    /// --network previously accepted any String; a typo only surfaced as a
+    /// check-constraint violation on the first insert. It's now validated at
+    /// CLI-parse time against the same set the database enforces (#773).
+    #[test]
+    fn network_arg_rejects_unknown_value_and_accepts_known_ones() {
+        let err = Args::try_parse_from([
+            "trident-backfill",
+            "--from-ledger",
+            "1",
+            "--to-ledger",
+            "2",
+            "--network",
+            "bogus",
+        ])
+        .expect_err("an unrecognised network must be rejected at parse time");
+        assert!(
+            err.to_string().contains("mainnet")
+                && err.to_string().contains("testnet")
+                && err.to_string().contains("futurenet")
+                && err.to_string().contains("sandbox"),
+            "the error should list the known networks, got: {err}"
+        );
+
+        for valid in ["mainnet", "testnet", "futurenet", "sandbox"] {
+            let args = Args::try_parse_from([
+                "trident-backfill",
+                "--from-ledger",
+                "1",
+                "--to-ledger",
+                "2",
+                "--network",
+                valid,
+            ])
+            .unwrap_or_else(|e| panic!("{valid} must be accepted, got: {e}"));
+            assert_eq!(args.network.as_str(), valid);
+        }
+    }
+
+    /// Unset --network must keep defaulting to testnet, matching the
+    /// pre-#773 behaviour, not silently change the default while adding
+    /// validation.
+    #[test]
+    fn network_arg_defaults_to_testnet() {
+        let args =
+            Args::try_parse_from(["trident-backfill", "--from-ledger", "1", "--to-ledger", "2"])
+                .unwrap();
+        assert_eq!(args.network.as_str(), "testnet");
     }
 }
