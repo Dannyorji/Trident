@@ -39,6 +39,10 @@ spec:
     metadata:
       labels:
         {{- include "trident.selectorLabels" (dict "root" . "component" "indexer") | nindent 8 }}
+        # Picked up by the PodMonitor's jobLabel (issue #768) as the
+        # Prometheus `job` label, matching monitoring/alerts.yml's
+        # up{job="trident-indexer"} matcher exactly.
+        job: {{ .Values.monitoring.indexer.jobLabel }}
     spec:
       {{- include "trident.imagePullSecrets" . | nindent 6 }}
       securityContext:

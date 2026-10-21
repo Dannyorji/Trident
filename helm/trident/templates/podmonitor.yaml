@@ -1,0 +1,36 @@
+{{/*
+Prometheus Operator PodMonitor for the indexer (issue #768).
+
+The indexer has no Service (indexer-deployment.yaml is Deployment-only, by
+design — see the single-writer note there), so it needs a PodMonitor rather
+than a ServiceMonitor to be scraped at all. Without this, monitoring/
+alerts.yml's up{job="trident-indexer"} series never exists and
+TridentIndexerProcessDown can never fire.
+
+jobLabel matches .Values.monitoring.indexer.jobLabel, which must stay
+"trident-indexer" unless the alert rule's job= matcher is updated to match.
+*/}}
+{{- if .Values.monitoring.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "trident.fullname" . }}-indexer
+  labels:
+    {{- include "trident.labels" . | nindent 4 }}
+    app.kubernetes.io/component: indexer
+    {{- with .Values.monitoring.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  # "job" names the Pod label (set on the indexer pod template above) whose
+  # value becomes Prometheus's `job` label — not a literal override.
+  jobLabel: job
+  selector:
+    matchLabels:
+      {{- include "trident.selectorLabels" (dict "root" . "component" "indexer") | nindent 6 }}
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ .Values.monitoring.indexer.interval }}
+      scrapeTimeout: {{ .Values.monitoring.indexer.scrapeTimeout }}
+{{- end }}
