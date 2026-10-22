@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Verify that every metric name referenced in Prometheus alert rules actually
-# exists in the live /metrics endpoints (issue #393).
+# exists in the live /metrics endpoints (issue #393), and that no alert name
+# is defined more than once across the rule files (issue #769 — two copies
+# of TridentIndexerPersistDeadLetterBacklog both fired together, paging
+# on-call twice per incident).
 #
 # Usage:
 #   ./scripts/verify-alert-metrics.sh <api-metrics-url> <indexer-metrics-url> [<api-legacy-metrics-url>]
@@ -21,8 +24,8 @@
 #     https://indexer-staging.trident.example/metrics
 #
 # Exit codes:
-#   0 - all referenced metrics exist
-#   1 - one or more metrics are missing
+#   0 - all referenced metrics exist and no alert name is duplicated
+#   1 - one or more metrics are missing, or a duplicate alert name was found
 #   2 - usage error or connectivity failure
 
 set -euo pipefail
@@ -179,11 +182,55 @@ for name in sorted(found):
 PYEOF
 }
 
+# Extract every `alert:` name declared in a rule file, one per line. Separate
+# from extract_metrics_from_alerts above: that function strips names down to
+# the *metrics* an expr reads, while this reads the rule's own `alert:` key
+# untouched, including names metrics-extraction would otherwise treat as
+# "not a metric" (e.g. no underscore).
+extract_alert_names() {
+  python3 - "$1" <<'PYEOF'
+import sys, yaml
+
+doc = yaml.safe_load(open(sys.argv[1], encoding="utf-8")) or {}
+for group in doc.get("groups") or []:
+    for rule in group.get("rules") or []:
+        name = rule.get("alert")
+        if name:
+            print(name)
+PYEOF
+}
+
 ALERT_FILES=(
   "monitoring/alerts.yml"
   "observability/burn-rate-alerts.yml"
   "observability/rpc-alerts.yml"
 )
+
+echo "=== Checking alert names are unique across all rule files ==="
+ALERT_NAMES=()
+for alert_file in "${ALERT_FILES[@]}"; do
+  if [ ! -f "$alert_file" ]; then
+    continue
+  fi
+  while IFS= read -r name; do
+    ALERT_NAMES+=("$name")
+  done < <(extract_alert_names "$alert_file")
+done
+
+DUPLICATE_ALERT_NAMES=($(printf '%s\n' "${ALERT_NAMES[@]}" | sort | uniq -d))
+if [ ${#DUPLICATE_ALERT_NAMES[@]} -gt 0 ]; then
+  echo "FAILURE: alert name(s) defined more than once across ${ALERT_FILES[*]}:" >&2
+  for name in "${DUPLICATE_ALERT_NAMES[@]}"; do
+    echo "  - $name" >&2
+  done
+  echo "" >&2
+  echo "Duplicate alert rules fire together on the same condition, paging" >&2
+  echo "on-call more than once per incident, and can silently diverge from" >&2
+  echo "each other over time." >&2
+  exit 1
+fi
+echo "✓ ${#ALERT_NAMES[@]} alert names, all unique"
+echo ""
 
 REFERENCED_METRICS=()
 for alert_file in "${ALERT_FILES[@]}"; do

@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"regexp"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -87,6 +88,35 @@ func redactConnErr(err error) string {
 	return connErrRegexp.ReplaceAllString(err.Error(), "${1}://[redacted]@")
 }
 
+// parseOTLPHeaders parses the standard OTel OTEL_EXPORTER_OTLP_HEADERS
+// format (comma-separated key=value pairs, e.g. "api-key=secret,x-foo=bar")
+// used to authenticate against a hosted collector (issue #762). Malformed
+// entries are skipped rather than failing exporter init.
+func parseOTLPHeaders(raw string) map[string]string {
+	if raw == "" {
+		return nil
+	}
+	headers := make(map[string]string)
+	for _, pair := range strings.Split(raw, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		kv := strings.SplitN(pair, "=", 2)
+		if len(kv) != 2 {
+			slog.Warn("skipping malformed OTEL_EXPORTER_OTLP_HEADERS entry", "entry", pair)
+			continue
+		}
+		key := strings.TrimSpace(kv[0])
+		value := strings.TrimSpace(kv[1])
+		if key == "" {
+			continue
+		}
+		headers[key] = value
+	}
+	return headers
+}
+
 func initTracer(ctx context.Context) func() {
 	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
 	if endpoint == "" {
@@ -95,15 +125,29 @@ func initTracer(ctx context.Context) func() {
 
 	samplingRatio := 0.1
 	if r := os.Getenv("OTEL_SAMPLING_RATIO"); r != "" {
-		if f, err := strconv.ParseFloat(r, 64); err == nil {
+		f, err := strconv.ParseFloat(r, 64)
+		if err != nil || f < 0 || f > 1 {
+			slog.Warn("invalid OTEL_SAMPLING_RATIO, must be a float in [0,1]; falling back to default", "value", r, "default", samplingRatio)
+		} else {
 			samplingRatio = f
 		}
 	}
 
-	exporter, err := otlptracegrpc.New(ctx,
+	// Issue #762: traces include request paths, contract ids, key ids and
+	// error messages, so the exporter connection defaults to TLS. Insecure
+	// (plaintext) requires an explicit opt-in via the standard OTel env var
+	// — e.g. for a local collector sidecar in development.
+	opts := []otlptracegrpc.Option{
 		otlptracegrpc.WithEndpoint(endpoint),
-		otlptracegrpc.WithInsecure(),
-	)
+	}
+	if insecure, _ := strconv.ParseBool(os.Getenv("OTEL_EXPORTER_OTLP_INSECURE")); insecure {
+		opts = append(opts, otlptracegrpc.WithInsecure())
+	}
+	if headers := parseOTLPHeaders(os.Getenv("OTEL_EXPORTER_OTLP_HEADERS")); len(headers) > 0 {
+		opts = append(opts, otlptracegrpc.WithHeaders(headers))
+	}
+
+	exporter, err := otlptracegrpc.New(ctx, opts...)
 	if err != nil {
 		slog.Warn("failed to create OTLP trace exporter", "err", err)
 		return func() {}

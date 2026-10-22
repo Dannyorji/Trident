@@ -215,6 +215,13 @@ goApi:
   env:
     PORT: "3000"
     GRPC_ADDR: "trident-grpc-api:5000"
+    METRICS_PORT: "9091"
+  # Internal Prometheus metrics server (METRICS_PORT, issue #58), separate
+  # from the public API port and from the legacy /metrics route mounted on
+  # it. Exposed as its own container/Service port so a ServiceMonitor can
+  # scrape it without also exposing it on the public-facing port (issue
+  # #768). Must match goApi.env.METRICS_PORT above.
+  metricsPort: 9091
   hpa:
     minReplicas: 2
     maxReplicas: 10
@@ -368,3 +375,35 @@ internalMTLS:
   #   INTERNAL_CLIENT_CERT  - Go API client leaf cert
   #   INTERNAL_CLIENT_KEY   - Go API client private key
   mountPath: /etc/trident/mtls
+
+# ---------------------------------------------------------------------------
+# Prometheus Operator scrape config (issue #768). monitoring/alerts.yml keys
+# on up{job="trident-indexer"} and up{job="trident-api"}, but nothing in this
+# chart previously created a ServiceMonitor/PodMonitor (or any scrape
+# annotation), so in a kube-prometheus-stack cluster those `up` series never
+# existed and TridentIndexerProcessDown / TridentAPIProcessDown could never
+# fire. Off by default so installs without the Prometheus Operator CRDs
+# aren't broken by `helm install`.
+#
+# The Rust gRPC API exposes no /metrics endpoint at all yet (tracked
+# separately), so it has no ServiceMonitor here.
+# ---------------------------------------------------------------------------
+monitoring:
+  enabled: false
+  # jobLabel matches monitoring/alerts.yml's `job=` label matchers exactly —
+  # changing it here without updating the alert rules breaks every alert
+  # that keys on job="trident-indexer"/"trident-api".
+  indexer:
+    jobLabel: trident-indexer
+    interval: 30s
+    scrapeTimeout: 10s
+  goApi:
+    jobLabel: trident-api
+    interval: 30s
+    scrapeTimeout: 10s
+  # Labels merged onto the ServiceMonitor/PodMonitor objects themselves (not
+  # the scraped targets) — set this to match your Prometheus Operator's
+  # serviceMonitorSelector/podMonitorSelector if it isn't the chart-wide
+  # release selector (e.g. kube-prometheus-stack's default often expects
+  # release: <prometheus-release-name>).
+  additionalLabels: {}

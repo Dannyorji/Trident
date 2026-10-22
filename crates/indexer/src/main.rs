@@ -264,20 +264,44 @@ fn init_tracer() -> Option<opentelemetry_sdk::trace::Tracer> {
     let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok()?;
     let sampling_ratio = std::env::var("OTEL_SAMPLING_RATIO")
         .ok()
-        .and_then(|s| s.parse::<f64>().ok())
+        .and_then(|s| {
+            let parsed = s.parse::<f64>().ok();
+            if !matches!(parsed, Some(v) if (0.0..=1.0).contains(&v)) {
+                eprintln!(
+                    "invalid OTEL_SAMPLING_RATIO {s:?}, must be a float in [0,1]; falling back to default"
+                );
+                return None;
+            }
+            parsed
+        })
         .unwrap_or(0.1);
 
     opentelemetry::global::set_text_map_propagator(
         opentelemetry_sdk::propagation::TraceContextPropagator::new(),
     );
 
+    // Issue #762: traces include request paths, contract ids, key ids and
+    // error messages, so the exporter connection defaults to TLS. Insecure
+    // (plaintext) requires an explicit opt-in via the standard OTel env var
+    // — e.g. for a local collector sidecar in development. Collector auth
+    // headers (OTEL_EXPORTER_OTLP_HEADERS) are already read automatically by
+    // opentelemetry-otlp's tonic exporter, so no extra wiring is needed here.
+    let insecure = std::env::var("OTEL_EXPORTER_OTLP_INSECURE")
+        .ok()
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false);
+
+    let mut tonic_exporter = opentelemetry_otlp::new_exporter()
+        .tonic()
+        .with_endpoint(endpoint);
+    if !insecure {
+        tonic_exporter =
+            tonic_exporter.with_tls_config(tonic::transport::ClientTlsConfig::new());
+    }
+
     match opentelemetry_otlp::new_pipeline()
         .tracing()
-        .with_exporter(
-            opentelemetry_otlp::new_exporter()
-                .tonic()
-                .with_endpoint(endpoint),
-        )
+        .with_exporter(tonic_exporter)
         .with_trace_config(
             opentelemetry_sdk::trace::Config::default()
                 .with_sampler(opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(
@@ -319,6 +343,7 @@ async fn maintain_partitions(pool: PgPool) {
                 .await
             {
                 tracing::error!(error = %e, "failed to run ensure_future_event_partitions");
+                metrics::record_partition_maintenance_failure();
             }
             let _ = sqlx::query("SELECT pg_advisory_unlock(123456789, 1)")
                 .execute(&pool)
