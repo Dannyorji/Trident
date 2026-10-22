@@ -115,11 +115,19 @@ pub async fn fail_job(pool: &PgPool, id: Uuid, error: &str) -> Result<(), Triden
 /// deployment (e.g. `"mainnet"` or `"testnet"`); the natural-key constraint is
 /// network-scoped because the same transaction hash can legitimately appear on
 /// more than one network.
+/// Returns the number of rows actually inserted (0 or 1), not just whether
+/// the statement executed without error. `ON CONFLICT ... DO NOTHING` means
+/// a true duplicate returns `Ok(())` with zero rows affected, which looks
+/// identical to a successful insert unless the caller checks
+/// `rows_affected()` — a caller that only matches `Ok`/`Err` cannot tell a
+/// duplicate from a real insert, and (worse) cannot tell a real DB error
+/// from a duplicate either, since both only surface via this return value
+/// (#772).
 pub async fn insert_event(
     pool: &PgPool,
     event: &SorobanEvent,
     network: &str,
-) -> Result<(), TridentError> {
+) -> Result<u64, TridentError> {
     let id = event_uuid(&event.transaction_hash, event.raw_event_index);
     let event_type = match event.event_type {
         trident_common::EventType::Contract => "contract",
@@ -153,9 +161,8 @@ pub async fn insert_event(
     .bind(network)
     .execute(pool)
     .await
-    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("insert_event")))?;
-
-    Ok(())
+    .map(|result| result.rows_affected())
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("insert_event")))
 }
 
 #[cfg(test)]
@@ -287,6 +294,62 @@ mod tests {
 
         sqlx::query("DELETE FROM backfill_jobs WHERE network = $1")
             .bind(&network)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    fn test_event(unique_suffix: &str, raw_event_index: u32) -> SorobanEvent {
+        SorobanEvent {
+            contract_id: format!("CA-test-{unique_suffix}"),
+            topics: vec![],
+            data: serde_json::Value::Null,
+            ledger_sequence: 12_345,
+            ledger_timestamp: "2024-01-01T00:00:00Z".to_string(),
+            transaction_hash: format!("tx-{unique_suffix}"),
+            event_index: raw_event_index,
+            raw_event_index,
+            event_type: trident_common::EventType::Contract,
+        }
+    }
+
+    /// `ON CONFLICT (ledger_sequence, id) DO NOTHING` means a true
+    /// duplicate insert returns `Ok(())` with zero rows affected — it must
+    /// not look identical to a real error, and it must not look identical
+    /// to a successful first insert either, or the caller (backfill's
+    /// duplicates_skipped vs. events_indexed counters) cannot tell any of
+    /// the three apart (#772).
+    ///
+    /// `network` is a restricted set (`chk_soroban_events_network`:
+    /// mainnet/testnet/futurenet/sandbox), unlike `backfill_jobs.network`
+    /// above, so test isolation here is by a unique `transaction_hash`
+    /// (part of the real natural key and of `event_uuid`'s input), not by a
+    /// throwaway `network` value.
+    #[tokio::test]
+    async fn insert_event_reports_rows_affected_for_new_vs_duplicate() {
+        let Some(pool) = connect_test_db().await else {
+            return;
+        };
+
+        let network = "sandbox";
+        let unique_suffix = Uuid::new_v4().to_string();
+        let event = test_event(&unique_suffix, 1);
+
+        let first = insert_event(&pool, &event, network).await.unwrap();
+        assert_eq!(
+            first, 1,
+            "first insert of a new event must affect exactly one row"
+        );
+
+        let second = insert_event(&pool, &event, network).await.unwrap();
+        assert_eq!(
+            second, 0,
+            "re-inserting the same (ledger_sequence, id) must be a no-op (0 rows affected), \
+             not indistinguishable from either a fresh insert or an error"
+        );
+
+        sqlx::query("DELETE FROM soroban_events WHERE transaction_hash = $1")
+            .bind(&event.transaction_hash)
             .execute(&pool)
             .await
             .unwrap();

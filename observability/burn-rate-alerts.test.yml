@@ -1,0 +1,112 @@
+# Promtool unit tests for observability/burn-rate-alerts.yml (#770).
+#
+# Validate with: promtool test rules observability/burn-rate-alerts.test.yml
+
+rule_files:
+  - burn-rate-alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # --- SLO 3: API availability -------------------------------------------
+  - interval: 1m
+    input_series:
+      # A constant 10% 5xx rate for the whole test window: well above the
+      # 14.4x fast-burn threshold (14.4 * 0.5% = 7.2%) in both the 5m and 1h
+      # windows, so the fast-burn alert should fire once both windows have
+      # enough history (after ~1h).
+      - series: 'trident_api_http_requests_total{status="200"}'
+        values: "0+90x120"
+      - series: 'trident_api_http_requests_total{status="500"}'
+        values: "0+10x120"
+    alert_rule_test:
+      - eval_time: 65m
+        alertname: APIAvailabilityFastBurn
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              slo: api-availability
+            exp_annotations:
+              summary: "API availability SLO fast-burn — 5xx rate consuming error budget quickly"
+              description: "Over 10% of API requests returned a 5xx status in both the last 5m and the last 1h. At this burn rate the 28-day error budget (docs/slo.md SLO 3, target 99.5%) is exhausted in under 2 days. This is the same underlying signal as TridentAPIHTTP5xxRateHigh/Critical (monitoring/alerts.yml), framed as error-budget consumption instead of a flat threshold."
+              runbook_url: "docs/runbooks/alerts.md#apiavailabilityfastburn"
+
+  - interval: 1m
+    input_series:
+      # A clean 0% 5xx rate: the fast-burn alert must never fire.
+      - series: 'trident_api_http_requests_total{status="200"}'
+        values: "0+100x120"
+      - series: 'trident_api_http_requests_total{status="500"}'
+        values: "0+0x120"
+    alert_rule_test:
+      - eval_time: 65m
+        alertname: APIAvailabilityFastBurn
+        exp_alerts: []
+
+  # --- SLO 2: API read-route (GET) p95 latency ----------------------------
+  - interval: 1m
+    input_series:
+      # Every GET request lands in the >500ms bucket (le="0.5" never
+      # increments while le="+Inf"/count does): a simulated total latency
+      # regression on read routes, well above the fast-burn threshold
+      # (14.4 * 5% = 72% of requests allowed over target before firing).
+      - series: 'trident_api_http_request_duration_seconds_bucket{method="GET",le="0.5"}'
+        values: "0+0x120"
+      - series: 'trident_api_http_request_duration_seconds_count{method="GET"}'
+        values: "0+50x120"
+    alert_rule_test:
+      - eval_time: 65m
+        alertname: APIReadLatencyFastBurn
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              slo: api-latency
+            exp_annotations:
+              summary: "API read-route p95 latency SLO fast-burn — GET routes slower than 500ms"
+              description: "Over 100% of GET requests exceeded the 500ms p95 target (docs/slo.md SLO 2) in both the last 5m and the last 1h. At this burn rate the 28-day error budget (33.6h) is exhausted in under 2 days."
+              runbook_url: "docs/runbooks/alerts.md#apireadlatencyfastburn"
+
+  - interval: 1m
+    input_series:
+      # Every GET request lands under 500ms: the read-latency fast-burn
+      # alert must never fire.
+      - series: 'trident_api_http_request_duration_seconds_bucket{method="GET",le="0.5"}'
+        values: "0+50x120"
+      - series: 'trident_api_http_request_duration_seconds_count{method="GET"}'
+        values: "0+50x120"
+    alert_rule_test:
+      - eval_time: 65m
+        alertname: APIReadLatencyFastBurn
+        exp_alerts: []
+
+  # --- SLO 2: API write-route (non-GET) p95 latency -----------------------
+  - interval: 1m
+    input_series:
+      # Every POST request lands in the >1s bucket: a simulated latency
+      # regression on write routes.
+      - series: 'trident_api_http_request_duration_seconds_bucket{method="POST",le="1"}'
+        values: "0+0x120"
+      - series: 'trident_api_http_request_duration_seconds_count{method="POST"}'
+        values: "0+30x120"
+    alert_rule_test:
+      - eval_time: 65m
+        alertname: APIWriteLatencyFastBurn
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              slo: api-latency
+            exp_annotations:
+              summary: "API write-route p95 latency SLO fast-burn — non-GET routes slower than 1s"
+              description: "Over 100% of non-GET requests exceeded the 1s p95 target (docs/slo.md SLO 2) in both the last 5m and the last 1h. At this burn rate the 28-day error budget is exhausted in under 2 days."
+              runbook_url: "docs/runbooks/alerts.md#apiwritelatencyfastburn"
+
+  - interval: 1m
+    input_series:
+      - series: 'trident_api_http_request_duration_seconds_bucket{method="POST",le="1"}'
+        values: "0+30x120"
+      - series: 'trident_api_http_request_duration_seconds_count{method="POST"}'
+        values: "0+30x120"
+    alert_rule_test:
+      - eval_time: 65m
+        alertname: APIWriteLatencyFastBurn
+        exp_alerts: []

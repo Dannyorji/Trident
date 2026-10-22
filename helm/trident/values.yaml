@@ -124,21 +124,26 @@ indexer:
     # allowlist. Unset means no topic narrowing. Segment count must match the
     # events you want, e.g. a SEP-41 transfer carries three topics:
     #   INDEX_TOPIC_FILTERS: "transfer/*/*,mint/*/*"
-  # Prometheus metrics server (METRICS_PORT, default 9090) doubles as the
-  # liveness/readiness signal for this otherwise portless worker.
   metricsPort: 9090
+  # crates/indexer/src/health.rs serves /healthz (liveness) and /readyz
+  # (readiness, checks DB + Redis) on HEALTH_PORT (default 8080). Fly
+  # (fly/indexer.toml) already probes these; Helm previously pointed both
+  # probes at /metrics on the Prometheus port instead, which keeps answering
+  # while the poll loop is hung, the DB pool is exhausted, or the streamer
+  # has hit a fatal error and the process is blocked in shutdown (#763).
+  healthPort: 8080
   livenessProbe:
     httpGet:
-      path: /metrics
-      port: 9090
+      path: /healthz
+      port: 8080
     initialDelaySeconds: 15
     periodSeconds: 20
     failureThreshold: 3
     timeoutSeconds: 2
   readinessProbe:
     httpGet:
-      path: /metrics
-      port: 9090
+      path: /readyz
+      port: 8080
     initialDelaySeconds: 10
     periodSeconds: 10
     failureThreshold: 3
