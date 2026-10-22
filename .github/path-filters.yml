@@ -1,0 +1,157 @@
+# Path filters shared by ci.yml, integration.yml and security.yml
+# (dorny/paths-filter). Each workflow's `changes` job reads this one file, so
+# "what does a change to X have to re-run?" is answered in a single place.
+#
+# On push to dev/main, schedule and dispatch the workflows ignore the result
+# and run everything; the filters only narrow pull requests.
+#
+# Editing a workflow, a composite action or this file re-runs everything in
+# the workflows that use it (the `shared` anchor below).
+shared: &shared
+  - ".github/actions/**"
+  - ".github/scripts/**"
+  - ".github/path-filters.yml"
+  - ".github/workflows/ci.yml"
+  - ".github/workflows/integration.yml"
+  - ".github/workflows/security.yml"
+
+# --- ci.yml -----------------------------------------------------------------
+rust:
+  - *shared
+  - "crates/**"
+  - "Cargo.toml"
+  - "Cargo.lock"
+  - "rust-toolchain.toml"
+  - ".cargo/**"
+  - ".sqlx/**"
+  - "database/**"
+  - "proto/**"
+go:
+  - *shared
+  - "services/api/**"
+  - "api/**"
+  - "proto/**"
+  - "buf.yaml"
+  - "buf.gen.yaml"
+sdk_typescript:
+  - *shared
+  - "sdk/typescript/**"
+  - "api/**"
+sdk_go:
+  - *shared
+  - "sdk/go/**"
+  - "api/**"
+sdk_python:
+  - *shared
+  - "sdk/python/**"
+  - "api/**"
+sdk_react:
+  - *shared
+  - "sdk/react/**"
+  - "sdk/typescript/**"
+sdk_rust:
+  - *shared
+  - "sdk/rust/**"
+  - "api/**"
+explorer:
+  - *shared
+  - "explorer/**"
+  - "sdk/typescript/**"
+contracts:
+  - *shared
+  - "contracts/**"
+openapi:
+  - *shared
+  - "api/**"
+  - ".spectral.yaml"
+  - "scripts/generate_sdk_models.py"
+  - "sdk/typescript/src/api-types.gen.ts"
+  - "sdk/go/openapi/**"
+  - "sdk/python/src/**"
+  - "sdk/rust/src/**"
+monitoring:
+  - *shared
+  - "monitoring/**"
+  - "observability/**"
+  - "docs/runbooks/**"
+  - "scripts/check-runbook-urls.sh"
+  - "scripts/test-check-runbook-urls.sh"
+helm:
+  - *shared
+  - "helm/**"
+schema:
+  - *shared
+  - "database/**"
+  - "api/**"
+  - "sdk/**"
+  - "scripts/lint-migrations.sh"
+  - "scripts/check-schema-drift.sh"
+  - "scripts/check-migration-rollback.sh"
+  - "scripts/check-sdk-versions.sh"
+docs:
+  - *shared
+  - "docs/site/**"
+  - "sdk/typescript/**"
+  - ".lycheeignore"
+workflows:
+  - ".github/**"
+
+# --- integration.yml / security.yml -----------------------------------------
+# Anything that changes what ends up in an image.
+images:
+  - *shared
+  - "crates/**"
+  - "services/**"
+  - "database/**"
+  - "proto/**"
+  - "api/**"
+  - "docker/**"
+  - "Cargo.toml"
+  - "Cargo.lock"
+  - "rust-toolchain.toml"
+  - ".dockerignore"
+  - ".env.ci"
+rust_integration:
+  - *shared
+  - "crates/**"
+  - "database/**"
+  - "Cargo.toml"
+  - "Cargo.lock"
+  - "rust-toolchain.toml"
+  - ".cargo/**"
+contract_events:
+  - *shared
+  - "contracts/**"
+  - "crates/**"
+  - "services/**"
+  - "database/**"
+  - "proto/**"
+  - "docker/**"
+  - "Cargo.toml"
+  - "Cargo.lock"
+  - ".env.ci"
+quickstart:
+  - *shared
+  - "docs/site/**"
+  - "sdk/typescript/**"
+coverage:
+  - *shared
+  - "crates/**"
+  - "services/**"
+  - "database/**"
+  - "sdk/typescript/**"
+  - "sdk/python/**"
+  - "Cargo.toml"
+  - "Cargo.lock"
+  - "scripts/check-python-sdk-coverage.py"
+dependencies:
+  - *shared
+  - "Cargo.toml"
+  - "Cargo.lock"
+  - "deny.toml"
+  - "services/api/go.*"
+  - "sdk/go/go.*"
+  - "explorer/package*.json"
+  - "sdk/typescript/package*.json"
+  - "sdk/react/package*.json"
+  - "sdk/python/**"

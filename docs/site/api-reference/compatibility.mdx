@@ -62,7 +62,7 @@ The stable endpoint set:
 | Events | `GET /v1/events`, `GET /v1/events/{id}`, `POST /v1/events/batch`, `GET /v1/events/stream` |
 | Contracts | `GET /v1/contracts/{id}/events/schema`, `GET /v1/contracts/{id}/spec`, `GET /v1/contracts/{id}/storage`, `GET /v1/contracts/{id}/storage/history` |
 | Statistics | `GET /v1/stats/indexer`, `GET /v1/stats/contracts` |
-| Monitoring | `GET /metrics` (Prometheus text exposition) |
+| Monitoring | Prometheus metrics on the internal `METRICS_PORT` listener (not the public API port) |
 
 ---
 

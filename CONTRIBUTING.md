@@ -48,7 +48,7 @@ pre-commit run --all-files
 
 The `.gitleaks.toml` allowlist covers the intentionally committed CI test credentials in `.env.ci` — they are not real secrets and are documented as such in that file. Any other finding blocks the commit.
 
-CI runs the same scan on every push and pull request targeting `dev` or `main` via `.github/workflows/secrets-scan.yml`.
+CI runs the same scan on every push and pull request targeting `dev` or `main` via `.github/workflows/security.yml`.
 
 ---
 

@@ -125,7 +125,9 @@ func TestLiveOpenAPIContract(t *testing.T) {
 	s.do(http.MethodGet, "/v1/version", api, nil, http.StatusOK)
 	s.do(http.MethodGet, "/v1/version", nil, nil, http.StatusUnauthorized)
 
-	s.do(http.MethodGet, "/metrics", nil, nil, http.StatusOK)
+	// /metrics is served only on the internal METRICS_PORT listener, never on
+	// the public API port.
+	s.do(http.MethodGet, "/metrics", nil, nil, http.StatusNotFound)
 
 	s.publicRateLimitErrors()
 	assertOperationCoverage(t, doc, s.covered)

@@ -9,7 +9,7 @@
 //!
 //! It talks to public testnet RPC, so it is neither hermetic nor fast, and
 //! testnet is periodically reset. It is gated behind `TESTNET_RPC_URL` and runs
-//! on a schedule (`.github/workflows/testnet-correctness.yml`) rather than
+//! on a schedule (`.github/workflows/nightly.yml`) rather than
 //! per-PR. That is also what makes it valuable: a scheduled run against live
 //! RPC catches upstream format changes that a pinned fixture never would.
 //!

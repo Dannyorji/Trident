@@ -101,10 +101,10 @@ async fn run_replay(
         .map_err(|_| "DATABASE_URL must be set to use `trident-indexer replay`")?;
     let db = sqlx::PgPool::connect(&database_url).await?;
 
-    // Replayed rows must be tagged with this deployment's actual network
-    // (issue #595) — `failed_events` has no network column of its own, so
-    // there is nothing to recover it from other than the same `NETWORK` env
-    // var the daemon validates at startup.
+    // Replay is scoped to this deployment's network: only `failed_events` rows
+    // tagged with the same `NETWORK` the daemon validates at startup are listed
+    // or replayed, and replayed events are written under that network (issue
+    // #595).
     let network =
         config::normalize_network(&std::env::var("NETWORK").unwrap_or_else(|_| "testnet".into()))?;
 
@@ -115,7 +115,7 @@ async fn run_replay(
     // everything.
     let list = list || (!all && id.is_none());
     if list {
-        print_pending(&db, limit).await?;
+        print_pending(&db, &network, limit).await?;
     }
     if !all && id.is_none() {
         return Ok(());
@@ -125,7 +125,7 @@ async fn run_replay(
     // full pending table before replaying just that one row.
     let ids: Vec<uuid::Uuid> = match id {
         Some(id) => vec![id],
-        None => db::list_pending_failed_events(&db, limit)
+        None => db::list_pending_failed_events(&db, &network, limit)
             .await?
             .into_iter()
             .map(|row| row.id)
@@ -230,10 +230,14 @@ async fn run_partition_check(min_headroom_ledgers: i64) -> Result<(), Box<dyn st
     Ok(())
 }
 
-async fn print_pending(db: &sqlx::PgPool, limit: i64) -> Result<(), Box<dyn std::error::Error>> {
-    let pending = db::list_pending_failed_events(db, limit).await?;
+async fn print_pending(
+    db: &sqlx::PgPool,
+    network: &str,
+    limit: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pending = db::list_pending_failed_events(db, network, limit).await?;
     if pending.is_empty() {
-        println!("No pending failed_events rows.");
+        println!("No pending failed_events rows for network {network}.");
         return Ok(());
     }
     println!(
@@ -442,8 +446,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let health_addr: SocketAddr = ([0, 0, 0, 0], cfg.health_port).into();
     let health_db = db_pool.clone();
     let health_redis_url = cfg.redis_url.clone();
+    let health_network = cfg.network.clone();
     tokio::spawn(async move {
-        health::serve(health_addr, health_db, health_redis_url).await;
+        health::serve(health_addr, health_db, health_redis_url, health_network).await;
     });
 
     let shutdown = CancellationToken::new();

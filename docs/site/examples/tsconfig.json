@@ -1,5 +1,5 @@
 {
-  "//": "Type-checks the published documentation samples against the real TypeScript SDK surface, so a sample cannot drift from the API it demonstrates. Used by .github/workflows/quickstart-ci.yml, which builds sdk/typescript first so dist/index.d.ts exists.",
+  "//": "Type-checks the published documentation samples against the real TypeScript SDK surface, so a sample cannot drift from the API it demonstrates. Used by .github/workflows/integration.yml (verify-quickstart job), which builds sdk/typescript first so dist/index.d.ts exists.",
   "compilerOptions": {
     "target": "ES2020",
     "lib": ["ES2020", "DOM"],

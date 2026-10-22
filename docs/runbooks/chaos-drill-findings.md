@@ -8,7 +8,7 @@ degradation behavior recorded. That could not be done from this environment:
 
 - Staging is a Kubernetes deployment reached only through CI secrets
   (`STAGING_KUBECONFIG`, `STAGING_URL`, `STAGING_DATABASE_URL` — see
-  `.github/workflows/staging-deploy.yml`), none of which are available here.
+  `.github/workflows/deploy.yml`), none of which are available here.
 - The harness itself is compose-native (`docker compose stop/pause/exec`
   against `docker/docker-compose.yml`'s service names), so it cannot target a
   Kubernetes staging deployment as written without a rewrite to `kubectl`
