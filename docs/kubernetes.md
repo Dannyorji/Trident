@@ -181,7 +181,7 @@ Ingress-based alternative (commented out — flip `nginx.enabled: false` and
 `image.tag` — a production install should run the version-pinned image
 `Chart.yaml`'s `appVersion` resolves to, the same one this chart release
 was tested against, not a floating tag or a per-commit SHA (that per-commit
-SHA pattern is what `values-staging.yaml` and `staging-deploy.yml` use
+SHA pattern is what `values-staging.yaml` and `deploy.yml` use
 instead, appropriately for a CI-driven staging environment that redeploys on
 every commit to `dev`).
 

@@ -1,10 +1,9 @@
 // Package metrics provides a client_golang-backed Prometheus registry served
 // on its own internal port (issue #58), separate from the public API port.
 //
-// It is additive to the pre-existing hand-rolled, dependency-free
-// Prometheus-text metrics mounted at GET /metrics on the public mux
-// (handlers.MetricsHandler and friends) — that endpoint is untouched. This
-// package covers the specific gaps called out by #58: per-endpoint HTTP
+// The pre-existing hand-rolled, dependency-free Prometheus-text metrics
+// (handlers.MetricsHandler) are no longer served on the public mux; they are
+// mounted on this same internal server at LegacyPath. This package covers the specific gaps called out by #58: per-endpoint HTTP
 // request counts/latency, active WebSocket connections and message totals,
 // outbound gRPC call metrics, and rate-limiting rejections.
 package metrics
@@ -243,21 +242,31 @@ func Port() string {
 	return DefaultPort
 }
 
-// Handler builds a mux exposing only GET /metrics, backed by Registry.
-// Exposed for testing.
-func Handler() *http.ServeMux {
+// LegacyPath is where the hand-rolled metrics (indexer freshness gauges,
+// webhook counters, rate-limit/concurrency counters, ...) are served on the
+// internal server. They moved here from the public listener's GET /metrics.
+const LegacyPath = "/metrics/legacy"
+
+// Handler builds a mux exposing GET /metrics, backed by Registry, and — when
+// legacy is non-nil — the hand-rolled metrics at GET LegacyPath. Exposed for
+// testing.
+func Handler(legacy http.Handler) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", promhttp.HandlerFor(Registry, promhttp.HandlerOpts{}))
+	if legacy != nil {
+		mux.Handle("GET "+LegacyPath, legacy)
+	}
 	return mux
 }
 
 // Start launches the internal metrics server on METRICS_PORT (default 9091)
-// and returns its *http.Server so the caller can shut it down.
-func Start() *http.Server {
+// and returns its *http.Server so the caller can shut it down. legacy, when
+// non-nil, is served at LegacyPath.
+func Start(legacy http.Handler) *http.Server {
 	addr := ":" + Port()
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           Handler(),
+		Handler:           Handler(legacy),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

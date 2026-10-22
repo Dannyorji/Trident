@@ -276,7 +276,7 @@ the Go and gRPC API deployments after each phase.
 
 ## Audit controls
 
-- `.github/workflows/secrets-scan.yml` checks out with `fetch-depth: 0` and
+- `.github/workflows/security.yml` checks out with `fetch-depth: 0` and
   runs `gitleaks detect`, scanning the complete repository history rather than
   only the pull-request diff. The 2026-08-26 launch audit scanned all 280
   commits and found no leaks.

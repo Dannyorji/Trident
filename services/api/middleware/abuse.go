@@ -90,8 +90,9 @@ func trustedClientIP(r *http.Request, trustProxyHeaders bool) string {
 }
 
 // publicPathPrefixes lists the path prefixes PerIPRateLimit applies to. It
-// intentionally does NOT cover /internal or /metrics, which are not exposed
-// publicly (see docs/threat-model.md).
+// intentionally does NOT cover /internal. /metrics is not served on the public
+// listener at all — it lives on the internal METRICS_PORT server only (see
+// docs/threat-model.md).
 var publicPathPrefixes = []string{
 	"/v1/",
 	"/ws",
@@ -112,7 +113,7 @@ func isPublicPath(path string) bool {
 // in the chain (see main.go) so a single source flooding the auth path itself
 // — before any per-key limit from TieredRateLimit ever engages — is
 // contained. Only applies to public paths (isPublicPath); operational
-// endpoints like /metrics and /internal/status are unaffected.
+// endpoints like /internal/status are unaffected.
 //
 // Fail-open on Redis errors, matching TieredRateLimit's policy: availability
 // over strict enforcement during a Redis outage.

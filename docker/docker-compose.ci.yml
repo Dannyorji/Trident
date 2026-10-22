@@ -85,6 +85,9 @@ services:
   # together for smoke tests.
   # ---------------------------------------------------------------------------
   grpc-api:
+    # The :ci tags are what integration.yml's build-images job produces and
+    # shares as artifacts; the E2E jobs load them and run `up --no-build`.
+    image: trident-grpc-api:ci
     build:
       context: ..
       dockerfile: crates/api/Dockerfile
@@ -110,6 +113,7 @@ services:
   # Rust indexer — bypass PgBouncer for faster startup.
   # ---------------------------------------------------------------------------
   indexer:
+    image: trident-indexer:ci
     restart: "no"
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
@@ -138,6 +142,7 @@ services:
   # Go REST API — bypass PgBouncer, point gRPC at the grpc-api service.
   # ---------------------------------------------------------------------------
   api:
+    image: trident-go-api:ci
     restart: "no"
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
@@ -145,6 +150,7 @@ services:
       # Point at the grpc-api service defined in this overlay, not localhost.
       GRPC_ADDR: grpc-api:50051
       PORT: ${PORT:-3000}
+      METRICS_PORT: ${API_METRICS_PORT:-9091}
       API_KEY_SALT: ${API_KEY_SALT}
       API_KEY_HASHES: ${API_KEY_HASHES}
       ADMIN_API_KEY: ${ADMIN_API_KEY:-}
@@ -157,6 +163,8 @@ services:
       RATE_LIMIT_FREE_RPS: 100
     ports:
       - "${PORT:-3000}:${PORT:-3000}"
+      # Internal metrics listener (not served on the public port).
+      - "${API_METRICS_PORT:-9091}:${API_METRICS_PORT:-9091}"
     # Replace (not merge with) the base depends_on so the profile-disabled
     # pgbouncer dependency is dropped in CI.
     depends_on: !override

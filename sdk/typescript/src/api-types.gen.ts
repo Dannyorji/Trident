@@ -673,26 +673,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/metrics": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Prometheus metrics
-         * @description Exposes Prometheus-formatted metrics
-         */
-        get: operations["getMetrics"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -2664,26 +2644,6 @@ export interface operations {
             429: components["responses"]["RateLimitExceeded"];
             500: components["responses"]["InternalError"];
             503: components["responses"]["ServiceUnavailable"];
-        };
-    };
-    getMetrics: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Prometheus metrics */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/plain; version=0.0.4; charset=utf-8": string;
-                };
-            };
         };
     };
 }

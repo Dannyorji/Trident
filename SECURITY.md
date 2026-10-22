@@ -88,7 +88,7 @@ stage.
 - [`docs/threat-model.md`](./docs/threat-model.md) — assets, entry points,
   trust boundaries, and top threats + mitigations.
 - [`docs/security-triage.md`](./docs/security-triage.md) — how dependency
-  and image vulnerability scan findings are triaged (`.github/workflows/security-scan.yml`).
+  and image vulnerability scan findings are triaged (`.github/workflows/security.yml`).
 
 ## Review Cadence
 

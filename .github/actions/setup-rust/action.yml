@@ -1,0 +1,43 @@
+name: Set up Rust
+description: Rust toolchain, sccache and Swatinem/rust-cache, wired the same way in every job.
+
+inputs:
+  components:
+    description: Comma-separated rustup components (e.g. "rustfmt, clippy").
+    default: ""
+  targets:
+    description: Comma-separated extra compilation targets (e.g. "wasm32v1-none").
+    default: ""
+  shared-key:
+    description: rust-cache shared-key. Jobs compiling the same workspace share one key.
+    default: ""
+  workspaces:
+    description: rust-cache workspaces (defaults to the repo root).
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      with:
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
+
+    # sccache caches compiled objects in the GitHub Actions cache, keyed by
+    # crate/flags/rustc version, so jobs compiling overlapping code reuse each
+    # other's objects (see docs/CI.md).
+    - name: Set up sccache
+      uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+
+    - name: Enable sccache for cargo
+      shell: bash
+      run: |
+        echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+        echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+
+    - name: Cache Rust build artefacts
+      uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84 # v2.7.3
+      with:
+        shared-key: ${{ inputs.shared-key }}
+        workspaces: ${{ inputs.workspaces }}

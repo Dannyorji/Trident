@@ -4,7 +4,7 @@
 #
 # Note these are URL patterns, not paths — a bare directory name here matches
 # nothing. Files are excluded by narrowing the globs in
-# .github/workflows/docs-ci.yml instead.
+# the `docs` job in .github/workflows/ci.yml instead.
 
 # Product pages that are not published yet. The marketing site resolves, but
 # these paths do not exist, so the checker fails on links the docs are correct

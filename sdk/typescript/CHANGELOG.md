@@ -21,8 +21,8 @@ Given a version `MAJOR.MINOR.PATCH`:
 1. Land changes on `dev` via the normal PR flow.
 2. Add an entry under `[Unreleased]` in this file describing the change
    (Added / Changed / Fixed / Removed), following Keep a Changelog sections.
-3. When ready to publish, trigger the **Publish SDK** GitHub Actions workflow
-   (`.github/workflows/publish-sdk.yml`) manually via `workflow_dispatch`,
+3. When ready to publish, trigger the **Release** GitHub Actions workflow
+   (`.github/workflows/release.yml`) manually via `workflow_dispatch`,
    supplying the target semver version. The workflow runs lint + tests,
    bumps `package.json`, builds, smoke-tests the packed tarball, and
    publishes to npm with provenance.
