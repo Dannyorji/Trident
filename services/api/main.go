@@ -301,7 +301,14 @@ func main() {
 	// through and panicking on first use.
 	var sorobanCaller handlers.SorobanRPCCaller
 	if rpcURL := os.Getenv("STELLAR_RPC_URL"); rpcURL != "" {
-		sorobanCaller = sorobanrpc.NewClient(rpcURL)
+		rpcClient, err := sorobanrpc.NewClient(rpcURL)
+		if err != nil {
+			// A malformed STELLAR_RPC_HEADERS must not silently start an
+			// unauthenticated client that 401s every contract call.
+			slog.Error("invalid Stellar RPC configuration", "err", err)
+			os.Exit(1)
+		}
+		sorobanCaller = rpcClient
 	}
 	var rlDB middleware.TierDB
 	if pool != nil {
@@ -569,7 +576,13 @@ func runContractStatsRollupRefresh(ctx context.Context, pool *pgxpool.Pool) {
 		}
 	}
 
-	refresh()
+	// Delay first run, and use advisory lock (issue #731)
+	time.Sleep(60 * time.Second)
+	var locked bool
+	if err := pool.QueryRow(ctx, "SELECT pg_try_advisory_lock(123456789, 101)").Scan(&locked); err == nil && locked {
+		refresh()
+		_, _ = pool.Exec(ctx, "SELECT pg_advisory_unlock(123456789, 101)")
+	}
 
 	ticker := time.NewTicker(contractStatsRollupRefreshInterval)
 	defer ticker.Stop()
@@ -578,7 +591,11 @@ func runContractStatsRollupRefresh(ctx context.Context, pool *pgxpool.Pool) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			refresh()
+			var locked bool
+			if err := pool.QueryRow(ctx, "SELECT pg_try_advisory_lock(123456789, 101)").Scan(&locked); err == nil && locked {
+				refresh()
+				_, _ = pool.Exec(ctx, "SELECT pg_advisory_unlock(123456789, 101)")
+			}
 		}
 	}
 }
@@ -632,7 +649,16 @@ func startRetentionJob(ctx context.Context, pool *pgxpool.Pool) {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
+		// Delay first run to avoid re-running on restart/crash-loop
+		time.Sleep(60 * time.Second)
+
 		run := func() {
+			// Leader election using advisory lock (issue #731)
+			var locked bool
+			if err := pool.QueryRow(ctx, "SELECT pg_try_advisory_lock(123456789, 100)").Scan(&locked); err != nil || !locked {
+				return
+			}
+			defer pool.Exec(context.Background(), "SELECT pg_advisory_unlock(123456789, 100)")
 			cleanupCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 			defer cancel()
 
@@ -689,15 +715,15 @@ func startRetentionJob(ctx context.Context, pool *pgxpool.Pool) {
 		// Run once at startup, then on ticker.
 		run()
 
-		for {
-			select {
-			case <-ctx.Done():
-				run()
-				return
-			case <-ticker.C:
-				run()
-			}
+	for {
+		select {
+		case <-ctx.Done():
+			// Don't run on exit with locks
+			return
+		case <-ticker.C:
+			run()
 		}
+	}
 	}()
 }
 
@@ -712,6 +738,11 @@ func runUsageRollupCleanup(ctx context.Context, pool *pgxpool.Pool) {
 	cleanup := func() {
 		cleanupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
+		var locked bool
+		if err := pool.QueryRow(cleanupCtx, "SELECT pg_try_advisory_lock(123456789, 103)").Scan(&locked); err != nil || !locked {
+			return
+		}
+		defer pool.Exec(context.Background(), "SELECT pg_advisory_unlock(123456789, 103)")
 		if _, err := pool.Exec(cleanupCtx,
 			`DELETE FROM usage_rollup WHERE period_start < NOW() - $1::interval`,
 			fmt.Sprintf("%d seconds", int64(usageRollupRetention.Seconds())),
@@ -720,10 +751,10 @@ func runUsageRollupCleanup(ctx context.Context, pool *pgxpool.Pool) {
 		}
 	}
 
+	time.Sleep(120 * time.Second)
 	for {
 		select {
 		case <-ctx.Done():
-			cleanup()
 			return
 		case <-ticker.C:
 			cleanup()

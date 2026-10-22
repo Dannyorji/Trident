@@ -40,7 +40,7 @@ Open `.env` and set every value below. Do not leave defaults in production.
 | `DATABASE_URL` | PostgreSQL connection string, e.g. `postgresql://trident:password@postgres:5432/trident` |
 | `REDIS_URL` | Redis connection string, e.g. `redis://redis:6379` |
 | `STELLAR_RPC_URL` | Soroban RPC endpoint for the chosen `NETWORK` — `https://soroban-testnet.stellar.org` for testnet; for mainnet a provider or self-hosted endpoint, see [Testnet vs. mainnet configuration](#testnet-vs-mainnet-configuration) |
-| `NETWORK` | One of `mainnet`, `testnet`, or `futurenet`; must match `STELLAR_RPC_URL` |
+| `NETWORK` | One of `mainnet` or `testnet` (`pubnet` is accepted as an alias for `mainnet` and normalised at startup); must match `STELLAR_RPC_URL` |
 | `POLL_INTERVAL_FLOOR_MS` | Shortest adaptive poll interval (ms), used while far behind the chain tip (default: `250`) |
 | `POLL_INTERVAL_CEILING_MS` | Longest adaptive poll interval (ms), used once caught up (default: `5000`) |
 | `INDEX_DIAGNOSTIC` | Set `false` in production (diagnostic events are high-volume) |
@@ -112,8 +112,8 @@ and consider a second endpoint for failover via `STELLAR_RPC_URLS` (see below).
 | `RPC_POOL_IDLE_TIMEOUT_MS` | How long an idle pooled connection is kept (default: `90000`) |
 | `RPC_POOL_MAX_IDLE_PER_HOST` | Idle keep-alive connections retained per RPC host (default: `8`) |
 | `RPC_TCP_KEEPALIVE_MS` | TCP keep-alive probe interval (default: `60000`) |
-| `RPC_FAILOVER_THRESHOLD` | Parsed but currently unused — see note below (default: `3`) |
-| `RPC_ENDPOINT_COOLDOWN_MS` | Parsed but currently unused — see note below (default: `30000`) |
+| `RPC_FAILOVER_THRESHOLD` | **Removed** — setting it is a startup error; use `RPC_BREAKER_FAILURE_THRESHOLD` |
+| `RPC_ENDPOINT_COOLDOWN_MS` | **Removed** — setting it is a startup error; use `RPC_BREAKER_COOLDOWN_MS` |
 | `RPC_BREAKER_FAILURE_THRESHOLD` | Consecutive RPC-layer poll failures before the circuit breaker opens (default: `5`) |
 | `RPC_BREAKER_COOLDOWN_MS` | How long the breaker stays open before allowing a probe poll (default: `30000`) |
 
@@ -122,13 +122,14 @@ indefinitely: the retry wrapper only reacts to returned errors, never to a call
 that never returns. Timeouts are classified retryable, so they engage backoff.
 
 **Note on `RPC_FAILOVER_THRESHOLD`/`RPC_ENDPOINT_COOLDOWN_MS`**: these two
-values are parsed into config but the cooldown-based endpoint pool that
-would read them (`crates/indexer/src/rpc/endpoints.rs`) is dead code. The
-indexer's actual failover is per-call health-scored routing
-(`crates/indexer/src/rpc/health.rs`), which has no concept of a parked
-endpoint or a cooldown window. Found while writing
-[`runbooks/rpc-provider-rotation.md`](runbooks/rpc-provider-rotation.md)
-(issue #684); fixing the gap itself is tracked separately.
+values were parsed into config but never read by the running indexer, so
+they no longer exist (issue #737): setting either is a hard startup error
+naming the effective knob. Failover is per-call health-scored routing with a
+sticky endpoint and a per-endpoint circuit breaker
+(`crates/indexer/src/rpc/health.rs`). An endpoint that fails
+`RPC_BREAKER_FAILURE_THRESHOLD` consecutive times is parked for
+`RPC_BREAKER_COOLDOWN_MS`, then probed again — so those two variables are
+what an operator tuning failover should set.
 
 See [`runbooks/rpc-provider-rotation.md`](runbooks/rpc-provider-rotation.md)
 for the tested procedure to change `STELLAR_RPC_URLS` on a running indexer

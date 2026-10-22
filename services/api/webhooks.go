@@ -349,11 +349,17 @@ func startWebhookCleanupJob(ctx context.Context, db *sql.DB) {
 	go func() {
 		ticker := time.NewTicker(1 * time.Hour)
 		defer ticker.Stop()
+		time.Sleep(180 * time.Second)
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				var locked bool
+				if err := db.QueryRowContext(ctx, "SELECT pg_try_advisory_lock(123456789, 104)").Scan(&locked); err != nil || !locked {
+					continue
+				}
+				defer func() { _, _ = db.ExecContext(context.Background(), "SELECT pg_advisory_unlock(123456789, 104)") }()
 				if _, err := db.ExecContext(ctx, `DELETE FROM webhook_deliveries WHERE delivered_at < NOW() - INTERVAL '7 days'`); err != nil {
 					slog.Warn("webhook cleanup failed", "err", err)
 				}

@@ -121,8 +121,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     server_builder
         .add_service(trident::events_server::EventsServer::new(events_service))
-        .serve(addr)
+        .serve_with_shutdown(addr, async {
+            tokio::signal::ctrl_c().await.ok();
+            tracing::info!("Received shutdown signal");
+        })
         .await?;
+
+    // Flush OpenTelemetry spans on shutdown (issue #733)
+    opentelemetry::global::shutdown_tracer_provider();
 
     Ok(())
 }

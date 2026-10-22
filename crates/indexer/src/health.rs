@@ -102,20 +102,18 @@ async fn readyz(db: &PgPool, redis_url: &str) -> (u16, &'static str, String) {
     let db_ok = sqlx::query("SELECT 1").execute(db).await.is_ok();
     let redis_ok = check_redis(redis_url).await;
 
-    if db_ok && redis_ok {
-        (200, "OK", "ready\n".into())
+    if db_ok {
+        if redis_ok {
+            (200, "OK", "ready\n".into())
+        } else {
+            // Redis is not required for ingestion (issue #732) - report degraded but ready
+            (200, "OK", "ready (redis degraded)\n".into())
+        }
     } else {
-        let mut reasons = Vec::new();
-        if !db_ok {
-            reasons.push("db");
-        }
-        if !redis_ok {
-            reasons.push("redis");
-        }
         (
             503,
             "Service Unavailable",
-            format!("not ready: {}\n", reasons.join(", ")),
+            "not ready: db\n".into(),
         )
     }
 }
