@@ -139,15 +139,13 @@ firing, so alerts are both fast (short window) and not flaky (long window
 confirms it's sustained).
 
 Rules live in `observability/burn-rate-alerts.yml` — see that file for the
-actual PromQL and thresholds (2%/hour fast-burn, 5%/day slow-burn budget
-consumption, standard SRE workbook multipliers). It only defines rules for
-SLO 1 (ingest freshness) today, since that's the only SLO with live metrics;
-SLO 2/3 rules are stubbed with a comment pointing at issue #295 and should be
-filled in once those metrics exist.
+actual PromQL and thresholds (14.4x/5m+1h fast-burn, 6x/30m+6h slow-burn
+budget consumption, standard SRE workbook multipliers). All three SLOs have
+live rules today: #295 shipped the RED metrics SLO 2/3 needed, unblocking
+the rules that were previously stubbed here (#770).
 
-Validate with `promtool check rules observability/burn-rate-alerts.yml`
-(not run as part of this change — no `promtool` available in the environment
-this was authored in; verify in CI or locally before merging).
+Validate with `promtool check rules observability/burn-rate-alerts.yml` and
+`promtool test rules observability/burn-rate-alerts.test.yml`.
 
 ## Review cadence
 

@@ -53,6 +53,9 @@ spec:
             - name: metrics
               containerPort: {{ .Values.indexer.metricsPort }}
               protocol: TCP
+            - name: health
+              containerPort: {{ .Values.indexer.healthPort }}
+              protocol: TCP
           volumeMounts:
             - name: tmp
               mountPath: /tmp
