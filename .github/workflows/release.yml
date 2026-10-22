@@ -1,119 +1,178 @@
 name: Release
 
+# Tag push (vX.Y.Z): verify CI is green on the tagged commit, build + sign +
+# attest every image, publish every SDK, then create the GitHub release.
+#
+# Manual dispatch: publish one SDK (or all) at a version you choose, optionally
+# as a dry run -- the old publish-sdk.yml, folded in so the TypeScript SDK is
+# published from exactly one place.
+
 on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      sdk:
+        description: "Which SDK to publish"
+        required: true
+        type: choice
+        options:
+          - typescript
+          - python
+          - rust
+          - go
+          - react
+          - all
+      version:
+        description: "Semver version to publish (e.g. 1.2.3)"
+        required: true
+        type: string
+      dry_run:
+        description: "Build, test, and package without publishing to any registry"
+        required: false
+        type: boolean
+        default: false
 
 # Prevent concurrent releases from running simultaneously.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 env:
   REGISTRY: ghcr.io
   ORG: telocel-labs
 
 jobs:
+  meta:
+    name: Resolve release inputs
+    runs-on: ubuntu-latest
+    outputs:
+      is_release: ${{ steps.meta.outputs.is_release }}
+      version: ${{ steps.meta.outputs.version }}
+      sdk: ${{ steps.meta.outputs.sdk }}
+      dry_run: ${{ steps.meta.outputs.dry_run }}
+    steps:
+      - id: meta
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_SDK: ${{ inputs.sdk }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          if [ "$EVENT" = "push" ]; then
+            {
+              echo "is_release=true"
+              echo "version=${GITHUB_REF_NAME#v}"
+              echo "sdk=all"
+              echo "dry_run=false"
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "is_release=false"
+              echo "version=${INPUT_VERSION}"
+              echo "sdk=${INPUT_SDK}"
+              echo "dry_run=${INPUT_DRY_RUN}"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
   # ---------------------------------------------------------------------------
-  # Build and push multi-platform Docker images in parallel
+  # Release gate (#781): the tagged commit must have passed the three aggregate
+  # checks branch protection requires -- ci-ok, integration-ok and security-ok.
+  # Waits for runs still in progress; fails fast on a red or missing one.
   # ---------------------------------------------------------------------------
-  build-indexer:
-    name: Build indexer image
+  gate:
+    name: Require green CI on the tagged commit
+    needs: meta
+    if: needs.meta.outputs.is_release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      checks: read
+    steps:
+      - name: Wait for ci-ok, integration-ok and security-ok
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          required=(ci-ok integration-ok security-ok)
+          deadline=$((SECONDS + 2400))
+          first_seen_deadline=$((SECONDS + 300))
+          while true; do
+            pending=()
+            for name in "${required[@]}"; do
+              conclusion=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/check-runs?per_page=100" \
+                --jq "[.check_runs[] | select(.name == \"${name}\")] | sort_by(.started_at) | last | if . == null then \"missing\" elif .status != \"completed\" then \"pending\" else .conclusion end")
+              case "$conclusion" in
+                success) echo "✓ ${name}" ;;
+                pending) pending+=("$name") ;;
+                missing)
+                  if [ "$SECONDS" -ge "$first_seen_deadline" ]; then
+                    echo "::error::${name} never ran for ${GITHUB_SHA}. Tag a commit that has been pushed to dev/main."
+                    exit 1
+                  fi
+                  pending+=("$name")
+                  ;;
+                *)
+                  echo "::error::${name} concluded '${conclusion}' for ${GITHUB_SHA}; refusing to release."
+                  exit 1
+                  ;;
+              esac
+            done
+            if [ ${#pending[@]} -eq 0 ]; then
+              echo "All required checks are green for ${GITHUB_SHA}."
+              exit 0
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::Timed out waiting for: ${pending[*]}"
+              exit 1
+            fi
+            echo "Waiting for: ${pending[*]}"
+            sleep 30
+          done
+
+  # ---------------------------------------------------------------------------
+  # Build, push, sign and attest the multi-platform images (#780).
+  #
+  #  - Signed keylessly with cosign (Sigstore, GitHub OIDC identity); verify with
+  #    `cosign verify --certificate-identity-regexp ... --certificate-oidc-issuer
+  #    https://token.actions.githubusercontent.com <image>@<digest>`.
+  #  - A SLSA build-provenance attestation is attached and pushed to the registry.
+  # ---------------------------------------------------------------------------
+  build-images:
+    name: Build, sign and attest (${{ matrix.name }})
+    needs: [meta, gate]
+    if: needs.meta.outputs.is_release == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-    outputs:
-      digest: ${{ steps.push.outputs.digest }}
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: indexer
+            image: trident-indexer
+            file: crates/indexer/Dockerfile
+          - name: grpc-api
+            image: trident-grpc-api
+            file: crates/api/Dockerfile
+          - name: go-api
+            image: trident-go-api
+            file: services/api/Dockerfile
+          - name: migrate
+            image: trident-migrate
+            file: database/Dockerfile
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
       - name: Set up QEMU (cross-platform emulation)
         uses: docker/setup-qemu-action@68827325e0b33c7199eb31dd4e31fbe9023e06e3 # v3.0.0
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@2b51285047da1547ffb1b2203d8be4c0af6b1f20 # v3.2.0
-
-      - name: Log in to GHCR
-        uses: docker/login-action@e92390c5fb421da1463c202d546fed0ec5c39f20 # v3.1.0
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract tag name
-        id: tag
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-
-      - name: Build and push indexer
-        id: push
-        uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
-        with:
-          context: .
-          file: crates/indexer/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.ORG }}/trident-indexer:${{ github.ref_name }}
-            ${{ env.REGISTRY }}/${{ env.ORG }}/trident-indexer:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  build-grpc-api:
-    name: Build gRPC API image
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    outputs:
-      digest: ${{ steps.push.outputs.digest }}
-    steps:
-      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@68827325e0b33c7199eb31dd4e31fbe9023e06e3 # v3.0.0
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@2b51285047da1547ffb1b2203d8be4c0af6b1f20 # v3.2.0
-
-      - name: Log in to GHCR
-        uses: docker/login-action@e92390c5fb421da1463c202d546fed0ec5c39f20 # v3.1.0
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push gRPC API
-        id: push
-        uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
-        with:
-          context: .
-          file: crates/api/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.ORG }}/trident-grpc-api:${{ github.ref_name }}
-            ${{ env.REGISTRY }}/${{ env.ORG }}/trident-grpc-api:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  build-go-api:
-    name: Build Go API image
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    outputs:
-      digest: ${{ steps.push.outputs.digest }}
-    steps:
-      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@68827325e0b33c7199eb31dd4e31fbe9023e06e3 # v3.0.0
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@2b51285047da1547ffb1b2203d8be4c0af6b1f20 # v3.2.0
 
       - name: Log in to GHCR
         uses: docker/login-action@e92390c5fb421da1463c202d546fed0ec5c39f20 # v3.1.0
@@ -126,73 +185,79 @@ jobs:
         id: build-time
         run: echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
-      - name: Build and push Go API
+      - name: Build and push
         id: push
-        uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
+        uses: ./.github/actions/build-image
         with:
-          context: .
-          file: services/api/Dockerfile
+          file: ${{ matrix.file }}
+          scope: ${{ matrix.name }}
           platforms: linux/amd64,linux/arm64
-          push: true
+          push: "true"
           tags: |
-            ${{ env.REGISTRY }}/${{ env.ORG }}/trident-go-api:${{ github.ref_name }}
-            ${{ env.REGISTRY }}/${{ env.ORG }}/trident-go-api:latest
+            ${{ env.REGISTRY }}/${{ env.ORG }}/${{ matrix.image }}:${{ github.ref_name }}
+            ${{ env.REGISTRY }}/${{ env.ORG }}/${{ matrix.image }}:latest
+          # Only the Go API Dockerfile declares these; the others ignore them.
           build-args: |
             VERSION=${{ github.ref_name }}
             COMMIT_SHA=${{ github.sha }}
             BUILD_TIME=${{ steps.build-time.outputs.timestamp }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
-  build-migrate:
-    name: Build database migration image
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    outputs:
-      digest: ${{ steps.push.outputs.digest }}
-    steps:
-      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - name: Install cosign
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@68827325e0b33c7199eb31dd4e31fbe9023e06e3 # v3.0.0
+      - name: Sign image (keyless)
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.ORG }}/${{ matrix.image }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@2b51285047da1547ffb1b2203d8be4c0af6b1f20 # v3.2.0
-
-      - name: Log in to GHCR
-        uses: docker/login-action@e92390c5fb421da1463c202d546fed0ec5c39f20 # v3.1.0
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018 # v1.4.4
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          subject-name: ${{ env.REGISTRY }}/${{ env.ORG }}/${{ matrix.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
 
-      - name: Build and push database migration image
-        id: push
-        uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
+      - name: Record digest
+        env:
+          IMAGE: ${{ matrix.image }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: echo "| ${IMAGE} | ${DIGEST} |" > "digest-${IMAGE}.txt"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
         with:
-          context: .
-          file: database/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.ORG }}/trident-migrate:${{ github.ref_name }}
-            ${{ env.REGISTRY }}/${{ env.ORG }}/trident-migrate:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          name: digest-${{ matrix.image }}
+          path: digest-${{ matrix.image }}.txt
+          retention-days: 7
 
   # ---------------------------------------------------------------------------
-  # Publish TypeScript SDK to npm
+  # Publish SDKs to their registries -- all of them on a tag, or the one chosen
+  # on manual dispatch. This is the single place the TypeScript SDK is
+  # published from (release.yml used to publish it a second time).
   # ---------------------------------------------------------------------------
-  publish-sdk:
-    name: Publish TypeScript SDK
+  publish-typescript:
+    name: Publish TypeScript SDK to npm
+    needs: [meta, gate]
+    if: ${{ !cancelled() && needs.meta.result == 'success' && needs.gate.result != 'failure' && needs.gate.result != 'cancelled' && (needs.meta.outputs.sdk == 'typescript' || needs.meta.outputs.sdk == 'all') }}
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: sdk/typescript
+    # id-token: write is required so npm can mint a Sigstore-backed provenance
+    # attestation via GitHub's OIDC token — there is no secret involved.
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Validate version input is semver
+        run: |
+          if ! [[ "${{ needs.meta.outputs.version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'${{ needs.meta.outputs.version }}' is not a valid semver version"
+            exit 1
+          fi
 
       - name: Set up Node.js
         uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
@@ -200,34 +265,437 @@ jobs:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
 
-      - name: Derive version from Git tag (strip leading v)
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          npm version "$VERSION" --no-git-tag-version
-
       - name: Install dependencies
         run: npm ci
+
+      - name: Type check
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+      - name: Set version
+        run: npm version "${{ needs.meta.outputs.version }}" --no-git-tag-version
 
       - name: Build
         run: npm run build
 
+      - name: Pack tarball
+        run: npm pack
+
+      - name: Smoke test packed tarball (CJS + ESM)
+        run: |
+          set -euo pipefail
+          TARBALL="$(pwd)/$(node -p "require('./package.json').name.replace('@','').replace('/','-')")-${{ needs.meta.outputs.version }}.tgz"
+
+          SMOKE_DIR=$(mktemp -d)
+          cd "$SMOKE_DIR"
+          npm init -y >/dev/null
+          npm install "$TARBALL" >/dev/null
+
+          cat > smoke-cjs.cjs <<'EOF'
+          const sdk = require("@trident-indexer/sdk");
+          const required = ["TridentClient", "TridentError", "TridentApiError", "iterEvents", "DEFAULT_MAX_PAGES"];
+          for (const name of required) {
+            if (typeof sdk[name] === "undefined") {
+              throw new Error(`CJS: missing export ${name}`);
+            }
+          }
+          console.log("CJS smoke test passed");
+          EOF
+
+          cat > smoke-esm.mjs <<'EOF'
+          import { TridentClient, TridentError, TridentApiError, iterEvents, DEFAULT_MAX_PAGES } from "@trident-indexer/sdk";
+          const required = { TridentClient, TridentError, TridentApiError, iterEvents, DEFAULT_MAX_PAGES };
+          for (const [name, value] of Object.entries(required)) {
+            if (typeof value === "undefined") {
+              throw new Error(`ESM: missing export ${name}`);
+            }
+          }
+          console.log("ESM smoke test passed");
+          EOF
+
+          node smoke-cjs.cjs
+          node smoke-esm.mjs
+
+          cd -
+          rm -rf "$SMOKE_DIR"
+
       - name: Publish to npm
-        run: npm publish --access public
+        if: ${{ needs.meta.outputs.dry_run != 'true' }}
+        run: npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+      - name: Dry run — skipped publish
+        if: ${{ needs.meta.outputs.dry_run == 'true' }}
+        run: |
+          echo "Dry run: package built and smoke-tested, not published."
+          npm pack --dry-run
+
   # ---------------------------------------------------------------------------
-  # Create GitHub Release — only after all builds succeed
+  # Python — build once, verify twice: TestPyPI first, then PyPI behind a
+  # separate job. Both publish steps use PyPI's trusted-publisher (OIDC) flow,
+  # so there is no API token secret to manage or leak — the environment name
+  # (testpypi / pypi) is exactly what each project's trusted publisher on
+  # PyPI/TestPyPI is configured to trust for this repo + workflow.
+  #
+  # The `pypi` environment should have required reviewers configured in the
+  # repo's Settings > Environments so promotion from TestPyPI to the real
+  # index needs an explicit human approval, not just a green TestPyPI run.
+  # ---------------------------------------------------------------------------
+  publish-python-testpypi:
+    name: Publish Python SDK to TestPyPI
+    needs: [meta, gate]
+    if: ${{ !cancelled() && needs.meta.result == 'success' && needs.gate.result != 'failure' && needs.gate.result != 'cancelled' && (needs.meta.outputs.sdk == 'python' || needs.meta.outputs.sdk == 'all') }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/python
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/project/trident-indexer/
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Validate version input is semver
+        run: |
+          if ! [[ "${{ needs.meta.outputs.version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'${{ needs.meta.outputs.version }}' is not a valid semver version"
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d # v5.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Set version
+        run: |
+          sed -i "s/^version = \".*\"/version = \"${{ needs.meta.outputs.version }}\"/" pyproject.toml
+          grep '^version' pyproject.toml
+
+      - name: Install package with dev deps
+        run: pip install -e ".[dev]"
+
+      - name: Type check (mypy --strict)
+        run: mypy
+
+      - name: Test
+        run: pytest -q
+
+      - name: Build sdist + wheel
+        run: |
+          pip install build twine
+          python -m build
+
+      - name: twine check
+        run: twine check dist/*
+
+      - name: Smoke test installed wheel
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/trident-sdk-smoke
+          /tmp/trident-sdk-smoke/bin/pip install dist/*.whl
+          /tmp/trident-sdk-smoke/bin/python -c "
+          import pathlib
+          import trident_indexer as sdk
+
+          assert sdk.__version__ == '${{ needs.meta.outputs.version }}', f'unexpected __version__: {sdk.__version__}'
+
+          required = [
+              'TridentClient', 'AsyncTridentClient', 'TridentApiError',
+              'SorobanEvent', 'PaginatedEvents', 'Network',
+              'RetryConfig', 'DEFAULT_RETRY_CONFIG',
+          ]
+          for name in required:
+              assert hasattr(sdk, name), f'missing export: {name}'
+
+          pkg_dir = pathlib.Path(sdk.__file__).parent
+          assert (pkg_dir / 'py.typed').exists(), 'py.typed marker missing from installed wheel'
+
+          print('Python SDK smoke test passed:', sdk.__version__)
+          "
+
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: sdk/python/dist
+
+  publish-python-pypi:
+    name: Publish Python SDK to PyPI
+    needs: [meta, gate, publish-python-testpypi]
+    if: ${{ !cancelled() && needs.meta.result == 'success' && needs.gate.result != 'failure' && needs.gate.result != 'cancelled' && (needs.meta.outputs.sdk == 'python' || needs.meta.outputs.sdk == 'all') && needs.publish-python-testpypi.result == 'success' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/python
+    environment:
+      name: pypi
+      url: https://pypi.org/project/trident-indexer/
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Set up Python
+        uses: actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d # v5.1.0
+        with:
+          python-version: "3.12"
+
+      # Rebuilt from source rather than shared via upload/download-artifact
+      # between jobs — the build is deterministic given the same pinned
+      # toolchain and version input, so re-running it here keeps this job
+      # self-contained without adding another action dependency.
+      - name: Set version
+        run: |
+          sed -i "s/^version = \".*\"/version = \"${{ needs.meta.outputs.version }}\"/" pyproject.toml
+          grep '^version' pyproject.toml
+
+      - name: Build sdist + wheel
+        run: |
+          pip install build twine
+          python -m build
+
+      - name: twine check
+        run: twine check dist/*
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
+        with:
+          packages-dir: sdk/python/dist
+
+  # ---------------------------------------------------------------------------
+  # Rust — crates.io. Issue #429: sdk/rust had no publish path at all, so it
+  # could not be installed by users regardless of how well it was tested.
+  #
+  # `cargo publish --dry-run` runs unconditionally before the real publish: it
+  # packages and compiles the crate exactly as crates.io will, which catches the
+  # common failure of a crate that builds in-workspace but not standalone (a
+  # path dependency, or a file missing from the package include list).
+  # ---------------------------------------------------------------------------
+  publish-rust:
+    name: Publish Rust SDK to crates.io
+    needs: [meta, gate]
+    if: ${{ !cancelled() && needs.meta.result == 'success' && needs.gate.result != 'failure' && needs.gate.result != 'cancelled' && (needs.meta.outputs.sdk == 'rust' || needs.meta.outputs.sdk == 'all') }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/rust
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Validate version input is semver
+        run: |
+          if ! [[ "${{ needs.meta.outputs.version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'${{ needs.meta.outputs.version }}' is not a valid semver version"
+            exit 1
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+
+      - name: Set version
+        run: |
+          sed -i "0,/^version = \".*\"/s//version = \"${{ needs.meta.outputs.version }}\"/" Cargo.toml
+          grep -m1 '^version' Cargo.toml
+
+      - name: Test
+        run: cargo test
+
+      # Runs whether or not this is a dry run: this is the step that proves the
+      # crate is actually publishable, so skipping it on a real publish would
+      # defeat the point of having it.
+      - name: Package (dry run)
+        run: cargo publish --dry-run --allow-dirty
+
+      - name: Publish to crates.io
+        if: ${{ needs.meta.outputs.dry_run != 'true' }}
+        run: cargo publish --allow-dirty
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # Go — the module proxy publishes from a git tag rather than an upload, so
+  # "publishing" here means creating the tag `sdk/go/vX.Y.Z` and warming the
+  # proxy so the first `go get` does not have to wait for indexing.
+  # ---------------------------------------------------------------------------
+  publish-go:
+    name: Publish Go SDK (tag + proxy warm)
+    needs: [meta, gate]
+    if: ${{ !cancelled() && needs.meta.result == 'success' && needs.gate.result != 'failure' && needs.gate.result != 'cancelled' && (needs.meta.outputs.sdk == 'go' || needs.meta.outputs.sdk == 'all') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Validate version input is semver
+        run: |
+          if ! [[ "${{ needs.meta.outputs.version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'${{ needs.meta.outputs.version }}' is not a valid semver version"
+            exit 1
+          fi
+
+      - name: Set up Go
+        uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491 # v5.0.0
+        with:
+          go-version: "1.25"
+          cache-dependency-path: sdk/go/go.sum
+
+      - name: Test
+        working-directory: sdk/go
+        run: go test ./...
+
+      # go.mod carries no version of its own, so sdk/go/VERSION is what
+      # scripts/check-sdk-versions.sh reads. Keeping it in step with the tag is
+      # what makes the alignment check meaningful for Go.
+      - name: Verify VERSION file matches the requested version
+        working-directory: sdk/go
+        run: |
+          declared="$(tr -d '[:space:]' < VERSION)"
+          if [ "$declared" != "${{ needs.meta.outputs.version }}" ]; then
+            echo "::error::sdk/go/VERSION is $declared but publishing ${{ needs.meta.outputs.version }}."
+            echo "Run scripts/check-sdk-versions.sh --fix and commit before publishing."
+            exit 1
+          fi
+
+      - name: Create module tag
+        if: ${{ needs.meta.outputs.dry_run != 'true' }}
+        run: |
+          tag="sdk/go/v${{ needs.meta.outputs.version }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "::error::tag $tag already exists — published module versions are immutable"
+            exit 1
+          fi
+          git tag "$tag"
+          git push origin "$tag"
+
+      - name: Warm the module proxy
+        if: ${{ needs.meta.outputs.dry_run != 'true' }}
+        run: |
+          module="github.com/Telocel-Labs/Trident/sdk/go"
+          for _ in $(seq 1 10); do
+            if curl -fsS "https://proxy.golang.org/${module}/@v/v${{ needs.meta.outputs.version }}.info"; then
+              echo "proxy is serving v${{ needs.meta.outputs.version }}"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::warning::proxy did not serve v${{ needs.meta.outputs.version }} within 150s; it usually appears shortly after."
+
+      - name: Dry run — skipped tag and publish
+        if: ${{ needs.meta.outputs.dry_run == 'true' }}
+        run: |
+          echo "Dry run: tests passed and VERSION verified; tag sdk/go/v${{ needs.meta.outputs.version }} not created."
+
+  # ---------------------------------------------------------------------------
+  # React — npm, same shape as the TypeScript SDK. It depends on the TypeScript
+  # SDK via `file:../typescript`, which resolves only inside this repo, so the
+  # published package must depend on the registry version instead. That rewrite
+  # happens here rather than being committed, so local development keeps using
+  # the workspace copy.
+  # ---------------------------------------------------------------------------
+  publish-react:
+    name: Publish React SDK to npm
+    needs: [meta, gate]
+    if: ${{ !cancelled() && needs.meta.result == 'success' && needs.gate.result != 'failure' && needs.gate.result != 'cancelled' && (needs.meta.outputs.sdk == 'react' || needs.meta.outputs.sdk == 'all') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Validate version input is semver
+        run: |
+          if ! [[ "${{ needs.meta.outputs.version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'${{ needs.meta.outputs.version }}' is not a valid semver version"
+            exit 1
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Build the TypeScript SDK
+        working-directory: sdk/typescript
+        run: npm ci && npm run build
+
+      - name: Install dependencies
+        working-directory: sdk/react
+        run: npm ci
+
+      - name: Test
+        working-directory: sdk/react
+        run: npm test
+
+      - name: Set version
+        working-directory: sdk/react
+        run: npm version "${{ needs.meta.outputs.version }}" --no-git-tag-version --allow-same-version
+
+      - name: Point the workspace dependency at the published TypeScript SDK
+        working-directory: sdk/react
+        env:
+          TARGET_VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          node <<'NODE'
+          const fs = require("fs");
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          const name = "@trident-indexer/sdk";
+          const range = "^" + process.env.TARGET_VERSION;
+          for (const field of ["dependencies", "peerDependencies"]) {
+            const dep = pkg[field] && pkg[field][name];
+            if (dep && dep.startsWith("file:")) {
+              pkg[field][name] = range;
+              console.log("rewrote " + field + "." + name + " -> " + range);
+            }
+          }
+          fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
+          NODE
+
+      - name: Build
+        working-directory: sdk/react
+        run: npm run build
+
+      - name: Publish to npm
+        if: ${{ needs.meta.outputs.dry_run != 'true' }}
+        working-directory: sdk/react
+        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Dry run — skipped publish
+        if: ${{ needs.meta.outputs.dry_run == 'true' }}
+        working-directory: sdk/react
+        run: |
+          echo "Dry run: package built and workspace dependency rewritten, not published."
+          npm pack --dry-run
+
+  # ---------------------------------------------------------------------------
+  # Create GitHub Release — only after all builds and publishes succeed
   # ---------------------------------------------------------------------------
   create-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
     needs:
-      - build-indexer
-      - build-grpc-api
-      - build-go-api
-      - build-migrate
-      - publish-sdk
+      - meta
+      - build-images
+      - publish-typescript
+      - publish-python-pypi
+      - publish-rust
+      - publish-go
+      - publish-react
+    if: needs.meta.outputs.is_release == 'true'
     permissions:
       contents: write
     steps:
@@ -235,18 +703,22 @@ jobs:
         with:
           fetch-depth: 0  # needed for auto-generated release notes
 
+      - name: Download image digests
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          pattern: digest-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
       - name: Write image digests file
         run: |
-          cat > digests.txt <<EOF
-          ## Docker image digests
-
-          | Image | Digest |
-          |-------|--------|
-          | trident-indexer | ${{ needs.build-indexer.outputs.digest }} |
-          | trident-grpc-api | ${{ needs.build-grpc-api.outputs.digest }} |
-          | trident-go-api | ${{ needs.build-go-api.outputs.digest }} |
-          | trident-migrate | ${{ needs.build-migrate.outputs.digest }} |
-          EOF
+          {
+            echo "## Docker image digests"
+            echo ""
+            echo "| Image | Digest |"
+            echo "|-------|--------|"
+            cat "${RUNNER_TEMP}"/digests/digest-*.txt
+          } > digests.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@9d7c94cfd0a1f3ed45544c887983e9fa900f0564 # v2.0.4
@@ -256,7 +728,8 @@ jobs:
           body: |
             ## Docker Images
 
-            Pull the images for this release:
+            Pull the images for this release (each is cosign-signed and carries a
+            build-provenance attestation):
 
             ```bash
             docker pull ghcr.io/${{ env.ORG }}/trident-indexer:${{ github.ref_name }}
@@ -265,11 +738,13 @@ jobs:
             docker pull ghcr.io/${{ env.ORG }}/trident-migrate:${{ github.ref_name }}
             ```
 
-            ## TypeScript SDK
+            ## SDKs
 
             ```bash
-            npm install @trident-indexer/sdk@${{ github.ref_name }}
+            npm install @trident-indexer/sdk@${{ needs.meta.outputs.version }}
             ```
+
+            The Python, Rust, Go and React SDKs are published at the same version.
 
             ---
             <!-- GitHub will append auto-generated release notes below -->

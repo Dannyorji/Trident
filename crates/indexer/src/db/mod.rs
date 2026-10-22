@@ -1622,6 +1622,7 @@ pub async fn set_alert_state(
 /// Record a parse error to parse_errors table for auditing and potential replay.
 pub async fn insert_parse_error(
     pool: &PgPool,
+    network: &str,
     ledger_sequence: u64,
     event_index: u32,
     raw_payload: &str,
@@ -1630,14 +1631,15 @@ pub async fn insert_parse_error(
     sqlx::query(
         r#"
         INSERT INTO parse_errors
-            (ledger_sequence, event_index, raw_payload, error_message)
-        VALUES ($1, $2, $3, $4)
+            (ledger_sequence, event_index, raw_payload, error_message, network)
+        VALUES ($1, $2, $3, $4, $5)
         "#,
     )
     .bind(ledger_sequence as i64)
     .bind(event_index as i32)
     .bind(raw_payload)
     .bind(error_message)
+    .bind(network)
     .execute(pool)
     .await
     .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("insert_parse_error")))?;
@@ -1654,8 +1656,10 @@ pub async fn insert_parse_error(
 /// constraint violation, an outage that outlasted the retry budget, etc.) is
 /// understood, without needing to re-fetch it from Stellar RPC.
 ///
-/// Keyed over PENDING rows by the event's natural key — the same
-/// (contract_id, ledger_sequence, event_index) triple `event_uuid` and
+/// Rows are tagged with `network` so indexers sharing one database keep
+/// separate dead-letter queues. Keyed over PENDING rows by the event's natural
+/// key within that network — the same (contract_id, ledger_sequence,
+/// event_index) triple `event_uuid` and
 /// migration 0025 make canonical (issue #508): a poison
 /// event re-encountered across polls — an RPC redelivery, a backfill overlap
 /// — updates its existing row (attempt count folded in, latest error kept)
@@ -1665,6 +1669,7 @@ pub async fn insert_parse_error(
 /// and does not block recording a fresh failure of the same event.
 pub async fn insert_failed_event(
     pool: &PgPool,
+    network: &str,
     event: &SorobanEvent,
     error_message: &str,
     attempts: u32,
@@ -1677,9 +1682,9 @@ pub async fn insert_failed_event(
         r#"
         INSERT INTO failed_events
             (ledger_sequence, contract_id, transaction_hash, event_index,
-             event_payload, error_message, attempts)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        ON CONFLICT (contract_id, ledger_sequence, event_index) WHERE replayed_at IS NULL
+             event_payload, error_message, attempts, network)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        ON CONFLICT (network, contract_id, ledger_sequence, event_index) WHERE replayed_at IS NULL
         DO UPDATE SET
             attempts      = failed_events.attempts + EXCLUDED.attempts,
             error_message = EXCLUDED.error_message
@@ -1692,6 +1697,7 @@ pub async fn insert_failed_event(
     .bind(payload)
     .bind(error_message)
     .bind(attempts as i32)
+    .bind(network)
     .execute(pool)
     .await
     .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("insert_failed_event")))?;
@@ -1711,23 +1717,25 @@ pub struct FailedEventRow {
 }
 
 /// List dead-lettered events still awaiting replay (`replayed_at IS NULL`),
-/// oldest first — the replay tool's `--list` output and the query the
+/// for `network`, oldest first — the replay tool's `--list` output and the query the
 /// dead-letter-queue runbook used to ask an operator to run by hand (issue
 /// #574). Uses `idx_failed_events_pending`, the partial index migration 0028
 /// built for exactly this query.
 pub async fn list_pending_failed_events(
     pool: &PgPool,
+    network: &str,
     limit: i64,
 ) -> Result<Vec<FailedEventRow>, TridentError> {
     let rows = sqlx::query_as::<_, (Uuid, i64, String, String, String, i32, DateTime<Utc>)>(
         r#"
         SELECT id, ledger_sequence, contract_id, transaction_hash, error_message, attempts, occurred_at
         FROM failed_events
-        WHERE replayed_at IS NULL
+        WHERE replayed_at IS NULL AND network = $1
         ORDER BY occurred_at
-        LIMIT $1
+        LIMIT $2
         "#,
     )
+    .bind(network)
     .bind(limit)
     .fetch_all(pool)
     .await
@@ -1788,19 +1796,21 @@ pub enum ReplayOutcome {
 /// replay a no-op on `failed_events` too — replaying twice cannot
 /// double-insert or double-count.
 ///
-/// `network` is the replayed row's network tag. `failed_events` has no
-/// network column of its own (the original event's network is not recorded
-/// at dead-letter time), so the caller must supply the deployment's actual
-/// network — see `main::run_replay` (issue #595).
+/// `network` is both the replayed row's network tag and a scope on the lookup:
+/// a row dead-lettered by another network's indexer is reported as missing
+/// rather than being replayed into the wrong network's `soroban_events`
+/// (issue #595).
 pub async fn replay_failed_event(
     pool: &PgPool,
     id: Uuid,
     network: &str,
 ) -> Result<ReplayOutcome, TridentError> {
     let row: Option<(serde_json::Value,)> = sqlx::query_as(
-        "SELECT event_payload FROM failed_events WHERE id = $1 AND replayed_at IS NULL",
+        "SELECT event_payload FROM failed_events
+         WHERE id = $1 AND network = $2 AND replayed_at IS NULL",
     )
     .bind(id)
+    .bind(network)
     .fetch_optional(pool)
     .await
     .map_err(|e| {
@@ -1855,16 +1865,22 @@ pub async fn replay_failed_event(
 /// `trident_indexer_persist_dead_letter_backlog` gauge each active poll
 /// cycle (and on every dead-letter write), so the non-empty-DLQ alert has a
 /// live series to fire on — a silent queue is indistinguishable from data
-/// loss (issue #508). Counts only pending rows: a replayed row is resolved
+/// loss (issue #508). Scoped to `network` so a shared database does not mix
+/// one indexer's backlog into another's gauge. Counts only pending rows: a replayed row is resolved
 /// history, not backlog.
-pub async fn count_pending_failed_events(pool: &PgPool) -> Result<i64, TridentError> {
-    let row: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM failed_events WHERE replayed_at IS NULL")
-            .fetch_one(pool)
-            .await
-            .map_err(|e| {
-                TridentError::storage(anyhow::Error::new(e).context("count_pending_failed_events"))
-            })?;
+pub async fn count_pending_failed_events(
+    pool: &PgPool,
+    network: &str,
+) -> Result<i64, TridentError> {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM failed_events WHERE replayed_at IS NULL AND network = $1",
+    )
+    .bind(network)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("count_pending_failed_events"))
+    })?;
     Ok(row.0)
 }
 
@@ -2105,10 +2121,10 @@ mod tests {
             .await
             .expect("cleanup failed");
 
-        insert_failed_event(&pool, &event, "first failure", 4)
+        insert_failed_event(&pool, "testnet", &event, "first failure", 4)
             .await
             .expect("first dead-letter failed");
-        insert_failed_event(&pool, &event, "second failure", 4)
+        insert_failed_event(&pool, "testnet", &event, "second failure", 4)
             .await
             .expect("redelivered dead-letter must not error");
 
@@ -2130,7 +2146,7 @@ mod tests {
             .execute(&pool)
             .await
             .expect("mark replayed");
-        insert_failed_event(&pool, &event, "regression after replay", 1)
+        insert_failed_event(&pool, "testnet", &event, "regression after replay", 1)
             .await
             .expect("post-replay dead-letter failed");
         let pending: (i64,) = sqlx::query_as(
@@ -3966,7 +3982,7 @@ mod tests {
             .await
             .unwrap();
 
-        insert_failed_event(&pool, &event, "simulated persistent failure", 3)
+        insert_failed_event(&pool, "testnet", &event, "simulated persistent failure", 3)
             .await
             .expect("insert_failed_event must succeed");
 
@@ -4026,7 +4042,7 @@ mod tests {
             .await
             .unwrap();
 
-        insert_failed_event(&pool, &event, "simulated failure", 3)
+        insert_failed_event(&pool, "testnet", &event, "simulated failure", 3)
             .await
             .unwrap();
 
@@ -4036,7 +4052,7 @@ mod tests {
             .await
             .unwrap();
 
-        let pending = list_pending_failed_events(&pool, 1000).await.unwrap();
+        let pending = list_pending_failed_events(&pool, "testnet", 1000).await.unwrap();
         assert!(
             pending.iter().any(|row| row.id == id.0),
             "freshly dead-lettered row must be listed as pending"
@@ -4045,7 +4061,7 @@ mod tests {
         let outcome = replay_failed_event(&pool, id.0, "testnet").await.unwrap();
         assert_eq!(outcome, ReplayOutcome::Replayed);
 
-        let pending_after = list_pending_failed_events(&pool, 1000).await.unwrap();
+        let pending_after = list_pending_failed_events(&pool, "testnet", 1000).await.unwrap();
         assert!(
             !pending_after.iter().any(|row| row.id == id.0),
             "replayed row must no longer be listed as pending"
@@ -4107,7 +4123,7 @@ mod tests {
             .await
             .unwrap();
 
-        insert_failed_event(&pool, &event, "simulated failure", 3)
+        insert_failed_event(&pool, "testnet", &event, "simulated failure", 3)
             .await
             .unwrap();
         let id: (Uuid,) = sqlx::query_as("SELECT id FROM failed_events WHERE contract_id = $1")

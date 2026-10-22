@@ -82,6 +82,14 @@ whether to fix and replay it. Both are deployed rules in
 
 ## Inspecting and replaying failed_events
 
+Both tables carry a `network` column (migration 0038), populated on insert from
+the indexer's `NETWORK`. The backlog gauge, the `/admin/dead-letter` endpoint,
+the reconciler's per-ledger counts and `trident-indexer replay` are all scoped
+to the running deployment's network, so testnet and mainnet indexers can share
+one database. `replay` only lists and replays rows tagged with the `NETWORK`
+set in the operator's shell; a row from another network is reported as
+skipped.
+
 `trident-indexer replay` (issue #574) is the supported way to inspect and
 replay dead-lettered events. It reads `DATABASE_URL` the same way the daemon
 does, connects, does the requested work, and exits — it never starts the

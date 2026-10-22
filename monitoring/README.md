@@ -14,8 +14,15 @@ scrape_configs:
       - targets: ["indexer:9090"] # crates/indexer/src/metrics.rs, METRICS_PORT
   - job_name: trident-api
     static_configs:
-      - targets: ["api:3000"] # GET /metrics, services/api
+      - targets: ["api:9091"] # GET /metrics, services/api METRICS_PORT (internal)
+  - job_name: trident-api-legacy
+    metrics_path: /metrics/legacy
+    static_configs:
+      - targets: ["api:9091"] # hand-rolled indexer-freshness/webhook/rate-limit metrics
 ```
+
+The API does not serve `/metrics` on its public port (3000); only the internal
+`METRICS_PORT` listener does.
 
 The `job=` labels above (`trident-indexer`, `trident-api`) must match what
 `alerts.yml`'s `up{job="..."}` rules expect — rename both sides together if

@@ -1,15 +1,17 @@
-name: Security Scan
+name: Security
 
-# SBOM generation + container/dependency vulnerability scanning (issue #311).
-# Complements pinning (#303) and secrets scanning (secrets-scan.yml). Gated
-# on a severity threshold — see docs/security-triage.md for the allowlist
-# and triage process for findings.
+# Secrets scanning, dependency audits, and SBOM + vulnerability scanning of the
+# images integration.yml builds (issue #311). Gated on a severity threshold --
+# see docs/security-triage.md for the allowlist and triage process.
+#
+# `security-ok` is the aggregate gate and the only security check branch
+# protection needs to require.
 #
 # Every third-party action below is pinned to a commit SHA resolved with
 # `git ls-remote` against the upstream repo. Keep it that way: pinning to a
 # tag (or worse, a floating major like @v0) lets the referenced code change
 # under you, and an unverified SHA copied from memory tends to resolve to
-# nothing at all — trivy-action was pinned to a version that was never
+# nothing at all -- trivy-action was pinned to a version that was never
 # released, which is why this job never ran (issue #371).
 
 on:
@@ -18,52 +20,126 @@ on:
   pull_request:
     branches: [dev, main]
   schedule:
-    # Catch newly-disclosed CVEs in already-merged code, not just at PR time.
-    - cron: "0 6 * * 1"
+    # Nightly: catch newly-disclosed CVEs in already-merged code, not just at
+    # PR time (the old security-scan.yml only did this weekly).
+    - cron: "0 6 * * *"
+  workflow_dispatch:
 
 concurrency:
-  group: security-scan-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+
+permissions:
+  contents: read
 
 jobs:
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      images: ${{ steps.f.outputs.images == 'true' || github.event_name != 'pull_request' }}
+      dependencies: ${{ steps.f.outputs.dependencies == 'true' || github.event_name != 'pull_request' }}
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      # Pull requests only run what their diff can affect. Pushes to dev/main
+      # (and anything that is not a PR) run everything: the outputs above are
+      # forced true when the event is not a pull_request. Filters live in
+      # .github/path-filters.yml, shared with integration.yml and security.yml.
+      - id: f
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        with:
+          filters: .github/path-filters.yml
+
   # ---------------------------------------------------------------------------
-  # SBOM + image scan — one job per image so a failure in one doesn't hide
-  # the others' results, matching the `docker` job's per-image build split
-  # in ci.yml.
+  # Secrets scan (always: a leaked credential is not path-dependent)
+  # ---------------------------------------------------------------------------
+  gitleaks:
+    name: Gitleaks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          # Full history so gitleaks can scan every commit on a PR, not just
+          # the tip. Without this, a secret committed and then "removed" in a
+          # later commit would slip through on a squash-and-merge workflow.
+          fetch-depth: 0
+
+      # The gitleaks scanner is MIT-licensed and free; only the GitHub Action
+      # wrapper is gated — it refuses to run for an organisation account
+      # without a paid GITLEAKS_LICENSE secret ("[Telocel-Labs] is an
+      # organization. License key is required."), at every v2.x version. Run
+      # the release binary directly instead: same scanner, same
+      # .gitleaks.toml, same coverage, no licence and no secret.
+      #
+      # The download is checksum-verified. This job exists to catch leaked
+      # credentials, so silently running an unverified binary fetched over the
+      # network would undercut the point of having it.
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          set -euo pipefail
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL --retry 3 -o "$tarball" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${tarball}"
+          echo "${GITLEAKS_SHA256}  ${tarball}" | sha256sum -c -
+          tar -xzf "$tarball" gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      # `detect` scans full git history, which is why checkout above sets
+      # fetch-depth: 0 — a secret committed and later "removed" still has to
+      # fail the build. Exit code 1 means findings, which fails the job.
+      - name: Run gitleaks
+        run: gitleaks detect --source . --config .gitleaks.toml --redact --verbose
+
+  # ---------------------------------------------------------------------------
+  # SBOM + image scan — one job per image so a failure in one doesn't hide the
+  # others' results. The images are the ones integration.yml built for this
+  # commit (reused from its artifacts); nightly and manual runs have no such
+  # run and build them instead.
   # ---------------------------------------------------------------------------
   image-scan:
     name: SBOM + scan (${{ matrix.name }})
+    needs: changes
+    if: needs.changes.outputs.images == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: go-api
             dockerfile: services/api/Dockerfile
-            tag: trident-go-api:scan
+            tag: trident-go-api:ci
           - name: grpc-api
             dockerfile: crates/api/Dockerfile
-            tag: trident-grpc-api:scan
+            tag: trident-grpc-api:ci
           - name: indexer
             dockerfile: crates/indexer/Dockerfile
-            tag: trident-indexer:scan
+            tag: trident-indexer:ci
 
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@2b51285047da1547ffb1b2203d8be4c0af6b1f20 # v3.2.0
-
-      - name: Build image (loaded locally for scanning, not pushed)
-        uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
+      - name: Get image
+        uses: ./.github/actions/get-image
         with:
-          context: .
+          name: ${{ matrix.name }}
           file: ${{ matrix.dockerfile }}
-          push: false
-          load: true
-          tags: ${{ matrix.tag }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tag: ${{ matrix.tag }}
+          sha: ${{ github.event.pull_request.head.sha || github.sha }}
+          reuse: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+          token: ${{ github.token }}
 
       - name: Verify no secret is baked into an image layer
         run: bash scripts/check-image-history.sh "${{ matrix.tag }}"
@@ -102,31 +178,32 @@ jobs:
           trivyignores: .trivyignore
 
   # The migration image is released alongside the three application images,
-  # but is not part of the pre-existing vulnerability/SBOM matrix. Build it
-  # separately here so every shipped image receives the layer-secret audit
-  # without changing unrelated vulnerability policy.
+  # but is not part of the pre-existing vulnerability/SBOM matrix. It still
+  # gets the layer-secret audit, without changing unrelated vulnerability
+  # policy.
   migration-image-secret-audit:
     name: Image secret audit (migrate)
+    needs: changes
+    if: needs.changes.outputs.images == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@2b51285047da1547ffb1b2203d8be4c0af6b1f20 # v3.2.0
-
-      - name: Build migration image (loaded locally, not pushed)
-        uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
+      - name: Get image
+        uses: ./.github/actions/get-image
         with:
-          context: .
+          name: migrate
           file: database/Dockerfile
-          push: false
-          load: true
-          tags: trident-migrate:secret-audit
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tag: trident-migrate:ci
+          sha: ${{ github.event.pull_request.head.sha || github.sha }}
+          reuse: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+          token: ${{ github.token }}
 
       - name: Verify no secret is baked into an image layer
-        run: bash scripts/check-image-history.sh trident-migrate:secret-audit
+        run: bash scripts/check-image-history.sh trident-migrate:ci
 
   # ---------------------------------------------------------------------------
   # Dependency vulnerability audits — one step per ecosystem actually
@@ -135,7 +212,13 @@ jobs:
   # ---------------------------------------------------------------------------
   dependency-audit:
     name: Dependency audit
+    needs: changes
+    if: needs.changes.outputs.dependencies == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+      issues: write
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
@@ -220,3 +303,25 @@ jobs:
         uses: pypa/gh-action-pip-audit@1220774d901786e6f652ae159f7b6bc8fea6d266 # v1.1.0
         with:
           inputs: sdk/python/
+
+  # ---------------------------------------------------------------------------
+  # Aggregate gate -- the only check branch protection requires from this
+  # workflow. Skipped jobs count as success; failed/cancelled count as failure.
+  # ---------------------------------------------------------------------------
+  security-ok:
+    name: security-ok
+    if: always()
+    needs:
+      - changes
+      - gitleaks
+      - image-scan
+      - migration-image-secret-audit
+      - dependency-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          sparse-checkout: .github
+      - uses: ./.github/actions/gate
+        with:
+          needs: ${{ toJSON(needs) }}

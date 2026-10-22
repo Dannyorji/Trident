@@ -11,10 +11,11 @@ follows is the documented procedure, the automation now wired around it
 
 ## What is now automated (issue #621)
 
-`.github/workflows/staging-deploy.yml` now runs a `rollback-staging` job
-automatically whenever `deploy-staging` or `smoke-test-staging` fails. It
-runs `helm rollback trident-staging 0` (roll back to the immediately
-previous revision) in the staging namespace, then waits for the three app
+`.github/workflows/deploy.yml` now runs a `rollback` job
+automatically whenever `deploy` or `smoke-test` fails (for staging and, with
+the `production` environment's approval, production). It
+runs `helm rollback <release> 0` (roll back to the immediately
+previous revision) in the environment's namespace, then waits for the three app
 deployments to report ready. If there is no previous revision to roll back
 to (a release's first-ever install), it logs a warning and stops rather
 than performing a no-op rollback that would mask the failure.

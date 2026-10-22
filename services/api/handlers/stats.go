@@ -92,7 +92,8 @@ func RecordWebhookDelivery(success bool, deadLetter bool, durationMs int64) {
 // indexer's own same-named counters/gauges of a different type), HTTP
 // request count/latency (all routes, via middleware.PrometheusHTTP), gRPC
 // client call count/latency, DB connection pool utilisation, and the
-// trident:events Redis Stream length. Mount at GET /metrics.
+// trident:events Redis Stream length. Served only on the internal metrics port
+// (internal/metrics, GET /metrics/legacy) — never on the public mux.
 func MetricsHandler(pool *pgxpool.Pool, rdb *redis.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")

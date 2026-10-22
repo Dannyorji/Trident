@@ -9,7 +9,7 @@
 #
 # The assertions live in Rust (crates/indexer/src/testnet_correctness.rs) so
 # the same checks run unattended on a schedule; see
-# .github/workflows/testnet-correctness.yml. This script is the operator-facing
+# .github/workflows/nightly.yml. This script is the operator-facing
 # entry point for running them on demand.
 #
 # Usage:

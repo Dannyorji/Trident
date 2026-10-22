@@ -1,0 +1,26 @@
+name: Aggregate gate
+description: >-
+  Fails when any job in `needs` failed or was cancelled. Skipped jobs count as
+  success, so a path-filtered job that did not run never blocks the gate. Each
+  workflow's aggregate job (ci-ok, integration-ok, security-ok) uses this and
+  is the only check branch protection needs to require.
+
+inputs:
+  needs:
+    description: toJSON(needs) of the calling job.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        NEEDS: ${{ inputs.needs }}
+      run: |
+        echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+        bad=$(echo "$NEEDS" | jq -r 'to_entries[] | select(.value.result == "failure" or .value.result == "cancelled") | .key')
+        if [ -n "$bad" ]; then
+          echo "::error::failed or cancelled: $(echo "$bad" | tr '\n' ' ')"
+          exit 1
+        fi
+        echo "All required jobs passed or were skipped."

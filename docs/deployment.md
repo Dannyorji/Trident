@@ -824,7 +824,7 @@ lasting change.
   `crates/indexer/src/health.rs`). These are also wired into `fly/indexer.toml`
   under the top-level `[checks]` section so Fly restarts the machine if
   readiness fails, not just if the TCP port stops accepting connections.
-- **Go API metrics**: `GET /metrics` on the public `trident-api` endpoint
+- **Go API metrics**: `GET /metrics` and `GET /metrics/legacy` on the internal `METRICS_PORT` (default 9091) — reachable on the 6PN only; the public `trident-api` endpoint does not serve `/metrics`
 - **Go API health check**: `GET /v1/ready` (used by Fly's HTTP service check
   in `fly/api.toml` to gate traffic routing). `/v1/ready` verifies
   Postgres/Redis/gRPC reachability, unlike `/v1/health`, which is a cheap
@@ -936,7 +936,7 @@ fly secrets set -a trident-indexer   OTEL_SAMPLING_RATIO=0.1
 
 ## Staging Environment {#staging}
 
-Issue #313: `.github/workflows/staging-deploy.yml` builds and deploys the
+Issue #313: `.github/workflows/deploy.yml` builds and deploys the
 `dev` branch to a staging environment automatically on every push to `dev`,
 then runs a post-deploy smoke test before staging is considered promotable.
 
@@ -956,7 +956,7 @@ then runs a post-deploy smoke test before staging is considered promotable.
 - **Failure alerting**: a failed deploy or smoke test posts to
   `STAGING_ALERT_WEBHOOK_URL` if configured.
 - **Env reference lint** (`scripts/check-env-reference.sh`, issue #312) is
-  wired into `ci.yml` as the `env-reference` job so config drift on any
+  wired into `ci.yml` as the `static` job so config drift on any
   branch — including `dev` — is caught before it reaches staging.
 
 ### What's best-effort / requires setup this environment couldn't provision
@@ -969,8 +969,8 @@ following require you to provision them once:
   kubeconfig scoped to the staging namespace), `STAGING_API_KEY`,
   `STAGING_DATABASE_URL` (when runner migrations are used), and
   `STAGING_ALERT_WEBHOOK_URL` (optional) are stored as encrypted secrets. The
-  kubeconfig and database URL must be set for `deploy-staging`/`smoke-test-staging`
-  to run at all. Without them, `check-staging-config` **fails** and names the
+  kubeconfig and database URL must be set for the `deploy`/`smoke-test` jobs
+  to run at all. Without them, `check-config` **fails** and names the
   missing credentials, so a deploy that did not happen never reports green
   (issue #395). To skip intentionally — a dry run with no staging environment
   provisioned — trigger the workflow via `workflow_dispatch` with
@@ -999,8 +999,8 @@ following require you to provision them once:
 
 ### Promotion path: staging -> prod (dev -> main)
 
-1. Changes land on `dev` via PR, triggering `staging-deploy.yml` automatically.
-2. Once staging's smoke test passes (green `smoke-test-staging` job), open a
+1. Changes land on `dev` via PR, triggering `deploy.yml` (staging) automatically.
+2. Once staging's smoke test passes (green `smoke-test` job), open a
    PR from `dev` into `main`.
 3. Merging into `main` does not itself deploy anything — production deploys
    are tag-triggered: `git tag vX.Y.Z && git push origin vX.Y.Z` runs
