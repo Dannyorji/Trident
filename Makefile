@@ -112,7 +112,7 @@ lint-openapi: ## Lint the OpenAPI specification
 		exit 1; \
 	fi
 
-# Coverage (issue #325). Mirrors the `coverage` job in .github/workflows/ci.yml
+# Coverage (issue #325). Mirrors the `coverage` job in .github/workflows/integration.yml
 # so a local run and CI report the same numbers from the same tools.
 #
 # cargo-llvm-cov, not tarpaulin: llvm-cov uses the compiler's own
@@ -144,7 +144,7 @@ coverage-sdk: ## TypeScript and Python SDK coverage
 # so a clean tree failed on a missing file rather than on coverage.
 #
 # Floors are set from measured baselines, not aspiration; see the `coverage`
-# job in .github/workflows/ci.yml for the rationale and current numbers.
+# job in .github/workflows/integration.yml for the rationale and current numbers.
 coverage-check: ## Enforce coverage floors on MVP-critical packages
 	@set -e; \
 	cd services/api; \

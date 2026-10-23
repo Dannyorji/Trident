@@ -1,6 +1,6 @@
 # Vulnerability Triage Process
 
-How SBOM/vulnerability findings from `.github/workflows/security-scan.yml`
+How SBOM/vulnerability findings from `.github/workflows/security.yml`
 (issue #311) get triaged, allowlisted, or fixed.
 
 ## What runs, and when

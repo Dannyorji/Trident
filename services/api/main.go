@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"regexp"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -87,6 +88,35 @@ func redactConnErr(err error) string {
 	return connErrRegexp.ReplaceAllString(err.Error(), "${1}://[redacted]@")
 }
 
+// parseOTLPHeaders parses the standard OTel OTEL_EXPORTER_OTLP_HEADERS
+// format (comma-separated key=value pairs, e.g. "api-key=secret,x-foo=bar")
+// used to authenticate against a hosted collector (issue #762). Malformed
+// entries are skipped rather than failing exporter init.
+func parseOTLPHeaders(raw string) map[string]string {
+	if raw == "" {
+		return nil
+	}
+	headers := make(map[string]string)
+	for _, pair := range strings.Split(raw, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		kv := strings.SplitN(pair, "=", 2)
+		if len(kv) != 2 {
+			slog.Warn("skipping malformed OTEL_EXPORTER_OTLP_HEADERS entry", "entry", pair)
+			continue
+		}
+		key := strings.TrimSpace(kv[0])
+		value := strings.TrimSpace(kv[1])
+		if key == "" {
+			continue
+		}
+		headers[key] = value
+	}
+	return headers
+}
+
 func initTracer(ctx context.Context) func() {
 	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
 	if endpoint == "" {
@@ -95,15 +125,29 @@ func initTracer(ctx context.Context) func() {
 
 	samplingRatio := 0.1
 	if r := os.Getenv("OTEL_SAMPLING_RATIO"); r != "" {
-		if f, err := strconv.ParseFloat(r, 64); err == nil {
+		f, err := strconv.ParseFloat(r, 64)
+		if err != nil || f < 0 || f > 1 {
+			slog.Warn("invalid OTEL_SAMPLING_RATIO, must be a float in [0,1]; falling back to default", "value", r, "default", samplingRatio)
+		} else {
 			samplingRatio = f
 		}
 	}
 
-	exporter, err := otlptracegrpc.New(ctx,
+	// Issue #762: traces include request paths, contract ids, key ids and
+	// error messages, so the exporter connection defaults to TLS. Insecure
+	// (plaintext) requires an explicit opt-in via the standard OTel env var
+	// — e.g. for a local collector sidecar in development.
+	opts := []otlptracegrpc.Option{
 		otlptracegrpc.WithEndpoint(endpoint),
-		otlptracegrpc.WithInsecure(),
-	)
+	}
+	if insecure, _ := strconv.ParseBool(os.Getenv("OTEL_EXPORTER_OTLP_INSECURE")); insecure {
+		opts = append(opts, otlptracegrpc.WithInsecure())
+	}
+	if headers := parseOTLPHeaders(os.Getenv("OTEL_EXPORTER_OTLP_HEADERS")); len(headers) > 0 {
+		opts = append(opts, otlptracegrpc.WithHeaders(headers))
+	}
+
+	exporter, err := otlptracegrpc.New(ctx, opts...)
 	if err != nil {
 		slog.Warn("failed to create OTLP trace exporter", "err", err)
 		return func() {}
@@ -161,7 +205,9 @@ func main() {
 		p, err := newDBPool(ctx, dsn, dbPoolSizeFromEnv())
 		cancel()
 		if err != nil {
-			slog.Warn("could not connect to database; DB-backed endpoints will return 503", "err", redactConnErr(err))
+			// Only a malformed DSN lands here; an unreachable server does not,
+			// because the pool is created lazily (see newDBPool).
+			slog.Warn("invalid database configuration; DB-backed endpoints will return 503", "err", redactConnErr(err))
 		} else {
 			pool = p
 			defer pool.Close()
@@ -308,7 +354,14 @@ func main() {
 	// through and panicking on first use.
 	var sorobanCaller handlers.SorobanRPCCaller
 	if rpcURL := os.Getenv("STELLAR_RPC_URL"); rpcURL != "" {
-		sorobanCaller = sorobanrpc.NewClient(rpcURL)
+		rpcClient, err := sorobanrpc.NewClient(rpcURL)
+		if err != nil {
+			// A malformed STELLAR_RPC_HEADERS must not silently start an
+			// unauthenticated client that 401s every contract call.
+			slog.Error("invalid Stellar RPC configuration", "err", err)
+			os.Exit(1)
+		}
+		sorobanCaller = rpcClient
 	}
 	var rlDB middleware.TierDB
 	if pool != nil {
@@ -387,9 +440,10 @@ func main() {
 	defer profiling.Shutdown(pprofSrv)
 
 	// Internal Prometheus metrics server on METRICS_PORT (default 9091,
-	// issue #58) — separate port from the public API and from the legacy
-	// /metrics route mounted above.
-	metricsSrv := metrics.Start()
+	// issue #58) — the only place metrics are served. The public listener has
+	// no /metrics route; the hand-rolled legacy metrics live at
+	// /metrics/legacy on this port.
+	metricsSrv := metrics.Start(handlers.MetricsHandler(pool, redisClient))
 	defer metrics.Shutdown(metricsSrv)
 
 	// Grace period mirrors Helm terminationGracePeriodSeconds (default 30s).
@@ -477,6 +531,12 @@ func buildPoolConfig(dsn string, poolSize int32) (*pgxpool.Config, error) {
 	return cfg, nil
 }
 
+// newDBPool builds the pool without requiring Postgres to be reachable.
+// pgxpool dials on demand and re-dials after failures, so a database that is
+// down or failing over at boot recovers on its own once it is back — the pod
+// does not have to be restarted, and every DB-backed component stays wired.
+// While the database is unreachable, requests fail (and /v1/ready reports it)
+// rather than the components being disabled for the life of the process.
 func newDBPool(ctx context.Context, dsn string, poolSize int32) (*pgxpool.Pool, error) {
 	cfg, err := buildPoolConfig(dsn, poolSize)
 	if err != nil {
@@ -487,8 +547,7 @@ func newDBPool(ctx context.Context, dsn string, poolSize int32) (*pgxpool.Pool, 
 		return nil, err
 	}
 	if err := pool.Ping(ctx); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("ping database: %w", err)
+		slog.Warn("database not reachable at startup; will connect when it becomes available", "err", redactConnErr(err))
 	}
 	return pool, nil
 }
@@ -570,7 +629,13 @@ func runContractStatsRollupRefresh(ctx context.Context, pool *pgxpool.Pool) {
 		}
 	}
 
-	refresh()
+	// Delay first run, and use advisory lock (issue #731)
+	time.Sleep(60 * time.Second)
+	var locked bool
+	if err := pool.QueryRow(ctx, "SELECT pg_try_advisory_lock(123456789, 101)").Scan(&locked); err == nil && locked {
+		refresh()
+		_, _ = pool.Exec(ctx, "SELECT pg_advisory_unlock(123456789, 101)")
+	}
 
 	ticker := time.NewTicker(contractStatsRollupRefreshInterval)
 	defer ticker.Stop()
@@ -579,7 +644,11 @@ func runContractStatsRollupRefresh(ctx context.Context, pool *pgxpool.Pool) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			refresh()
+			var locked bool
+			if err := pool.QueryRow(ctx, "SELECT pg_try_advisory_lock(123456789, 101)").Scan(&locked); err == nil && locked {
+				refresh()
+				_, _ = pool.Exec(ctx, "SELECT pg_advisory_unlock(123456789, 101)")
+			}
 		}
 	}
 }
@@ -633,7 +702,16 @@ func startRetentionJob(ctx context.Context, pool *pgxpool.Pool) {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
+		// Delay first run to avoid re-running on restart/crash-loop
+		time.Sleep(60 * time.Second)
+
 		run := func() {
+			// Leader election using advisory lock (issue #731)
+			var locked bool
+			if err := pool.QueryRow(ctx, "SELECT pg_try_advisory_lock(123456789, 100)").Scan(&locked); err != nil || !locked {
+				return
+			}
+			defer pool.Exec(context.Background(), "SELECT pg_advisory_unlock(123456789, 100)")
 			cleanupCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 			defer cancel()
 
@@ -690,15 +768,15 @@ func startRetentionJob(ctx context.Context, pool *pgxpool.Pool) {
 		// Run once at startup, then on ticker.
 		run()
 
-		for {
-			select {
-			case <-ctx.Done():
-				run()
-				return
-			case <-ticker.C:
-				run()
-			}
+	for {
+		select {
+		case <-ctx.Done():
+			// Don't run on exit with locks
+			return
+		case <-ticker.C:
+			run()
 		}
+	}
 	}()
 }
 
@@ -713,6 +791,11 @@ func runUsageRollupCleanup(ctx context.Context, pool *pgxpool.Pool) {
 	cleanup := func() {
 		cleanupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
+		var locked bool
+		if err := pool.QueryRow(cleanupCtx, "SELECT pg_try_advisory_lock(123456789, 103)").Scan(&locked); err != nil || !locked {
+			return
+		}
+		defer pool.Exec(context.Background(), "SELECT pg_advisory_unlock(123456789, 103)")
 		if _, err := pool.Exec(cleanupCtx,
 			`DELETE FROM usage_rollup WHERE period_start < NOW() - $1::interval`,
 			fmt.Sprintf("%d seconds", int64(usageRollupRetention.Seconds())),
@@ -721,10 +804,10 @@ func runUsageRollupCleanup(ctx context.Context, pool *pgxpool.Pool) {
 		}
 	}
 
+	time.Sleep(120 * time.Second)
 	for {
 		select {
 		case <-ctx.Done():
-			cleanup()
 			return
 		case <-ticker.C:
 			cleanup()

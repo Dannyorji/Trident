@@ -33,7 +33,7 @@ Failures create comments on related PRs/issues.
 | `PERFORMANCE_BUDGET.md` | Explicit targets (FCP, LCP, API latency) |
 | `SCALE_BOTTLENECKS.md` | Known issues and mitigation strategies |
 | `scripts/perf-test.ts` | Node.js test suite (run locally or in CI) |
-| `.github/workflows/explorer-perf.yml` | Weekly scheduled GitHub Actions workflow |
+| `.github/workflows/nightly.yml` (`explorer-perf` job) | Nightly scheduled GitHub Actions workflow |
 | `.lighthouserc.json` | Lighthouse CI config (optional, future) |
 
 ## Measurement

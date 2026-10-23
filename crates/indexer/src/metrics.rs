@@ -88,6 +88,10 @@ pub const RECONCILE_DISCREPANT_LEDGERS: &str = "trident_indexer_reconcile_discre
 pub const RECONCILE_WINDOW_END_LEDGER: &str = "trident_indexer_reconcile_window_end_ledger";
 pub const OUTBOX_PUBLISHED_TOTAL: &str = "trident_indexer_outbox_published_total";
 pub const OUTBOX_PUBLISH_FAILURES_TOTAL: &str = "trident_indexer_outbox_publish_failures_total";
+/// Outbox rows the relay could not decode and dead-lettered instead of
+/// publishing (issue #739). Distinct from publish failures: a decode failure
+/// never reaches Redis, so retrying cannot help.
+pub const OUTBOX_UNDECODABLE_TOTAL: &str = "trident_indexer_outbox_undecodable_total";
 /// RPC call latency in seconds, labelled by `method` (e.g. `getEvents`) and
 /// `endpoint` (the pool index serving the call, `0` = primary). Covers every
 /// call regardless of outcome, so `_count` doubles as a per-method,
@@ -165,6 +169,14 @@ pub const LEDGER_GAPS_CLOSED_TOTAL: &str = "trident_indexer_ledger_gaps_closed_t
 /// instead of relying on the gap scan to notice later.
 pub const RETAINED_FLOOR_LEDGERS_SKIPPED_TOTAL: &str =
     "trident_indexer_retained_floor_ledgers_skipped_total";
+
+/// Failed runs of `ensure_future_event_partitions` (issue #431/#771). Before
+/// this metric the only signal was a `tracing::error!` log line in
+/// `maintain_partitions` — nothing paged on it, so a persistently failing
+/// partition-maintenance job (e.g. a permissions change, a locked table) was
+/// silent until TridentPartitionExhausted fired days or weeks later.
+pub const PARTITION_MAINTENANCE_FAILURES_TOTAL: &str =
+    "trident_indexer_partition_maintenance_failures_total";
 
 /// Install the global Prometheus recorder and start serving `/metrics` on
 /// `port`. Must be called once, before the streamer starts recording.
@@ -262,6 +274,10 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         "Outbox publish attempts that failed (issue #200)"
     );
     describe_counter!(
+        OUTBOX_UNDECODABLE_TOTAL,
+        "Outbox rows dead-lettered because their payload could not be decoded (issue #739)"
+    );
+    describe_counter!(
         UNEXPECTED_SCVAL_VARIANT_TOTAL,
         "ScVal variants decoded from event payloads where they should never appear (issue #506)"
     );
@@ -354,6 +370,7 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     counter!(RPC_FAILOVERS_TOTAL).increment(0);
     counter!(OUTBOX_PUBLISHED_TOTAL).increment(0);
     counter!(OUTBOX_PUBLISH_FAILURES_TOTAL).increment(0);
+    counter!(OUTBOX_UNDECODABLE_TOTAL).increment(0);
     counter!(LEDGER_GAPS_DETECTED_TOTAL).increment(0);
     counter!(LEDGER_GAPS_CLOSED_TOTAL).increment(0);
     counter!(UNEXPECTED_SCVAL_VARIANT_TOTAL).increment(0);
@@ -382,6 +399,7 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     // alerts resolved — silence in exactly the case that needs paging. The
     // real value is written after the first poll cycle.
     gauge!(PARTITION_LOOKAHEAD_LEDGERS).set(0.0);
+    counter!(PARTITION_MAINTENANCE_FAILURES_TOTAL).increment(0);
 
     // Histograms render nothing at all until they observe a value — not even
     // a HELP/TYPE header — so an indexer that has not yet made an RPC call
@@ -606,6 +624,13 @@ pub fn record_outbox_publish_failure() {
     counter!(OUTBOX_PUBLISH_FAILURES_TOTAL).increment(1);
 }
 
+/// Count an outbox row the relay dead-lettered because its stored payload
+/// could not be decoded (issue #739). Nothing was published, so this is not a
+/// publish failure: the failure is permanent for that row.
+pub fn record_outbox_undecodable() {
+    counter!(OUTBOX_UNDECODABLE_TOTAL).increment(1);
+}
+
 /// Record one RPC call's latency, labelled by method and the endpoint pool
 /// index that served it (0 = primary). Recorded for every call regardless of
 /// outcome, so a degraded-but-not-yet-failing provider (rising latency, no
@@ -662,6 +687,11 @@ pub fn record_retention_job_success() {
 /// Records one failed event-retention pruning run (issue #482).
 pub fn record_retention_job_failure() {
     counter!(RETENTION_JOB_FAILURE_TOTAL).increment(1);
+}
+
+/// Records one failed `ensure_future_event_partitions` run (issue #771).
+pub fn record_partition_maintenance_failure() {
+    counter!(PARTITION_MAINTENANCE_FAILURES_TOTAL).increment(1);
 }
 
 /// Publish the current number of detected ledger gaps.

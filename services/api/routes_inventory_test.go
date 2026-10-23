@@ -94,7 +94,6 @@ func TestEveryOperationDocumentsStatusCodesAndErrorEnvelope(t *testing.T) {
 	// their error contract.
 	noErrorResponseAllowed := map[string]string{
 		"GET /v1/health":  "liveness probe: unauthenticated, returns 200 by design; a failure is a transport error, not an API response",
-		"GET /metrics":    "Prometheus exposition endpoint; scrapers treat any non-200 as scrape failure",
 		"GET /v1/version": "static build metadata with no failure mode of its own",
 	}
 

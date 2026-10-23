@@ -40,7 +40,7 @@ Open `.env` and set every value below. Do not leave defaults in production.
 | `DATABASE_URL` | PostgreSQL connection string, e.g. `postgresql://trident:password@postgres:5432/trident` |
 | `REDIS_URL` | Redis connection string, e.g. `redis://redis:6379` |
 | `STELLAR_RPC_URL` | Soroban RPC endpoint for the chosen `NETWORK` — `https://soroban-testnet.stellar.org` for testnet; for mainnet a provider or self-hosted endpoint, see [Testnet vs. mainnet configuration](#testnet-vs-mainnet-configuration) |
-| `NETWORK` | One of `mainnet`, `testnet`, or `futurenet`; must match `STELLAR_RPC_URL` |
+| `NETWORK` | One of `mainnet` or `testnet` (`pubnet` is accepted as an alias for `mainnet` and normalised at startup); must match `STELLAR_RPC_URL` |
 | `POLL_INTERVAL_FLOOR_MS` | Shortest adaptive poll interval (ms), used while far behind the chain tip (default: `250`) |
 | `POLL_INTERVAL_CEILING_MS` | Longest adaptive poll interval (ms), used once caught up (default: `5000`) |
 | `INDEX_DIAGNOSTIC` | Set `false` in production (diagnostic events are high-volume) |
@@ -115,8 +115,8 @@ and consider a second endpoint for failover via `STELLAR_RPC_URLS` (see below).
 | `RPC_POOL_IDLE_TIMEOUT_MS` | How long an idle pooled connection is kept (default: `90000`) |
 | `RPC_POOL_MAX_IDLE_PER_HOST` | Idle keep-alive connections retained per RPC host (default: `8`) |
 | `RPC_TCP_KEEPALIVE_MS` | TCP keep-alive probe interval (default: `60000`) |
-| `RPC_FAILOVER_THRESHOLD` | Parsed but currently unused — see note below (default: `3`) |
-| `RPC_ENDPOINT_COOLDOWN_MS` | Parsed but currently unused — see note below (default: `30000`) |
+| `RPC_FAILOVER_THRESHOLD` | **Removed** — setting it is a startup error; use `RPC_BREAKER_FAILURE_THRESHOLD` |
+| `RPC_ENDPOINT_COOLDOWN_MS` | **Removed** — setting it is a startup error; use `RPC_BREAKER_COOLDOWN_MS` |
 | `RPC_BREAKER_FAILURE_THRESHOLD` | Consecutive RPC-layer poll failures before the circuit breaker opens (default: `5`) |
 | `RPC_BREAKER_COOLDOWN_MS` | How long the breaker stays open before allowing a probe poll (default: `30000`) |
 
@@ -125,13 +125,14 @@ indefinitely: the retry wrapper only reacts to returned errors, never to a call
 that never returns. Timeouts are classified retryable, so they engage backoff.
 
 **Note on `RPC_FAILOVER_THRESHOLD`/`RPC_ENDPOINT_COOLDOWN_MS`**: these two
-values are parsed into config but the cooldown-based endpoint pool that
-would read them (`crates/indexer/src/rpc/endpoints.rs`) is dead code. The
-indexer's actual failover is per-call health-scored routing
-(`crates/indexer/src/rpc/health.rs`), which has no concept of a parked
-endpoint or a cooldown window. Found while writing
-[`runbooks/rpc-provider-rotation.md`](runbooks/rpc-provider-rotation.md)
-(issue #684); fixing the gap itself is tracked separately.
+values were parsed into config but never read by the running indexer, so
+they no longer exist (issue #737): setting either is a hard startup error
+naming the effective knob. Failover is per-call health-scored routing with a
+sticky endpoint and a per-endpoint circuit breaker
+(`crates/indexer/src/rpc/health.rs`). An endpoint that fails
+`RPC_BREAKER_FAILURE_THRESHOLD` consecutive times is parked for
+`RPC_BREAKER_COOLDOWN_MS`, then probed again — so those two variables are
+what an operator tuning failover should set.
 
 See [`runbooks/rpc-provider-rotation.md`](runbooks/rpc-provider-rotation.md)
 for the tested procedure to change `STELLAR_RPC_URLS` on a running indexer
@@ -865,7 +866,7 @@ lasting change.
   `crates/indexer/src/health.rs`). These are also wired into `fly/indexer.toml`
   under the top-level `[checks]` section so Fly restarts the machine if
   readiness fails, not just if the TCP port stops accepting connections.
-- **Go API metrics**: `GET /metrics` on the public `trident-api` endpoint
+- **Go API metrics**: `GET /metrics` and `GET /metrics/legacy` on the internal `METRICS_PORT` (default 9091) — reachable on the 6PN only; the public `trident-api` endpoint does not serve `/metrics`
 - **Go API health check**: `GET /v1/ready` (used by Fly's HTTP service check
   in `fly/api.toml` to gate traffic routing). `/v1/ready` verifies
   Postgres/Redis/gRPC reachability, unlike `/v1/health`, which is a cheap
@@ -977,7 +978,7 @@ fly secrets set -a trident-indexer   OTEL_SAMPLING_RATIO=0.1
 
 ## Staging Environment {#staging}
 
-Issue #313: `.github/workflows/staging-deploy.yml` builds and deploys the
+Issue #313: `.github/workflows/deploy.yml` builds and deploys the
 `dev` branch to a staging environment automatically on every push to `dev`,
 then runs a post-deploy smoke test before staging is considered promotable.
 
@@ -997,7 +998,7 @@ then runs a post-deploy smoke test before staging is considered promotable.
 - **Failure alerting**: a failed deploy or smoke test posts to
   `STAGING_ALERT_WEBHOOK_URL` if configured.
 - **Env reference lint** (`scripts/check-env-reference.sh`, issue #312) is
-  wired into `ci.yml` as the `env-reference` job so config drift on any
+  wired into `ci.yml` as the `static` job so config drift on any
   branch — including `dev` — is caught before it reaches staging.
 
 ### What's best-effort / requires setup this environment couldn't provision
@@ -1010,8 +1011,8 @@ following require you to provision them once:
   kubeconfig scoped to the staging namespace), `STAGING_API_KEY`,
   `STAGING_DATABASE_URL` (when runner migrations are used), and
   `STAGING_ALERT_WEBHOOK_URL` (optional) are stored as encrypted secrets. The
-  kubeconfig and database URL must be set for `deploy-staging`/`smoke-test-staging`
-  to run at all. Without them, `check-staging-config` **fails** and names the
+  kubeconfig and database URL must be set for the `deploy`/`smoke-test` jobs
+  to run at all. Without them, `check-config` **fails** and names the
   missing credentials, so a deploy that did not happen never reports green
   (issue #395). To skip intentionally — a dry run with no staging environment
   provisioned — trigger the workflow via `workflow_dispatch` with
@@ -1040,8 +1041,8 @@ following require you to provision them once:
 
 ### Promotion path: staging -> prod (dev -> main)
 
-1. Changes land on `dev` via PR, triggering `staging-deploy.yml` automatically.
-2. Once staging's smoke test passes (green `smoke-test-staging` job), open a
+1. Changes land on `dev` via PR, triggering `deploy.yml` (staging) automatically.
+2. Once staging's smoke test passes (green `smoke-test` job), open a
    PR from `dev` into `main`.
 3. Merging into `main` does not itself deploy anything — production deploys
    are tag-triggered: `git tag vX.Y.Z && git push origin vX.Y.Z` runs

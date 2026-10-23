@@ -231,9 +231,11 @@ func newDB() (*sql.DB, error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	// database/sql dials lazily and re-dials after failures, so an unreachable
+	// database at boot is only a warning: the webhook handlers and worker keep
+	// working once Postgres comes back, without a restart.
 	if err := db.PingContext(ctx); err != nil {
-		_ = db.Close()
-		return nil, err
+		slog.Warn("webhook database not reachable at startup; will connect when it becomes available", "err", redactConnErr(err))
 	}
 	return db, nil
 }
@@ -347,11 +349,17 @@ func startWebhookCleanupJob(ctx context.Context, db *sql.DB) {
 	go func() {
 		ticker := time.NewTicker(1 * time.Hour)
 		defer ticker.Stop()
+		time.Sleep(180 * time.Second)
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				var locked bool
+				if err := db.QueryRowContext(ctx, "SELECT pg_try_advisory_lock(123456789, 104)").Scan(&locked); err != nil || !locked {
+					continue
+				}
+				defer func() { _, _ = db.ExecContext(context.Background(), "SELECT pg_advisory_unlock(123456789, 104)") }()
 				if _, err := db.ExecContext(ctx, `DELETE FROM webhook_deliveries WHERE delivered_at < NOW() - INTERVAL '7 days'`); err != nil {
 					slog.Warn("webhook cleanup failed", "err", err)
 				}
@@ -442,23 +450,32 @@ func processWebhookEvent(ctx context.Context, db *sql.DB, redisClient *redis.Cli
 		return err
 	}
 
-	// Issue #454: fan out deliveries for this event's subscriptions
-	// concurrently, bounded by globalDeliverySem, instead of one at a
-	// time — a single slow/hanging endpoint no longer delays every other
-	// subscriber matching the same event.
+	deliverToSubscriptions(ctx, db, redisClient, subs, event)
+	return nil
+}
+
+// deliverToSubscriptions fans out deliveries for one event concurrently
+// (issue #454), bounded by globalDeliverySem, so a single slow endpoint no
+// longer delays every other subscriber matching the same event.
+//
+// A subscription whose in-flight slot is held (another replica is still
+// delivering or retrying) is waited for, not skipped: skipping dropped the
+// event for that subscription for good (issue #746).
+func deliverToSubscriptions(ctx context.Context, db *sql.DB, redisClient *redis.Client, subs []webhookSubscription, event webhookEvent) {
 	var wg sync.WaitGroup
 	for _, sub := range subs {
-		if !tryAcquireSubscriptionSlot(ctx, redisClient, sub.ID) {
-			slog.Warn("skipping delivery: previous delivery for this subscription still in flight", "subscription_id", sub.ID)
-			metrics.WebhookDeliveriesTotal.WithLabelValues("skipped_in_flight").Inc()
-			continue
-		}
 		wg.Add(1)
-		globalDeliverySem <- struct{}{}
 		go func(sub webhookSubscription) {
 			defer wg.Done()
-			defer func() { <-globalDeliverySem }()
+			// Wait for the slot before taking a global delivery token so a
+			// busy subscription does not tie up capacity other subscriptions
+			// need.
+			if !waitForSubscriptionSlot(ctx, redisClient, sub.ID) {
+				return
+			}
 			defer releaseSubscriptionSlot(context.Background(), redisClient, sub.ID)
+			globalDeliverySem <- struct{}{}
+			defer func() { <-globalDeliverySem }()
 			// Counted around the delivery itself so the gauge reflects work
 			// actually in flight, not queue admission.
 			metrics.WebhookDeliveriesInFlight.Inc()
@@ -472,7 +489,6 @@ func processWebhookEvent(ctx context.Context, db *sql.DB, redisClient *redis.Cli
 		}(sub)
 	}
 	wg.Wait()
-	return nil
 }
 
 func deliverSubscriptionWithRetry(ctx context.Context, db *sql.DB, sub webhookSubscription, event webhookEvent) error {

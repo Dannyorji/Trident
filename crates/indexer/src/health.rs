@@ -14,7 +14,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
-pub async fn serve(addr: SocketAddr, db: PgPool, redis_url: String) {
+pub async fn serve(addr: SocketAddr, db: PgPool, redis_url: String, network: String) {
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
@@ -34,11 +34,17 @@ pub async fn serve(addr: SocketAddr, db: PgPool, redis_url: String) {
         };
         let db = db.clone();
         let redis_url = redis_url.clone();
-        tokio::spawn(handle_conn(stream, db, redis_url));
+        let network = network.clone();
+        tokio::spawn(handle_conn(stream, db, redis_url, network));
     }
 }
 
-async fn handle_conn(stream: tokio::net::TcpStream, db: PgPool, redis_url: String) {
+async fn handle_conn(
+    stream: tokio::net::TcpStream,
+    db: PgPool,
+    redis_url: String,
+    network: String,
+) {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
@@ -74,7 +80,7 @@ async fn handle_conn(stream: tokio::net::TcpStream, db: PgPool, redis_url: Strin
         // Admin endpoint: return recent dead-lettered (parse error) events
         // for operational inspection (issue #414).
         "/admin/dead-letter" => {
-            let (code, phrase, body) = dead_letter_summary(&db).await;
+            let (code, phrase, body) = dead_letter_summary(&db, &network).await;
             (code, phrase, "application/json", body)
         }
         _ => (404, "Not Found", "text/plain", "not found\n".into()),
@@ -96,20 +102,18 @@ async fn readyz(db: &PgPool, redis_url: &str) -> (u16, &'static str, String) {
     let db_ok = sqlx::query("SELECT 1").execute(db).await.is_ok();
     let redis_ok = check_redis(redis_url).await;
 
-    if db_ok && redis_ok {
-        (200, "OK", "ready\n".into())
+    if db_ok {
+        if redis_ok {
+            (200, "OK", "ready\n".into())
+        } else {
+            // Redis is not required for ingestion (issue #732) - report degraded but ready
+            (200, "OK", "ready (redis degraded)\n".into())
+        }
     } else {
-        let mut reasons = Vec::new();
-        if !db_ok {
-            reasons.push("db");
-        }
-        if !redis_ok {
-            reasons.push("redis");
-        }
         (
             503,
             "Service Unavailable",
-            format!("not ready: {}\n", reasons.join(", ")),
+            "not ready: db\n".into(),
         )
     }
 }
@@ -133,16 +137,18 @@ async fn check_redis(redis_url: &str) -> bool {
 /// Generic over the executor (rather than `&PgPool`) so tests can drive it
 /// against a transaction they always roll back, instead of mutating the
 /// shared test database directly.
-async fn dead_letter_summary<'e, E>(db: E) -> (u16, &'static str, String)
+async fn dead_letter_summary<'e, E>(db: E, network: &str) -> (u16, &'static str, String)
 where
     E: sqlx::PgExecutor<'e>,
 {
     match sqlx::query_as::<_, DeadLetterRow>(
         r#"SELECT id, ledger_sequence, event_index, error_message, occurred_at
            FROM parse_errors
+           WHERE network = $1
            ORDER BY occurred_at DESC
            LIMIT 20"#,
     )
+    .bind(network)
     .fetch_all(db)
     .await
     {
@@ -207,15 +213,15 @@ mod tests {
 
         let ledger_sequence = 9_999_001i64;
         sqlx::query(
-            "INSERT INTO parse_errors (ledger_sequence, event_index, raw_payload, error_message)
-             VALUES ($1, 0, 'raw-payload', 'boom')",
+            "INSERT INTO parse_errors (ledger_sequence, event_index, raw_payload, error_message, network)
+             VALUES ($1, 0, 'raw-payload', 'boom', 'testnet')",
         )
         .bind(ledger_sequence)
         .execute(&pool)
         .await
         .expect("seed parse_errors row");
 
-        let (code, phrase, body) = dead_letter_summary(&pool).await;
+        let (code, phrase, body) = dead_letter_summary(&pool, "testnet").await;
 
         assert_eq!(
             code, 200,
@@ -271,7 +277,7 @@ mod tests {
             .await
             .expect("cleanup failed");
 
-        let (code, _, body) = dead_letter_summary(&mut *tx).await;
+        let (code, _, body) = dead_letter_summary(&mut *tx, "testnet").await;
 
         assert_eq!(code, 200);
         assert_eq!(body, "[]");

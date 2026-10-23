@@ -248,7 +248,7 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 			// debugging "which build is live?" have a key; anonymous callers
 			// do not need one. /v1/ready already covers unauthenticated
 			// liveness.
-			if path == "/v1/health" || path == "/v1/ready" || path == "/metrics" ||
+			if path == "/v1/health" || path == "/v1/ready" ||
 				path == "/v1/stats/indexer" {
 				next.ServeHTTP(w, r)
 				return

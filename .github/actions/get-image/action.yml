@@ -1,0 +1,53 @@
+name: Get image
+description: >-
+  Makes a Trident image available in the local Docker daemon. Reuses the image
+  integration.yml already built for this commit (shared as an artifact) when
+  it can; otherwise builds it. The build shares integration.yml's per-image gha
+  cache scope, so even the fallback is mostly cache hits.
+
+inputs:
+  name:
+    description: Image name as used by integration.yml's artifacts (go-api, grpc-api, indexer, migrate).
+    required: true
+  file:
+    description: Dockerfile path, used only when the image has to be built here.
+    required: true
+  tag:
+    description: Local image tag (trident-<name>:ci).
+    required: true
+  sha:
+    description: Commit whose integration run to take the image from.
+    required: true
+  reuse:
+    description: Try to reuse the integration.yml artifact first ("true"/"false"). Scheduled and manual runs have no integration run to reuse.
+    default: "true"
+  token:
+    description: Token with `actions: read`.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Reuse image built by integration.yml
+      id: fetch
+      if: inputs.reuse == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        IMAGE_NAME: ${{ inputs.name }}
+        COMMIT_SHA: ${{ inputs.sha }}
+      run: |
+        if bash .github/scripts/fetch-image-artifact.sh "$IMAGE_NAME" "$COMMIT_SHA"; then
+          echo "found=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "found=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Build image (loaded locally, not pushed)
+      if: steps.fetch.outputs.found != 'true'
+      uses: ./.github/actions/build-image
+      with:
+        file: ${{ inputs.file }}
+        tags: ${{ inputs.tag }}
+        scope: ${{ inputs.name }}
+        load: "true"

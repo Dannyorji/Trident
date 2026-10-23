@@ -66,4 +66,43 @@ if [ "${#missing[@]}" -gt 0 ]; then
   exit 1
 fi
 
+# ── Effective-behaviour check (issue #737) ────────────────────────────────
+# Documenting a knob is not enough: it must actually change behaviour. Every
+# field on `Config` originates in an env var, and a field read only inside
+# config.rs (parsed, then logged) was dead — that is exactly how
+# MAX_REORG_REWIND_DEPTH, RPC_FAILOVER_THRESHOLD and RPC_ENDPOINT_COOLDOWN_MS
+# shipped: validated, logged, and never read by the running indexer. Require
+# every field to be *read* (`.<field>`) somewhere outside config.rs.
+#
+# `.field` rather than a bare name on purpose: struct literals (including the
+# test fixtures that populate every field) would otherwise make a dead field
+# look used.
+config_fields=$(awk '/^pub struct Config \{/{inside=1; next} inside && /^\}/{exit} inside' \
+  crates/indexer/src/config.rs \
+  | grep -oE '^    pub [a-z_0-9]+:' | sed -E 's/^    pub //; s/:$//')
+
+if [ -z "$config_fields" ]; then
+  echo "check-env-reference: could not read Config fields from crates/indexer/src/config.rs" >&2
+  exit 1
+fi
+
+dead_fields=()
+for field in $config_fields; do
+  if ! grep -rqE "\.${field}\b" crates/indexer/src --include='*.rs' \
+    --exclude='config.rs' 2>/dev/null; then
+    dead_fields+=("$field")
+  fi
+done
+
+if [ "${#dead_fields[@]}" -gt 0 ]; then
+  echo "These Config fields (env-var knobs) are never read outside config.rs," >&2
+  echo "so setting them changes nothing at runtime:" >&2
+  printf '  %s\n' "${dead_fields[@]}" >&2
+  echo "" >&2
+  echo "Wire the knob into the running indexer, or remove the field and fail" >&2
+  echo "startup if the env var is set (see issue #737)." >&2
+  exit 1
+fi
+
 echo "OK: every env var read by indexer/backfill/grpc-api/go-api is documented in $DOC"
+echo "OK: every Config field is read outside config.rs (no dead knobs)"

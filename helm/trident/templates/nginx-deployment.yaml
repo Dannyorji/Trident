@@ -17,6 +17,11 @@ data:
       }
       server {
         listen 80;
+        # Prometheus metrics are scraped from the go-api's internal metrics
+        # port inside the cluster; never proxy them publicly.
+        location ~ ^/metrics(/|$) {
+          return 404;
+        }
         location / {
           proxy_pass         http://go_api;
           proxy_set_header   Host $host;

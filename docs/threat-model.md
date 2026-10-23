@@ -46,12 +46,15 @@ Every place an external actor's input reaches the system:
   and, longer-term, by cross-validating against multiple endpoints
   (`RPC_FAILOVER_THRESHOLD` today provides failover, not cross-validation).
 - **Internal-only endpoints** — `GET /internal/status` (process/dependency
-  health with more detail than the public `/v1/health`) and `GET /metrics`
-  (Prometheus text exposition). Both are mounted on the same mux as the
-  public routes in `main.go` and are **not** protected by network policy at
-  the application layer today — they rely on the deployment topology (nginx
-  only proxying `/`, `/ws`, `/v1/events/stream`; see `docker/nginx/nginx.conf`)
-  keeping them off the public network. `PPROF_ENABLED` (see
+  health with more detail than the public `/v1/health`) and the Prometheus
+  metrics. `/internal/status` is mounted on the same mux as the public routes
+  in `main.go` and is **not** protected by network policy at the application
+  layer today — it relies on the deployment topology (nginx denying
+  `/internal/`; see `docker/nginx/nginx.conf`) keeping it off the public
+  network. Metrics are not on the public mux at all: `GET /metrics` and
+  `GET /metrics/legacy` are served only by the separate `METRICS_PORT` server
+  (default 9091), and nginx also returns 404 for `/metrics` as defence in
+  depth. `PPROF_ENABLED` (see
   `services/api/internal/profiling/profiling.go`) is opt-in and, when
   enabled, must never be exposed publicly — it allows arbitrary memory/goroutine
   introspection and CPU profiling of the live process.
@@ -121,7 +124,7 @@ Key implications:
 | 9 | Response-side injection / clickjacking / MIME sniffing | Standard security headers (`X-Content-Type-Options`, `X-Frame-Options`, HSTS in production, `Referrer-Policy`) | `services/api/middleware/security.go` |
 | 10 | No audit trail for sensitive operations | Async, batched audit log writer capturing admin/API-key operations | `services/api/middleware/audit.go` |
 | 11 | Known-vulnerable dependencies shipping in a release | SBOM generation + image scanning (trivy) and dependency audits (`cargo audit`, `govulncheck`, `npm audit`, `pip-audit`) gating CI on push/PR to `dev`/`main` plus a weekly cron | `.github/workflows/security-scan.yml`, `docs/security-triage.md` (#311) |
-| 12 | Leaked secrets in commits/history | Dedicated secrets-scanning workflow | `.github/workflows/secrets-scan.yml` |
+| 12 | Leaked secrets in commits/history | Dedicated secrets-scanning workflow | `.github/workflows/security.yml` |
 | 13 | Connection-string credentials leaking into logs on a DB/Redis error | DSN userinfo redaction applied to logged connection errors | `services/api/main.go` (`redactConnErr`, issue #305) |
 | 14 | Malicious or compromised Soroban RPC endpoint feeding fabricated event data | RPC failover across configured endpoints (`RPC_FAILOVER_THRESHOLD`), defensive parsing of RPC responses; cross-endpoint response validation is not yet implemented (see "Open gaps" below) | `crates/indexer` |
 | 15 | SSRF via a registered webhook target URL | Not yet enforced at the application layer — see "Open gaps" | `services/api/webhooks.go` |

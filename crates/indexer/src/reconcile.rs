@@ -385,11 +385,12 @@ impl Reconciler {
 
         let indexed: Vec<(i64, i64)> = sqlx::query_as(
             "SELECT ledger_sequence, COUNT(*) FROM soroban_events
-             WHERE ledger_sequence BETWEEN $1 AND $2
+             WHERE ledger_sequence BETWEEN $1 AND $2 AND network = $3
              GROUP BY ledger_sequence",
         )
         .bind(window_start as i64)
         .bind(window_end as i64)
+        .bind(&self.network)
         .fetch_all(&self.db)
         .await
         .map_err(|e| {
@@ -401,11 +402,12 @@ impl Reconciler {
 
         let parse_errors: Vec<(i64, i64)> = sqlx::query_as(
             "SELECT ledger_sequence, COUNT(*) FROM parse_errors
-             WHERE ledger_sequence BETWEEN $1 AND $2
+             WHERE ledger_sequence BETWEEN $1 AND $2 AND network = $3
              GROUP BY ledger_sequence",
         )
         .bind(window_start as i64)
         .bind(window_end as i64)
+        .bind(&self.network)
         .fetch_all(&self.db)
         .await
         .map_err(|e| {
@@ -708,6 +710,7 @@ mod tests {
                 pool_max_idle_per_host: 8,
                 tcp_keepalive: std::time::Duration::from_secs(60),
                 max_calls_per_sec: 50,
+                ..crate::rpc::RpcHttpSettings::default()
             },
         )
         .expect("rpc client");
@@ -829,6 +832,7 @@ mod tests {
                 pool_max_idle_per_host: 8,
                 tcp_keepalive: std::time::Duration::from_secs(60),
                 max_calls_per_sec: 50,
+                ..crate::rpc::RpcHttpSettings::default()
             },
         )
         .expect("rpc client");

@@ -1,0 +1,830 @@
+name: Integration
+
+# Heavy checks that need built images or live services: the Docker image
+# build (done once, shared as artifacts), Rust integration tests against real
+# Postgres/Redis, the full-stack E2E + OpenAPI contract test, the on-chain
+# contract-event E2E, quickstart verification and coverage.
+#
+# `integration-ok` is the aggregate gate: it fails when any job here failed or
+# was cancelled, and treats path-filtered (skipped) jobs as success. A pull
+# request that touches only docs/ or the explorer skips the whole Rust/Go
+# build, E2E and coverage set; one that touches crates/ or services/ runs it.
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+
+concurrency:
+  group: integration-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      images: ${{ steps.f.outputs.images == 'true' || github.event_name != 'pull_request' }}
+      rust_integration: ${{ steps.f.outputs.rust_integration == 'true' || github.event_name != 'pull_request' }}
+      contract_events: ${{ steps.f.outputs.contract_events == 'true' || github.event_name != 'pull_request' }}
+      quickstart: ${{ steps.f.outputs.quickstart == 'true' || github.event_name != 'pull_request' }}
+      coverage: ${{ steps.f.outputs.coverage == 'true' || github.event_name != 'pull_request' }}
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      # Pull requests only run what their diff can affect. Pushes to dev/main
+      # (and anything that is not a PR) run everything: the outputs above are
+      # forced true when the event is not a pull_request. Filters live in
+      # .github/path-filters.yml, shared with integration.yml and security.yml.
+      - id: f
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        with:
+          filters: .github/path-filters.yml
+
+  # ---------------------------------------------------------------------------
+  # Docker -- build every image ONCE and share it as an artifact.
+  #
+  # e2e and e2e-contract-events below load these instead of rebuilding, and
+  # security.yml scans these same images (scripts/fetch-image-artifact.sh), so
+  # an image is compiled once per commit rather than once per workflow.
+  # Each image has its own gha cache scope: without one, the gha backend puts
+  # every build in the workflow into a single "buildkit" scope and the builds
+  # overwrite each other's cache blobs.
+  # ---------------------------------------------------------------------------
+  build-images:
+    name: Build image (${{ matrix.name }})
+    needs: changes
+    if: needs.changes.outputs.images == 'true' || needs.changes.outputs.contract_events == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: go-api
+            file: services/api/Dockerfile
+            tag: trident-go-api:ci
+          - name: grpc-api
+            file: crates/api/Dockerfile
+            tag: trident-grpc-api:ci
+          - name: indexer
+            file: crates/indexer/Dockerfile
+            tag: trident-indexer:ci
+          - name: migrate
+            file: database/Dockerfile
+            tag: trident-migrate:ci
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Build image
+        uses: ./.github/actions/build-image
+        with:
+          file: ${{ matrix.file }}
+          tags: ${{ matrix.tag }}
+          scope: ${{ matrix.name }}
+          outputs: type=docker,dest=${{ runner.temp }}/image.tar
+
+      - name: Upload image
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: image-${{ matrix.name }}
+          path: ${{ runner.temp }}/image.tar
+          retention-days: 1
+          compression-level: 1
+
+  # ---------------------------------------------------------------------------
+  # Rust integration tests — real Postgres + Redis
+  # Runs integration tests that are silently skipped when TEST_DATABASE_URL
+  # and TEST_REDIS_URL are absent.
+  # ---------------------------------------------------------------------------
+  rust-integration:
+    name: Rust integration tests
+    needs: changes
+    if: needs.changes.outputs.rust_integration == 'true'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: trident
+          POSTGRES_DB: trident_test
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      # Shares the sccache object cache and rust-cache scope with ci.yml's
+      # `rust` job (same workspace, same Cargo.lock).
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          shared-key: rust-workspace
+
+      - name: Set up Go
+        uses: ./.github/actions/setup-go
+        with:
+          cache-dependency-path: services/api/go.sum
+
+      # Apply the real migration chain (0001..latest) — the same artifact CI's
+      # `rust` job and production apply. This validates the migrations as an
+      # ordered, idempotent chain and can never silently depend on a stale
+      # database/schema.sql mirror (which had drifted from migrations).
+      #
+      # `*.down.sql` rollback files (issue #602) are excluded: this loop applies
+      # the forward chain only, the same set `sqlx migrate run` applies. A
+      # down migration is only ever run deliberately via `sqlx migrate revert`.
+      - name: Apply database migrations
+        env:
+          PGPASSWORD: trident
+        run: |
+          set -euo pipefail
+          for f in database/migrations/*.sql; do
+            case "$f" in
+              *.down.sql) continue ;;
+            esac
+            echo "Applying $f"
+            psql -v ON_ERROR_STOP=1 -h localhost -U postgres -d trident_test -f "$f"
+          done
+
+      - name: Run integration tests
+        env:
+          DATABASE_URL: postgres://postgres:trident@localhost:5432/trident_test
+          TEST_DATABASE_URL: postgres://postgres:trident@localhost:5432/trident_test
+          TEST_REDIS_URL: redis://localhost:6379
+          # Turns a missing TEST_DATABASE_URL/TEST_REDIS_URL into a hard test
+          # failure instead of a silent skip, so a misconfigured integration
+          # job cannot report green without running the DB/Redis tests.
+          REQUIRE_TEST_SERVICES: "1"
+          CI: "true"
+        run: cargo test --all -- --include-ignored --test-threads=1
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
+
+  # ---------------------------------------------------------------------------
+  # E2E smoke test — full-stack Docker Compose + curl assertions
+  #
+  # Loads the images produced by build-images and starts the complete four-service stack
+  # (Postgres, Redis, Rust gRPC API, Go REST API), waits for health checks,
+  # then asserts:
+  #   1. GET /v1/health   → 200 {"status":"ok"}
+  #   2. GET /v1/events   → 200 with a valid JSON body
+  #
+  # A fixed test API key is pre-seeded into Postgres by docker/ci-seed.sql
+  # and the corresponding HMAC-SHA256 digest is set in .env.ci as
+  # API_KEY_HASHES. The raw key is hardcoded for CI only — it is documented
+  # in .env.ci as "do not use outside CI".
+  #
+  # On any failure the step "Dump service logs" captures all container output
+  # so engineers can diagnose failures without re-running the job.
+  # ---------------------------------------------------------------------------
+  e2e:
+    name: E2E and OpenAPI contract test
+    needs: [changes, build-images]
+    if: needs.changes.outputs.images == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Set up Go
+        uses: ./.github/actions/setup-go
+        with:
+          cache-dependency-path: services/api/go.sum
+
+      - name: Download images
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          pattern: image-*
+          path: ${{ runner.temp }}/images
+
+      - name: Load images
+        run: |
+          for name in go-api grpc-api indexer; do
+            docker load -i "${RUNNER_TEMP}/images/image-${name}/image.tar"
+          done
+
+      # docker/docker-compose.ci.yml pins each app service to the :ci tag the
+      # build-images job produced, so --no-build uses exactly those images.
+      - name: Start full stack
+        run: |
+          docker compose \
+            -f docker/docker-compose.yml \
+            -f docker/docker-compose.ci.yml \
+            --env-file .env.ci \
+            --profile pgbouncer \
+            up -d --no-build
+
+      - name: Wait for Go API to become healthy
+        uses: ./.github/actions/wait-for-api
+
+      # Without this the job reports only curl's exit code, which says nothing
+      # about which service failed to come up. Runs only on failure.
+      - name: Dump stack state and logs on failure
+        if: failure()
+        uses: ./.github/actions/stack-logs
+        with:
+          profile: pgbouncer
+          services: postgres redis pgbouncer grpc-api indexer api
+
+      - name: Assert GET /v1/health returns status ok
+        run: |
+          RESPONSE=$(curl --silent --fail http://localhost:3000/v1/health)
+          echo "Response: $RESPONSE"
+
+          STATUS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")
+          if [ "$STATUS" != "ok" ]; then
+            echo "ERROR: expected status=ok, got status=$STATUS"
+            exit 1
+          fi
+          echo "✓ /v1/health returned {\"status\": \"ok\"}"
+
+      - name: Assert GET /v1/events returns 200 with JSON body
+        env:
+          # This raw key is pre-seeded in Postgres via docker/ci-seed.sql and
+          # its HMAC-SHA256 digest is in .env.ci as API_KEY_HASHES.
+          # DO NOT use this key outside CI.
+          CI_API_KEY: ci-test-api-key-do-not-use-in-production
+        run: |
+          RESPONSE=$(curl \
+            --silent \
+            --fail \
+            --max-time 10 \
+            -H "X-API-Key: ${CI_API_KEY}" \
+            "http://localhost:3000/v1/events?limit=1")
+          echo "Response: $RESPONSE"
+
+          # Validate the response is valid JSON — python3 will exit non-zero if not.
+          echo "$RESPONSE" | python3 -c "import sys,json; data=json.load(sys.stdin); print('✓ /v1/events returned valid JSON')"
+
+      - name: Verify alert metrics exist (issue #393)
+        run: |
+          chmod +x scripts/verify-alert-metrics.sh
+          ./scripts/verify-alert-metrics.sh \
+            http://localhost:9091/metrics \
+            http://localhost:9090/metrics \
+            http://localhost:9091/metrics/legacy
+
+      - name: Validate every documented operation against OpenAPI
+        working-directory: services/api
+        env:
+          CONTRACTTEST_BASE_URL: http://localhost:3000
+          CONTRACTTEST_API_KEY: ci-test-api-key-do-not-use-in-production
+          CONTRACTTEST_ADMIN_KEY: ci-admin-key-do-not-use-in-production
+          CONTRACTTEST_REDIS_URL: redis://localhost:6380
+        run: go test ./internal/contracttest -run TestLiveOpenAPIContract -count=1 -v
+
+      - name: Dump service logs
+        # Always run so logs are available for both passing and failing runs.
+        if: always()
+        run: |
+          echo "=== docker compose ps ==="
+          docker compose \
+            -f docker/docker-compose.yml \
+            -f docker/docker-compose.ci.yml \
+            --env-file .env.ci \
+            --profile pgbouncer \
+            ps
+
+          echo "=== Service logs ==="
+          docker compose \
+            -f docker/docker-compose.yml \
+            -f docker/docker-compose.ci.yml \
+            --env-file .env.ci \
+            --profile pgbouncer \
+            logs --no-color --timestamps
+
+      - name: Tear down stack
+        # Always run to avoid leaving containers behind if a test step fails.
+        if: always()
+        run: |
+          docker compose \
+            -f docker/docker-compose.yml \
+            -f docker/docker-compose.ci.yml \
+            --env-file .env.ci \
+            --profile pgbouncer \
+            down -v --remove-orphans
+
+  # ---------------------------------------------------------------------------
+  # E2E contract events — deploy a real contract, emit an event, assert it is
+  # indexed (issue #268).
+  #
+  # Unlike the `e2e` smoke test above (which only checks response shape), this
+  # job proves the actual pipeline: on-chain event -> indexer -> DB -> API.
+  #
+  #   1. Start a local Soroban network (stellar/quickstart, standalone mode).
+  #   2. Deploy the reference token contract (issue #258), initialize it, and
+  #      mint to a second account — mint publishes a decodable SEP-41 event.
+  #   3. Start the full stack pointed at the local network instead of testnet.
+  #   4. Poll GET /v1/events until the mint event appears, and assert its
+  #      decoded topics/data match what was invoked.
+  #
+  # Runs as its own job (not part of `e2e`) so a slow local-network boot
+  # doesn't hold up the fast checks; `needs: build-images` because it runs
+  # the application images that job produced.
+  # ---------------------------------------------------------------------------
+  e2e-contract-events:
+    name: E2E contract events
+    needs: [changes, build-images]
+    if: needs.changes.outputs.contract_events == 'true'
+    runs-on: ubuntu-latest
+    env:
+      STELLAR_CLI_VERSION: "25.2.0"
+      LOCAL_RPC_URL: http://localhost:8000/rpc
+      LOCAL_NETWORK_PASSPHRASE: "Standalone Network ; February 2017"
+
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      # Same cache scope as ci.yml's `contracts` job, so this reuses its
+      # compiled objects for the same token crate/target.
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          targets: wasm32v1-none
+          workspaces: contracts
+          shared-key: contracts-wasm
+
+      - name: Build the reference token contract
+        working-directory: contracts
+        run: cargo build --release --target wasm32v1-none -p trident-reference-token
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
+
+      - name: Install the stellar CLI
+        run: |
+          set -euo pipefail
+          curl -sSfL \
+            "https://github.com/stellar/stellar-cli/releases/download/v${STELLAR_CLI_VERSION}/stellar-cli-${STELLAR_CLI_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar xz -C /usr/local/bin stellar
+          stellar --version
+
+      - name: Start local Soroban network
+        run: |
+          docker run -d --name stellar-quickstart -p 8000:8000 \
+            stellar/quickstart:testing --local --enable rpc,horizon
+
+      - name: Wait for the local network to become healthy
+        run: |
+          echo "Waiting for $LOCAL_RPC_URL to report healthy..."
+          for i in $(seq 1 60); do
+            if curl -sSf -X POST "$LOCAL_RPC_URL" \
+                -H 'Content-Type: application/json' \
+                -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' \
+                | grep -q '"status":"healthy"'; then
+              echo "Local network is healthy."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Local network did not become healthy in time." >&2
+          docker logs stellar-quickstart || true
+          exit 1
+
+      - name: Wait for friendbot to become available
+        run: |
+          echo "Waiting for friendbot to start funding accounts..."
+          for i in $(seq 1 60); do
+            status=$(curl -sS -o /dev/null -w '%{http_code}' "http://localhost:8000/friendbot?addr=GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF")
+            if [ "$status" = "200" ] || [ "$status" = "400" ]; then
+              echo "Friendbot is ready (status $status)."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Friendbot did not become ready in time." >&2
+          docker logs stellar-quickstart || true
+          exit 1
+
+      - name: Deploy and invoke the reference token contract
+        id: deploy
+        run: |
+          set -euo pipefail
+          stellar network add local \
+            --rpc-url "$LOCAL_RPC_URL" \
+            --network-passphrase "$LOCAL_NETWORK_PASSPHRASE" \
+            || true
+
+          fund_with_retry() {
+            local key_name="$1"
+            stellar keys generate "$key_name" --network local
+            for i in $(seq 1 30); do
+              if stellar keys fund "$key_name" --network local; then
+                return 0
+              fi
+              echo "Funding $key_name failed (attempt $i/30), retrying..." >&2
+              sleep 2
+            done
+            echo "Failed to fund $key_name after retries." >&2
+            return 1
+          }
+
+          fund_with_retry admin
+          fund_with_retry recipient
+          ADMIN_ADDR=$(stellar keys address admin)
+          RECIPIENT_ADDR=$(stellar keys address recipient)
+
+          CONTRACT_ID=$(stellar contract deploy \
+            --wasm contracts/target/wasm32v1-none/release/trident_reference_token.wasm \
+            --source admin \
+            --network local)
+          echo "contract_id=$CONTRACT_ID" >> "$GITHUB_OUTPUT"
+
+          stellar contract invoke \
+            --id "$CONTRACT_ID" --source admin --network local \
+            -- initialize --admin "$ADMIN_ADDR" --decimal 7 \
+                --name "E2E Token" --symbol E2E
+
+          # The mint call is what the E2E assertion below waits for: it
+          # publishes a `mint` event with topics (admin, recipient) and an
+          # i128 amount body, decoded by
+          # crates/indexer/src/parser/token_events.rs.
+          stellar contract invoke \
+            --id "$CONTRACT_ID" --source admin --network local \
+            -- mint --to "$RECIPIENT_ADDR" --amount 4200000
+
+          echo "recipient_addr=$RECIPIENT_ADDR" >> "$GITHUB_OUTPUT"
+
+      - name: Download images
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          pattern: image-*
+          path: ${{ runner.temp }}/images
+
+      - name: Load images
+        run: |
+          for name in go-api grpc-api indexer; do
+            docker load -i "${RUNNER_TEMP}/images/image-${name}/image.tar"
+          done
+
+      - name: Start the full stack against the local network
+        run: |
+          docker compose \
+            -f docker/docker-compose.yml \
+            -f docker/docker-compose.ci.yml \
+            -f docker/docker-compose.e2e.yml \
+            --env-file .env.ci \
+            up -d --no-build
+
+      - name: Wait for Go API to become healthy
+        uses: ./.github/actions/wait-for-api
+
+      # Same rationale as the smoke-test job: curl's exit code alone does not
+      # identify which service failed to start.
+      - name: Dump stack state and logs on failure
+        if: failure()
+        uses: ./.github/actions/stack-logs
+        with:
+          compose-files: docker/docker-compose.yml docker/docker-compose.ci.yml docker/docker-compose.e2e.yml
+
+      - name: Poll /v1/events for the decoded mint event
+        env:
+          CI_API_KEY: ci-test-api-key-do-not-use-in-production
+          CONTRACT_ID: ${{ steps.deploy.outputs.contract_id }}
+          RECIPIENT_ADDR: ${{ steps.deploy.outputs.recipient_addr }}
+        run: |
+          set -euo pipefail
+          echo "Waiting for the mint event to be indexed (contract $CONTRACT_ID)..."
+          for i in $(seq 1 30); do
+            RESPONSE=$(curl -sS --fail \
+              -H "X-API-Key: ${CI_API_KEY}" \
+              "http://localhost:3000/v1/events?contractId=${CONTRACT_ID}&limit=10") || RESPONSE=""
+
+            if echo "$RESPONSE" | python3 .github/scripts/assert_mint_event.py "$RECIPIENT_ADDR"; then
+              echo "✓ mint event indexed and decoded correctly"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Mint event was not indexed within the bounded wait." >&2
+          exit 1
+
+      - name: Dump service logs
+        if: always()
+        run: |
+          echo "=== quickstart logs ==="
+          docker logs stellar-quickstart || true
+          echo "=== docker compose ps ==="
+          docker compose \
+            -f docker/docker-compose.yml \
+            -f docker/docker-compose.ci.yml \
+            -f docker/docker-compose.e2e.yml \
+            --env-file .env.ci \
+            ps
+          echo "=== Service logs ==="
+          docker compose \
+            -f docker/docker-compose.yml \
+            -f docker/docker-compose.ci.yml \
+            -f docker/docker-compose.e2e.yml \
+            --env-file .env.ci \
+            logs --no-color --timestamps
+
+      - name: Tear down
+        if: always()
+        run: |
+          docker compose \
+            -f docker/docker-compose.yml \
+            -f docker/docker-compose.ci.yml \
+            -f docker/docker-compose.e2e.yml \
+            --env-file .env.ci \
+            down -v --remove-orphans
+          docker rm -f stellar-quickstart || true
+
+  # ---------------------------------------------------------------------------
+  # Quickstart — the documented sample type-checks against the built SDK
+  # ---------------------------------------------------------------------------
+  verify-quickstart:
+    name: Verify quickstart
+    needs: changes
+    if: needs.changes.outputs.quickstart == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - name: Set up Node.js
+        uses: ./.github/actions/setup-node
+      # The sample imports @trident-indexer/sdk, so the SDK's declarations
+      # must exist before it can be type-checked. Building it here means the
+      # check verifies the sample against the SDK's real surface rather than
+      # just parsing it.
+      - name: Build the TypeScript SDK
+        working-directory: sdk/typescript
+        run: |
+          npm ci
+          npm run build
+
+      - name: Validate Quickstart Code Samples
+        working-directory: docs/site/examples
+        run: |
+          echo "Type-checking the quickstart sample against the SDK..."
+          # -p typescript, not a bare `npx tsc`: npx resolves `tsc` to the
+          # unrelated, abandoned `tsc@2.0.4` package, which prints "This is
+          # not the tsc command you are looking for" and exits 1.
+          #
+          # tsconfig.json here maps @trident-indexer/sdk to the declarations
+          # built in the previous step and sets an ES2020 target, so the
+          # sample is checked against the SDK's real surface (the default ES5
+          # target has no Promise, so every async sample failed to compile).
+          npx -y -p typescript@5 tsc --noEmit -p tsconfig.json
+
+  # ---------------------------------------------------------------------------
+  # Coverage — collect for Rust, Go, and the TS/Python SDKs, publish a PR
+  # summary, and enforce a floor on MVP-critical packages (issue #325).
+  #
+  # Thresholds are set from *measured* baselines, not aspiration: a floor above
+  # today's number turns the very next merge red for a reason unrelated to that
+  # merge. Each floor below sits at or just under the figure the package
+  # actually reports, so it catches regression without blocking work. Ratchet
+  # them upward deliberately as suites grow — that is the point of the gate.
+  #
+  # Scope is deliberately "critical packages", not the whole tree, per the
+  # issue's explicit non-goal of a repo-wide coverage mandate.
+  # ---------------------------------------------------------------------------
+  coverage:
+    name: Coverage
+    needs: changes
+    if: needs.changes.outputs.coverage == 'true'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: trident
+          POSTGRES_DB: trident_test
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      # --- Rust ------------------------------------------------------------
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          components: llvm-tools-preview
+          shared-key: rust-workspace
+
+      # cargo-llvm-cov, per the issue. (Not tarpaulin: llvm-cov uses the
+      # compiler's own instrumentation, so it reports the same regions rustc
+      # sees rather than a ptrace approximation.)
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@daa3c1f1f9a9d46f686d9fc2f65773d0c293688b # v2.44.68
+        with:
+          tool: cargo-llvm-cov
+
+      # `*.down.sql` rollback files (issue #602) are excluded: this loop applies
+      # the forward chain only, the same set `sqlx migrate run` applies.
+      - name: Apply database migrations
+        env:
+          PGPASSWORD: trident
+        run: |
+          set -euo pipefail
+          for f in database/migrations/*.sql; do
+            case "$f" in
+              *.down.sql) continue ;;
+            esac
+            psql -v ON_ERROR_STOP=1 -h localhost -U postgres -d trident_test -f "$f"
+          done
+
+      - name: Rust coverage
+        env:
+          DATABASE_URL: postgres://postgres:trident@localhost:5432/trident_test
+          TEST_DATABASE_URL: postgres://postgres:trident@localhost:5432/trident_test
+          TEST_REDIS_URL: redis://localhost:6379
+          REQUIRE_TEST_SERVICES: "1"
+          CI: "true"
+        run: |
+          cargo llvm-cov --workspace --lcov --output-path lcov.info -- --test-threads=1
+          cargo llvm-cov report --summary-only | tee rust-coverage.txt
+
+      # Report-only for now. The Rust floor is deliberately not enforced in
+      # this change: unlike Go, no baseline had been measured before this job
+      # existed, and picking a number without one is exactly the guesswork the
+      # Go gate's own comment warns against. The first scheduled run publishes
+      # the real figure; enforce from that, in a follow-up.
+      - name: Rust coverage summary (report only)
+        run: |
+          echo "### Rust coverage" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat rust-coverage.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      # --- Go --------------------------------------------------------------
+      - name: Set up Go
+        uses: ./.github/actions/setup-go
+        with:
+          cache-dependency-path: services/api/go.sum
+
+      # Issue #516: the API-key lifecycle tests (issue/rotate/revoke against a
+      # real Redis-cached auth path) skip themselves unless these are set —
+      # this job is the only one with Postgres and Redis attached, so without
+      # them the lifecycle suite silently never runs anywhere in CI.
+      # REQUIRE_TEST_SERVICES turns a missing service into a hard failure
+      # rather than a green run that tested nothing.
+      - name: Go coverage
+        working-directory: services/api
+        env:
+          DATABASE_URL: postgres://postgres:trident@localhost:5432/trident_test
+          TEST_DATABASE_URL: postgres://postgres:trident@localhost:5432/trident_test
+          TEST_REDIS_URL: redis://localhost:6379
+          REQUIRE_TEST_SERVICES: "1"
+          CI: "true"
+        run: |
+          go test ./... -coverprofile=coverage.out
+          go tool cover -func=coverage.out | tee go-coverage.txt
+
+      # Per-package floors on the MVP-critical paths the issue names (handlers,
+      # middleware, cursor). Baselines measured on this commit: handlers 45.5%,
+      # middleware 69.6%, cursor 94.4%. Floors sit just below each so normal
+      # variation does not flap the build.
+      - name: Enforce Go critical-package floors
+        working-directory: services/api
+        env:
+          DATABASE_URL: postgres://postgres:trident@localhost:5432/trident_test
+          TEST_DATABASE_URL: postgres://postgres:trident@localhost:5432/trident_test
+          TEST_REDIS_URL: redis://localhost:6379
+          REQUIRE_TEST_SERVICES: "1"
+          CI: "true"
+        run: |
+          set -euo pipefail
+          check() {
+            pkg="$1"; floor="$2"
+            actual=$(go test "./$pkg" -coverprofile="cov-$pkg.out" 2>/dev/null \
+              | grep -oE 'coverage: [0-9.]+%' | grep -oE '[0-9.]+' || echo "0")
+            echo "$pkg: ${actual}% (floor ${floor}%)"
+            awk -v a="$actual" -v f="$floor" 'BEGIN { exit !(a + 0 < f + 0) }' \
+              && { echo "::error::$pkg coverage ${actual}% is below the ${floor}% floor"; exit 1; } || true
+          }
+          check handlers 43
+          check middleware 66
+          check cursor 90
+          check validation 95
+
+      - name: Go coverage summary
+        run: |
+          echo "### Go coverage" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -1 services/api/go-coverage.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      # --- SDKs ------------------------------------------------------------
+      - name: Set up Node.js
+        uses: ./.github/actions/setup-node
+
+      # The coverage provider is installed here rather than added to
+      # package.json devDependencies on purpose: package-lock.json carries the
+      # platform-specific optional deps (@rollup/rollup-linux-*, @emnapi/*) that
+      # this Linux runner needs, and regenerating it from a non-Linux dev machine
+      # prunes them — `npm ci` then passes locally and fails here. Installing the
+      # provider as a separate no-save step keeps the lockfile untouched.
+      - name: TypeScript SDK coverage
+        working-directory: sdk/typescript
+        run: |
+          npm ci
+          npm install --no-save --no-package-lock @vitest/coverage-v8
+          npx vitest run --coverage --coverage.reporter=text --coverage.reporter=lcov
+
+      - name: Set up Python
+        uses: actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d # v5.1.0
+        with:
+          python-version: "3.12"
+
+      # `--cov-fail-under=0` overrides the 90 configured in pyproject.toml for
+      # this reporting step. That 90 is aspirational: measured coverage on this
+      # commit is 53%, dragged down by the generated openapi_models_gen.py.
+      # Enforcing it as-is would fail every build immediately. The floor below
+      # gates the hand-written client code, which is what the issue means by a
+      # critical package.
+      - name: Python SDK coverage
+        working-directory: sdk/python
+        run: |
+          pip install -e ".[dev]" pytest-cov
+          pytest -q --cov --cov-report=term --cov-report=xml --cov-fail-under=0
+
+      - name: Enforce Python SDK floor (hand-written client only)
+        working-directory: sdk/python
+        run: python ../../scripts/check-python-sdk-coverage.py coverage.xml --floor 75
+
+      # --- Artefacts -------------------------------------------------------
+      # Uploaded rather than pushed to a third party: the issue accepts "CI
+      # artifact and/or Codecov", and an artifact needs no external account or
+      # token to be useful on a fork PR.
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: coverage-reports
+          path: |
+            lcov.info
+            rust-coverage.txt
+            services/api/coverage.out
+            services/api/go-coverage.txt
+            sdk/typescript/coverage/
+            sdk/python/coverage.xml
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
+
+  # ---------------------------------------------------------------------------
+  # Aggregate gate -- the only check branch protection requires from this
+  # workflow. Skipped jobs count as success; failed/cancelled count as failure.
+  # ---------------------------------------------------------------------------
+  integration-ok:
+    name: integration-ok
+    if: always()
+    needs:
+      - changes
+      - build-images
+      - rust-integration
+      - e2e
+      - e2e-contract-events
+      - verify-quickstart
+      - coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          sparse-checkout: .github
+      - uses: ./.github/actions/gate
+        with:
+          needs: ${{ toJSON(needs) }}

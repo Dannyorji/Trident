@@ -1,0 +1,64 @@
+name: Explorer accessibility test
+description: >-
+  Builds the explorer, starts the built server and runs the axe-core a11y test
+  (issue #626). The script drives a locally built server with a fixture
+  contract path, so it has no live-testnet dependency; a non-2xx from the
+  fixture contract is expected and axe still inspects whatever renders.
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Node.js
+      uses: ./.github/actions/setup-node
+      with:
+        node-version: "22.12"
+        cache-dependency-path: explorer/package-lock.json
+
+    - name: Install explorer dependencies
+      shell: bash
+      working-directory: explorer
+      run: npm install --legacy-peer-deps
+
+    - name: Install Playwright browsers
+      shell: bash
+      working-directory: explorer
+      run: npx playwright install --with-deps chromium
+
+    - name: Build
+      shell: bash
+      working-directory: explorer
+      run: npm run build
+
+    - name: Start the built server
+      shell: bash
+      working-directory: explorer
+      env:
+        TRIDENT_TESTNET_API_URL: https://api.testnet.trident.dev
+        TRIDENT_MAINNET_API_URL: https://api.mainnet.trident.dev
+        EXPLORER_API_KEY: ci-smoke-test-key
+        PORT: "4321"
+      run: |
+        node dist/server/entry.mjs &
+        echo $! > server.pid
+        for i in $(seq 1 20); do
+          code=$(curl --silent --show-error --max-time 2 -o /dev/null -w '%{http_code}' \
+            "http://localhost:4321/" 2>/dev/null || echo "000")
+          if [ "$code" != "000" ]; then
+            echo "Server responded with HTTP $code"
+            exit 0
+          fi
+          sleep 0.5
+        done
+        echo "Server did not respond within the timeout" >&2
+        exit 1
+
+    - name: Run accessibility test
+      shell: bash
+      working-directory: explorer
+      run: npm run a11y-test -- --url http://localhost:4321
+
+    - name: Stop the server
+      if: always()
+      shell: bash
+      working-directory: explorer
+      run: kill "$(cat server.pid)" 2>/dev/null || true

@@ -20,6 +20,7 @@
 mod circuit_breaker;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sqlx::PgPool;
@@ -66,7 +67,9 @@ const GAUGE_GAP_SCAN_EVERY_N_POLLS: u32 = 60;
 pub struct Streamer {
     config: Config,
     db: PgPool,
-    rpc: RpcClient,
+    /// Shared with the spec-sync task (issue #725): that task needs the same
+    /// endpoint pool and health scoring, and `RpcClient` is not `Clone`.
+    rpc: Arc<RpcClient>,
     parser: Parser,
     /// `None`  → index all contracts (empty `indexed_contracts` table).
     /// `Some`  → allowlist with per-contract `index_from` boundaries (issue
@@ -87,16 +90,14 @@ pub struct Streamer {
     last_chain_tip: u64,
     /// Adaptive poll-interval controller driven by chain-tip lag (issue #198).
     adaptive_poll: AdaptivePoll,
-    /// Parsed-spec cache keyed by WASM code hash (issue #260).
-    spec_cache: crate::spec::SpecCache,
-    /// Last code hash synced to `contract_specs` per contract, so a redeploy
-    /// (changed hash) is what triggers a refresh, not every poll cycle
-    /// (issue #260).
-    known_code_hashes: std::collections::HashMap<String, String>,
     /// Tracked contracts most recently classified as SEP-41 tokens (issue
     /// #269) — what bounds storage-snapshot fetching (issue #270) to
     /// contracts we actually know how to read a balance from.
-    token_contracts: HashSet<String>,
+    ///
+    /// Written by the spec-sync task (issue #725) and read here on the poll
+    /// hot path, hence the lock. Never held across an `.await`: the poll body
+    /// clones the set once per page and works off the clone.
+    token_contracts: Arc<std::sync::RwLock<HashSet<String>>>,
     /// Trips after sustained RPC failures so the run loop stops attempting
     /// polls during an outage instead of retrying every interval (issue #197).
     rpc_breaker: CircuitBreaker,
@@ -127,6 +128,10 @@ impl Streamer {
                 pool_max_idle_per_host: config.rpc_pool_max_idle_per_host,
                 tcp_keepalive: config.rpc_tcp_keepalive,
                 max_calls_per_sec: config.rpc_max_calls_per_sec,
+                headers: Vec::new(),
+                endpoint_headers: (0..config.stellar_rpc_urls.len())
+                    .map(|index| config.rpc_headers.for_endpoint(index))
+                    .collect(),
             },
         )?;
         tracing::info!(
@@ -151,7 +156,7 @@ impl Streamer {
                          {} configured endpoint(s) ({:?}): {e}. Set \
                          RPC_STARTUP_CHECK_ENABLED=false to skip this check (not recommended).",
                         config.stellar_rpc_urls.len(),
-                        config.stellar_rpc_urls,
+                        crate::config::redact_rpc_urls(&config.stellar_rpc_urls),
                     )));
                 }
             }
@@ -192,7 +197,7 @@ impl Streamer {
         Ok(Self {
             config,
             db,
-            rpc,
+            rpc: Arc::new(rpc),
             parser,
             contract_filter,
             filter_plan,
@@ -200,9 +205,7 @@ impl Streamer {
             alerter,
             last_chain_tip: 0,
             adaptive_poll,
-            spec_cache: crate::spec::SpecCache::new(),
-            known_code_hashes: std::collections::HashMap::new(),
-            token_contracts: HashSet::new(),
+            token_contracts: Arc::new(std::sync::RwLock::new(HashSet::new())),
             rpc_breaker,
         })
     }
@@ -261,79 +264,6 @@ impl Streamer {
                 // Non-fatal: keep the existing filter, log the error.
                 tracing::warn!(error = %e, "Failed to refresh contract filter; keeping existing");
                 Ok(())
-            }
-        }
-    }
-
-    /// Fetch + persist specs and detected interfaces for every tracked
-    /// contract (issues #260, #269). Best-effort per contract: an RPC or
-    /// parse failure just skips that contract for this cycle. A DB write
-    /// only happens when the observed code hash differs from the last one
-    /// synced, so a contract whose code has not changed costs one cheap
-    /// `getLedgerEntries` call, not a WASM re-fetch.
-    async fn sync_contract_specs(&mut self) {
-        let Some(filter) = self.contract_filter.clone() else {
-            return;
-        };
-
-        // Only the ids matter here — spec sync is per contract and unrelated
-        // to each contract's index_from boundary.
-        for contract_id in filter.into_keys() {
-            match crate::spec::fetch_contract_spec(&self.rpc, &self.spec_cache, &contract_id).await
-            {
-                Ok(Some(contract_spec)) => {
-                    if contract_spec.interfaces.iter().any(|i| i == "sep41_token") {
-                        self.token_contracts.insert(contract_id.clone());
-                    } else {
-                        self.token_contracts.remove(&contract_id);
-                    }
-
-                    let previous_hash = self.known_code_hashes.get(&contract_id).cloned();
-                    let changed =
-                        previous_hash.as_deref() != Some(contract_spec.code_hash.as_str());
-                    if changed {
-                        match db::upsert_contract_spec(
-                            &self.db,
-                            &contract_id,
-                            &self.config.network,
-                            &contract_spec,
-                        )
-                        .await
-                        {
-                            Ok(()) => {
-                                self.known_code_hashes
-                                    .insert(contract_id.clone(), contract_spec.code_hash.clone());
-
-                                // A redeploy, not just this contract's first
-                                // sighting (issue #685): a code-hash change
-                                // against a previously known hash is a real
-                                // Soroban redeployment at this address, and
-                                // its token metadata was resolved against the
-                                // old code. A never-before-seen contract has
-                                // no cached row to invalidate, so there is
-                                // nothing to do on that path.
-                                if previous_hash.is_some() {
-                                    if let Err(e) = db::delete_token_metadata(
-                                        &self.db,
-                                        &contract_id,
-                                        &self.config.network,
-                                    )
-                                    .await
-                                    {
-                                        tracing::warn!(contract_id = %contract_id, error = %e, "Failed to invalidate token metadata on redeploy");
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(contract_id = %contract_id, error = %e, "Failed to persist contract spec");
-                            }
-                        }
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::warn!(contract_id = %contract_id, error = %e, "Failed to fetch contract spec");
-                }
             }
         }
     }
@@ -467,11 +397,20 @@ impl Streamer {
         let mut cursor = db::get_cursor(&self.db, &self.config.network).await?;
         tracing::info!(cursor, "Resuming from ledger cursor");
 
-        // Populate contract specs / interface tags once at startup (issues
-        // #260, #269) so storage snapshotting (#270) has token classification
-        // available from the first poll rather than waiting for the first
-        // periodic refresh.
-        self.sync_contract_specs().await;
+        // Contract spec sync (issues #260, #269, #270) is its own task rather
+        // than inline work in this loop (issue #725): it used to issue one
+        // `getLedgerEntries` per tracked contract before every first poll and
+        // every 12th poll, so a large allowlist or a slow endpoint delayed
+        // ingest directly. The task starts with an immediate pass; a poll that
+        // wins that race simply sees no token classification yet, which was
+        // already the case on a cold start.
+        let spec_sync = crate::spec_sync::SpecSync::new(
+            self.db.clone(),
+            Arc::clone(&self.rpc),
+            self.config.network.clone(),
+            Arc::clone(&self.token_contracts),
+        );
+        let spec_sync_handle = tokio::spawn(spec_sync.run(shutdown.clone()));
 
         loop {
             // Check for shutdown before starting a new poll so we never begin
@@ -490,8 +429,9 @@ impl Streamer {
             // become active without a restart (issue #47).
             self.poll_count = self.poll_count.wrapping_add(1);
             if self.poll_count.is_multiple_of(FILTER_REFRESH_EVERY_N_POLLS) {
+                // Spec sync reloads the allowlist itself on every pass, so it
+                // needs no coupling to this refresh (issue #725).
                 self.refresh_contract_filter().await?;
-                self.sync_contract_specs().await;
             }
 
             // Periodically scan for gaps in the processed ledger range and
@@ -638,6 +578,10 @@ impl Streamer {
                 }
             }
         }
+
+        // Shutdown was requested, so the task is already on its way out; abort
+        // rather than await it so a pass caught mid-RPC cannot delay exit.
+        spec_sync_handle.abort();
 
         tracing::info!(cursor, "Streamer stopped cleanly; cursor persisted");
         Ok(())
@@ -801,6 +745,11 @@ impl Streamer {
             let recent_ledgers = db::get_recent_ledger_metadata(&self.db, check_count).await?;
 
             for (seq, stored_hash) in recent_ledgers {
+                // Placeholder rows (#723) have no hash to compare; the query
+                // already excludes them, this keeps the invariant local.
+                if stored_hash.is_empty() {
+                    continue;
+                }
                 if let Ok(Some(rpc_hash)) = self.rpc.get_ledger(seq).await {
                     if rpc_hash != stored_hash {
                         tracing::warn!(
@@ -1074,6 +1023,7 @@ impl Streamer {
                         // transient DB hiccup does not lose the audit record
                         // (issue #414).
                         let db = self.db.clone();
+                        let network = self.config.network.clone();
                         let payload = raw_payload.clone();
                         let errmsg = e.to_string();
                         let dead_letter_strategy = ExponentialBackoff::from_millis(100)
@@ -1081,11 +1031,17 @@ impl Streamer {
                             .take(3);
                         if let Err(db_err) = Retry::start(dead_letter_strategy, || {
                             let db = db.clone();
+                            let network = network.clone();
                             let payload = payload.clone();
                             let errmsg = errmsg.clone();
                             async move {
                                 db::insert_parse_error(
-                                    &db, ledger_seq, event_idx, &payload, &errmsg,
+                                    &db,
+                                    &network,
+                                    ledger_seq,
+                                    event_idx,
+                                    &payload,
+                                    &errmsg,
                                 )
                                 .await
                             }
@@ -1115,7 +1071,7 @@ impl Streamer {
             // operator replay (which shrinks the queue out-of-band) is
             // reflected without restarting the indexer. Best-effort: the
             // gauge is observability, not control flow.
-            if let Ok(depth) = db::count_pending_failed_events(&self.db).await {
+            if let Ok(depth) = db::count_pending_failed_events(&self.db, &self.config.network).await {
                 metrics::set_persist_dead_letter_backlog(depth);
             }
 
@@ -1229,15 +1185,24 @@ impl Streamer {
             // contracts already classified as SEP-41 tokens (issue #269), and
             // only for holder addresses that moved funds in this page — never
             // a scan of arbitrary storage.
+            //
+            // Snapshot the classification first: the spec-sync task updates it
+            // from another task (issue #725), and the read lock must not be
+            // held across the storage-fetch awaits below.
+            let token_contracts = self
+                .token_contracts
+                .read()
+                .expect("token_contracts lock poisoned")
+                .clone();
             let mut owned_storage_snapshots: Vec<OwnedStorageSnapshot> = Vec::new();
-            if !self.token_contracts.is_empty() {
+            if !token_contracts.is_empty() {
                 let mut holders_by_contract: std::collections::HashMap<
                     &str,
                     std::collections::HashSet<&str>,
                 > = std::collections::HashMap::new();
                 for (index, token) in &page_tokens {
                     let contract_id = page_events[*index].contract_id.as_str();
-                    if !self.token_contracts.contains(contract_id) {
+                    if !token_contracts.contains(contract_id) {
                         continue;
                     }
                     let holders = holders_by_contract.entry(contract_id).or_default();
@@ -1312,6 +1277,11 @@ impl Streamer {
                 &storage_snapshots,
                 &self.config.network,
                 next_cursor,
+                // The page covers every ledger from just past the cursor it
+                // advanced to its new last ledger (issue #723): recording the
+                // whole span is what keeps `scan_ledger_gaps` from reporting
+                // inter-page stretches as holes.
+                next_cursor.map(|_| *cursor + 1),
                 next_cursor.map(|_| db::LedgerMeta {
                     sequence: ledger_sequence,
                     hash: &ledger_hash,
@@ -1600,6 +1570,7 @@ async fn commit_page_with_fallback(
     storage_snapshots: &[db::StorageSnapshotRow<'_>],
     network: &str,
     cursor: Option<u64>,
+    covered_from_ledger: Option<u64>,
     ledger: Option<db::LedgerMeta<'_>>,
     batch_size: usize,
 ) -> Result<(), TridentError> {
@@ -1624,6 +1595,7 @@ async fn commit_page_with_fallback(
                 storage_snapshots,
                 network,
                 cursor,
+                covered_from_ledger,
                 ledger: ledger.as_ref().map(|l| db::LedgerMeta {
                     sequence: l.sequence,
                     hash: l.hash,
@@ -1674,6 +1646,7 @@ async fn commit_page_with_fallback(
                         network,
                         cursor: None,
                         ledger: None,
+                        covered_from_ledger: None,
                         batch_size,
                     },
                 )
@@ -1712,14 +1685,14 @@ async fn commit_page_with_fallback(
                 attempts,
                 "Event failed to persist after per-event retries; dead-lettering"
             );
-            match db::insert_failed_event(db, event, &e.to_string(), attempts).await {
+            match db::insert_failed_event(db, network, event, &e.to_string(), attempts).await {
                 Ok(()) => {
                     // The PERSIST counter, not the parse one: these answer
                     // different operational questions (issue #508), and the
                     // backlog gauge refreshes immediately so the alert sees
                     // the new row without waiting for the next active cycle.
                     metrics::record_persist_dead_lettered();
-                    if let Ok(depth) = db::count_pending_failed_events(db).await {
+                    if let Ok(depth) = db::count_pending_failed_events(db, network).await {
                         metrics::set_persist_dead_letter_backlog(depth);
                     }
                 }
@@ -1762,6 +1735,7 @@ async fn commit_page_with_fallback(
             storage_snapshots,
             network,
             cursor,
+            covered_from_ledger,
             ledger,
             batch_size,
         },
@@ -2149,11 +2123,9 @@ mod tests {
             poll_interval_ceiling: Duration::from_millis(500),
             lag_high_watermark: 100,
             poll_hysteresis_ledgers: 10,
-            max_reorg_rewind_depth: 50,
             gap_scan_max_per_run: 100,
             stellar_rpc_urls: vec![rpc_url],
-            rpc_failover_threshold: 3,
-            rpc_endpoint_cooldown: Duration::from_secs(30),
+            rpc_headers: crate::config::RpcHeaderConfig::default(),
             rpc_breaker_failure_threshold: 5,
             rpc_breaker_cooldown: Duration::from_secs(30),
             rpc_connect_timeout: Duration::from_secs(5),
@@ -2739,6 +2711,7 @@ mod tests {
                 batch_size: 100,
                 backlog_alert_threshold: 1_000,
                 stream_maxlen: 10_000,
+                network: "testnet".to_string(),
             },
         );
         let published = relay.publish_pending().await.unwrap();
@@ -2813,6 +2786,7 @@ mod tests {
                 batch_size: 100,
                 backlog_alert_threshold: 1_000,
                 stream_maxlen: 10_000,
+                network: "testnet".to_string(),
             },
         );
         assert_eq!(relay.publish_pending().await.unwrap(), 3);
@@ -2826,6 +2800,138 @@ mod tests {
         assert_eq!(crate::db::outbox::backlog(&s.db).await.unwrap(), 0);
 
         // A second pass is a no-op: published rows are not re-delivered.
+        assert_eq!(relay.publish_pending().await.unwrap(), 0);
+    }
+
+    /// Issue #739: a payload the relay cannot decode must be dead-lettered, not
+    /// marked published. It has to stop blocking the queue, must not count as
+    /// delivered, and the failure must be visible on its own counter.
+    #[tokio::test]
+    async fn undecodable_outbox_payload_is_dead_lettered_not_published() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::MetricKind;
+
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(rpc_ok(events_page(600, 1)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(rpc_ok(events_page(600, 0)))
+            .mount(&server)
+            .await;
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        let mut conn = redis_conn(&redis_url).await;
+        reset_db(&s.db).await;
+        sqlx::query("DELETE FROM event_outbox")
+            .execute(&s.db)
+            .await
+            .unwrap();
+        let _: () = redis::cmd("XTRIM")
+            .arg("trident:events")
+            .arg("MAXLEN")
+            .arg(0)
+            .query_async(&mut conn)
+            .await
+            .unwrap_or(());
+
+        // Commit one well-formed event, then queue an undecodable row after it
+        // so both land in the same relay batch (seq order).
+        let mut cursor = 0u64;
+        s.poll_once(&mut cursor).await.unwrap();
+
+        let bad_id = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO event_outbox (event_id, payload) VALUES ($1, $2)")
+            .bind(bad_id)
+            .bind(serde_json::json!({"not": "an event"}))
+            .execute(&s.db)
+            .await
+            .unwrap();
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = ::metrics::set_default_local_recorder(&recorder);
+
+        let mut relay = OutboxRelay::new(
+            s.db.clone(),
+            conn.clone(),
+            RelayConfig {
+                interval: Duration::from_millis(10),
+                batch_size: 100,
+                backlog_alert_threshold: 1_000,
+                stream_maxlen: 10_000,
+            },
+        );
+        let published = relay.publish_pending().await.unwrap();
+        drop(guard);
+
+        assert_eq!(published, 1, "only the decodable event counts as delivered");
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let counter_value = |name: &str| {
+            snapshot
+                .iter()
+                .find(|(key, _, _, _)| {
+                    key.kind() == MetricKind::Counter && key.key().name() == name
+                })
+                .and_then(|(_, _, _, value)| match value {
+                    DebugValue::Counter(n) => Some(*n),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        };
+        assert_eq!(
+            counter_value(metrics::OUTBOX_UNDECODABLE_TOTAL),
+            1,
+            "the undecodable payload must be counted"
+        );
+        assert_eq!(
+            counter_value(metrics::OUTBOX_PUBLISHED_TOTAL),
+            1,
+            "the dead-lettered row must not count as published"
+        );
+
+        let (bad_published, has_dead_letter, reason): (bool, bool, Option<String>) =
+            sqlx::query_as(
+                "SELECT published, dead_lettered_at IS NOT NULL, dead_letter_reason \
+                 FROM event_outbox WHERE event_id = $1",
+            )
+            .bind(bad_id)
+            .fetch_one(&s.db)
+            .await
+            .unwrap();
+        assert!(
+            !bad_published,
+            "an undecodable payload never reached Redis, so it must stay unpublished"
+        );
+        assert!(has_dead_letter, "row must be dead-lettered");
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|r| r.contains("outbox payload decode")),
+            "dead-letter reason should preserve the decode error, got: {reason:?}"
+        );
+
+        let len: i64 = redis::cmd("XLEN")
+            .arg("trident:events")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(len, 1, "only the decodable event reached the stream");
+        assert_eq!(
+            crate::db::outbox::backlog(&s.db).await.unwrap(),
+            0,
+            "a dead-lettered row must not remain in the backlog"
+        );
+
+        // The dead-lettered row must not be fetched again, so a second pass is
+        // a no-op rather than re-dead-lettering it forever.
         assert_eq!(relay.publish_pending().await.unwrap(), 0);
     }
 
@@ -3853,11 +3959,10 @@ mod tests {
     //
     // Storage snapshot fetching (also named in the issue) is deliberately
     // not exercised here: it only runs for a contract classification
-    // produced by sync_contract_specs's own WASM-spec-parsing path, which
-    // has no test-mocking infrastructure anywhere in this suite yet (see
-    // spec::tests for what building a classifiable fixture WASM actually
-    // requires). Scoped out as a named follow-up rather than built under
-    // this issue.
+    // produced by the spec-sync task's WASM-spec-parsing path, which has no
+    // test-mocking infrastructure in this suite (see spec::tests for what
+    // building a classifiable fixture WASM actually requires). Scoped out as
+    // a named follow-up rather than built under this issue.
 
     /// Build one getEvents page mixing a token transfer (2 events, same
     /// contract), a plain contract invocation (1 event, a different
@@ -4138,5 +4243,153 @@ mod tests {
             metrics_after, 1,
             "replay must not duplicate invocation metrics rows"
         );
+    }
+    // -----------------------------------------------------------------------
+    // Contract spec sync as an independent task (issues #725, #726)
+    // -----------------------------------------------------------------------
+
+    /// A restart must not forget which code hash was last persisted (issue
+    /// #726). Seeded from `contract_specs`, a redeploy that happened while the
+    /// indexer was down looks like a hash change: the row is refreshed and the
+    /// token metadata resolved against the old code is invalidated. Without the
+    /// seed it looks like a first-ever sighting and the stale metadata would
+    /// survive the redeploy.
+    #[tokio::test]
+    async fn spec_sync_seeds_from_db_so_a_restart_still_invalidates_metadata_on_redeploy() {
+        use crate::spec::tests::{
+            code_ledger_entry, contract_strkey, empty_wasm, instance_ledger_entry,
+            LedgerEntriesResponder,
+        };
+        use std::collections::HashMap;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::{Arc, RwLock};
+        use stellar_xdr::curr::Hash;
+
+        let (db_url, _redis_url) = require_services!();
+        let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+        reset_db(&pool).await;
+
+        let contract_id = contract_strkey(0x77);
+        let old_hash = Hash([0x01; 32]);
+        let new_hash = Hash([0x02; 32]);
+
+        sqlx::query("DELETE FROM contract_specs WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM token_metadata WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        set_allowlist(&pool, &[contract_id.as_str()]).await;
+
+        // State left behind by the previous process: code hash A plus the
+        // token metadata that was resolved against it.
+        sqlx::query(
+            "INSERT INTO contract_specs
+                 (contract_id, network, code_hash, has_spec, functions, contract_type, interfaces)
+             VALUES ($1, 'testnet', $2, true, $3::jsonb, 'token', $4::jsonb)",
+        )
+        .bind(&contract_id)
+        .bind(hex::encode(old_hash.0))
+        .bind(serde_json::json!([{ "name": "old_fn" }]))
+        .bind(serde_json::json!(["sep41_token"]))
+        .execute(&pool)
+        .await
+        .unwrap();
+        db::upsert_token_metadata(
+            &pool,
+            &contract_id,
+            "testnet",
+            &token_metadata::TokenMetadataResolution::Token(token_metadata::TokenMetadata {
+                name: "Old".to_string(),
+                symbol: "OLD".to_string(),
+                decimals: 7,
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Meanwhile the contract was redeployed: the chain now reports hash B.
+        let mut entries = HashMap::new();
+        let (key, xdr) = instance_ledger_entry(&contract_id, &new_hash);
+        entries.insert(key, xdr);
+        let (key, xdr) = code_ledger_entry(&new_hash, &empty_wasm());
+        entries.insert(key, xdr);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(LedgerEntriesResponder {
+                entries,
+                code_requests: Arc::new(AtomicUsize::new(0)),
+            })
+            .mount(&server)
+            .await;
+
+        let rpc =
+            Arc::new(RpcClient::with_settings(server.uri(), &RpcHttpSettings::default()).unwrap());
+        let token_contracts = Arc::new(RwLock::new(HashSet::new()));
+        let mut spec_sync = crate::spec_sync::SpecSync::new(
+            pool.clone(),
+            rpc,
+            "testnet".to_string(),
+            token_contracts.clone(),
+        );
+
+        // Exactly what the spawned task does on startup, then one pass.
+        spec_sync
+            .seed_from_db()
+            .await
+            .expect("seeding from contract_specs must succeed");
+        spec_sync.sync_pass().await;
+
+        let (code_hash, has_spec): (String, bool) = sqlx::query_as(
+            "SELECT code_hash, has_spec FROM contract_specs
+             WHERE contract_id = $1 AND network = 'testnet'",
+        )
+        .bind(&contract_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            code_hash,
+            hex::encode(new_hash.0),
+            "a restart must still detect that the deployed code changed"
+        );
+        assert!(!has_spec, "the new code has no contract spec section");
+
+        let metadata: Option<(String,)> = sqlx::query_as(
+            "SELECT name FROM token_metadata
+             WHERE contract_id = $1 AND network = 'testnet'",
+        )
+        .bind(&contract_id)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert!(
+            metadata.is_none(),
+            "token metadata resolved against the old code must be invalidated"
+        );
+
+        assert!(
+            token_contracts.read().unwrap().is_empty(),
+            "the new code is no longer classified as a SEP-41 token"
+        );
+
+        // Leave the shared database as the rest of this suite assumes: an
+        // empty allowlist means "index all contracts".
+        set_allowlist(&pool, &[]).await;
+        sqlx::query("DELETE FROM contract_specs WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM token_metadata WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }

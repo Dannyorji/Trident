@@ -86,13 +86,21 @@ func RunUsageRollupLoop(ctx context.Context, db *pgxpool.Pool, interval, lookbac
 	run := func() {
 		rollupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
+		// Try advisory lock (issue #731) - use different lock key
+		var locked bool
+		_ = db.QueryRow(rollupCtx, "SELECT pg_try_advisory_lock(123456789, 102)").Scan(&locked)
+		if !locked {
+			return
+		}
+		defer db.Exec(context.Background(), "SELECT pg_advisory_unlock(123456789, 102)")
 		_ = RollupUsage(rollupCtx, db, time.Now().Add(-lookback))
 	}
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	run()
+	// Delay first run
+	time.Sleep(90 * time.Second)
 	for {
 		select {
 		case <-ctx.Done():

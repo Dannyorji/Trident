@@ -201,10 +201,14 @@ CREATE TABLE IF NOT EXISTS parse_errors (
     event_index      INT         NOT NULL,
     raw_payload      TEXT        NOT NULL,
     error_message    TEXT        NOT NULL,
-    occurred_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    occurred_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    network          TEXT        NOT NULL DEFAULT 'testnet'
+        CONSTRAINT chk_parse_errors_network CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_parse_errors_occurred_at ON parse_errors (occurred_at DESC);
+-- migration 0038
+CREATE INDEX IF NOT EXISTS idx_parse_errors_network_ledger ON parse_errors (network, ledger_sequence);
 
 -- ---------------------------------------------------------------------------
 -- event_outbox
@@ -217,7 +221,9 @@ CREATE TABLE IF NOT EXISTS event_outbox (
     payload      JSONB       NOT NULL,
     published    BOOLEAN     NOT NULL DEFAULT FALSE,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    published_at TIMESTAMPTZ
+    published_at TIMESTAMPTZ,
+    dead_lettered_at   TIMESTAMPTZ,
+    dead_letter_reason TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_event_outbox_unpublished
@@ -569,7 +575,9 @@ CREATE TABLE IF NOT EXISTS failed_events (
     error_message    TEXT        NOT NULL,
     attempts         INT         NOT NULL DEFAULT 1,
     occurred_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    replayed_at      TIMESTAMPTZ
+    replayed_at      TIMESTAMPTZ,
+    network          TEXT        NOT NULL DEFAULT 'testnet'
+        CONSTRAINT chk_failed_events_network CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_failed_events_occurred_at ON failed_events (occurred_at DESC);
@@ -577,8 +585,11 @@ CREATE INDEX IF NOT EXISTS idx_failed_events_pending ON failed_events (occurred_
 -- Pending rows are unique per event (migration 0030): redelivered failures
 -- update in place, so COUNT(*) of pending rows = distinct poisoned events.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_failed_events_pending
-    ON failed_events (contract_id, ledger_sequence, event_index)
+    ON failed_events (network, contract_id, ledger_sequence, event_index)
     WHERE replayed_at IS NULL;
+-- migration 0038
+CREATE INDEX IF NOT EXISTS idx_failed_events_network_pending
+    ON failed_events (network, occurred_at) WHERE replayed_at IS NULL;
 
 -- ---------------------------------------------------------------------------
 -- backfill_jobs  (migration 0032)

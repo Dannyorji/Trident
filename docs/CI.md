@@ -1,22 +1,88 @@
-# CI caching and job layout
+# CI layout, caching and job structure
 
-This document explains how CI caching is set up (issue #309) so future changes
-to `.github/workflows/ci.yml` don't accidentally regress it, and how to verify
-cache effectiveness on any given run.
+This document explains how the CI workflows are organised, how a pull request
+is gated, and how caching is set up (issue #309) so future changes don't
+accidentally regress either.
+
+## Workflow layout
+
+There are six workflows in `.github/workflows/`. Shared setup lives in
+composite actions under `.github/actions/` so the workflow files stay short.
+
+| Workflow | Trigger | What it holds |
+|---|---|---|
+| `ci.yml` | PR, push to dev/main | Path-filtered lint + unit tests (Rust, Go, every SDK, explorer build/boot/a11y, contracts) and static checks (OpenAPI lint + generated-model drift, Prometheus rules + promtool, Alertmanager routing, Helm, schema guard, env reference, migration versions, image digests, docs examples + links, actionlint). Gate: **`ci-ok`**. |
+| `integration.yml` | PR, push to dev/main | Image build (once, shared as artifacts), Rust integration tests with Postgres/Redis, E2E + OpenAPI contract test, E2E contract events, quickstart verification, coverage. Gate: **`integration-ok`**. |
+| `security.yml` | PR, push, nightly, dispatch | Gitleaks, dependency audits (cargo/govulncheck/npm/pip), SBOM + image scan of the images `integration.yml` built, migration image secret audit. Gate: **`security-ok`**. |
+| `nightly.yml` | schedule, dispatch | Testnet ingest correctness, explorer a11y + perf budget, launch gate checker, launch readiness, backup/restore drill, and one failure notification for all of them. |
+| `deploy.yml` | push to dev (staging); release or dispatch (production) | One pipeline parameterised by environment: config check, migrate + rollout (Helm), smoke test, rollback, alert. |
+| `release.yml` | `vX.Y.Z` tag, dispatch | Requires green `ci-ok`/`integration-ok`/`security-ok` on the tagged commit, builds + signs + attests the images, publishes every SDK, creates the GitHub release. |
+
+### Required checks
+
+Branch protection on `dev` and `main` requires exactly three checks:
+`ci-ok`, `integration-ok` and `security-ok`. Each is an aggregate job that
+`needs:` every other job in its workflow and fails if any of them **failed or
+was cancelled**; a **skipped** job (filtered out by paths) counts as success.
+Adding, renaming or removing a job therefore changes only that aggregate's
+`needs:` list, never the required-check list -- which is what stops a renamed
+job from silently dropping out of the required set.
+
+`scripts/set-branch-protection.sh` applies this to both branches (needs repo
+admin; it only updates the required-status-checks part of existing protection).
+
+### Path filters
+
+`ci.yml`, `integration.yml` and `security.yml` each start with a `changes` job
+that runs `dorny/paths-filter` against one shared file,
+`.github/path-filters.yml`. On a pull request a job runs only if its filter
+matched; on a push to dev/main (and schedule/dispatch) every filter is forced
+true, so the post-merge run is always the full suite. Editing a workflow, a
+composite action or the filters file re-runs everything in the workflows that
+use it.
+
+In practice: a PR touching only `docs/site/**` runs `changes`, the always-on
+static checks, the `docs` job and the aggregates (minutes); a PR touching
+`crates/` runs the full Rust, integration and E2E set.
+
+### Adding a job
+
+1. Add the job to the right workflow, with `needs: changes` and
+   `if: needs.changes.outputs.<filter> == 'true'` if it should be path-filtered
+   (add the filter to `.github/path-filters.yml` and to the `changes` job's
+   outputs).
+2. Add it to the `needs:` list of that workflow's aggregate job. That is the
+   only step that makes it gating.
+3. Do not touch branch protection.
+
+### Composite actions (`.github/actions/`)
+
+| Action | Used for |
+|---|---|
+| `setup-rust` | toolchain + sccache + rust-cache, wired identically everywhere |
+| `setup-go`, `setup-node` | pinned toolchains with optional module/npm cache |
+| `build-image` | one image with a per-image gha cache scope (CI, staging push, release push) |
+| `get-image` | reuse the image `integration.yml` built for this commit, else build it |
+| `wait-for-api`, `stack-logs` | E2E stack readiness and failure diagnostics |
+| `explorer-a11y` | the axe-core accessibility run (ci.yml and nightly.yml) |
+| `gate` | the aggregate pass/fail logic behind `ci-ok`, `integration-ok`, `security-ok` |
+
+### Linting the workflows
+
+`actionlint` runs in `ci.yml` whenever anything under `.github/` changes. A
+malformed workflow file (the old `ci.yml` had a duplicate `explorer` job key
+that disabled all 21 of its jobs unnoticed, #708) now fails the PR that
+introduces it. Its shellcheck/pyflakes integrations are off so the gate is not
+blocked by pre-existing findings in inline scripts.
 
 ## Rust: sccache + shared rust-cache keys
 
-Every Rust job (`rust`, `rust-integration`, `sdk-rust`, `contracts`,
-`e2e-contract-events`) sets:
-
-```yaml
-env:
-  RUSTC_WRAPPER: sccache
-  SCCACHE_GHA_ENABLED: "true"
-```
-
-and runs `mozilla-actions/sccache-action` before the `Swatinem/rust-cache`
-step. `sccache` caches individual compiled objects (keyed by crate, flags,
+Every Rust job (`rust`, `sdk-rust`, `contracts` in `ci.yml`;
+`rust-integration`, `e2e-contract-events`, `coverage` in `integration.yml`;
+`testnet-correctness` in `nightly.yml`) uses the `setup-rust` composite
+action, which installs the toolchain, sets `RUSTC_WRAPPER=sccache` and
+`SCCACHE_GHA_ENABLED=true`, and runs `mozilla-actions/sccache-action` before
+the `Swatinem/rust-cache` step. `sccache` caches individual compiled objects (keyed by crate, flags,
 and rustc version) in the GitHub Actions cache backend, rather than only
 caching a job-local `target/` directory. That makes the cache reusable
 *across* jobs that compile overlapping code, not just across re-runs of the
@@ -32,11 +98,11 @@ same job:
   cross-run one: once either job has populated `rust-workspace`, subsequent
   runs of both jobs reuse it, rather than each job maintaining its own
   separate, job-scoped cache as before.
-- `contracts` and `e2e-contract-events` both compile the `token` contract to
-  `wasm32v1-none`. `e2e-contract-events` has `needs: [contracts, ...]`, so by
-  the time it runs, `contracts` has already populated the shared
-  `contracts-wasm` cache key — the second build becomes a near-total cache
-  hit instead of a full wasm rebuild.
+- `contracts` (`ci.yml`) and `e2e-contract-events` (`integration.yml`) both
+  compile the `token` contract to `wasm32v1-none` with the shared
+  `contracts-wasm` cache key. They are separate workflows and run in parallel,
+  so the sharing is cross-run: once either has populated the key, the other
+  reuses the compiled objects instead of rebuilding the crate.
 
 Each job ends with a `sccache --show-stats` step (`if: always()`) so cache
 hit/miss counts for that run are visible directly in the job log without
@@ -48,41 +114,49 @@ install / migrate / `sqlx prepare` steps. Formatting is the most common CI
 failure and needs neither the database nor a compiled dependency graph, so it
 now fails in seconds instead of after several minutes of DB setup.
 
-## Docker: per-image cache scopes
+## Docker: built once, per-image cache scopes
 
-The `docker`, `e2e`, and `e2e-contract-events` jobs build/restore three
-images (Go API, Rust gRPC API, Rust indexer) using
-`docker/build-push-action` with `cache-from`/`cache-to: type=gha`.
+`integration.yml`'s `build-images` job builds the four images (Go API, Rust
+gRPC API, Rust indexer, migrate) exactly once per commit, using the
+`build-image` composite action, and uploads each as an artifact
+(`image-<name>`, 1-day retention). Everything that needs an image consumes
+that artifact instead of rebuilding:
 
-Previously none of these specified a `scope`, which means the `gha` cache
-backend defaulted all three builds to the same `buildkit` scope. Each image
-build's cache write was overwriting the previous image's cache blobs for that
-scope, so effective hit-rate degraded as more images were added to the
-workflow. Each image now uses its own scope (`scope=go-api`, `scope=grpc-api`,
-`scope=indexer`) on both the write side (`docker` job) and every read side
-(`e2e`, `e2e-contract-events`), so the three caches accumulate independently
-instead of colliding.
+- `e2e` and `e2e-contract-events` `docker load` the images and run
+  `docker compose up --no-build`. `docker/docker-compose.ci.yml` pins each app
+  service to the `:ci` tag `build-images` produces.
+- `security.yml` scans the same images. The two workflows run in parallel, so
+  `scripts/fetch-image-artifact.sh` waits for the artifact. If `integration.yml`
+  was path-filtered out, failed before the build, or this is a nightly/manual
+  run, the `get-image` action builds the image itself.
+- `deploy.yml` and `release.yml` build their own (registry-pushed, and for
+  release multi-arch) images with the same `build-image` action.
+
+Every image uses its own gha cache scope (`go-api`, `grpc-api`, `indexer`,
+`migrate`). Without an explicit `scope` the `gha` backend puts every build in a
+workflow into one shared `buildkit` scope, and the builds overwrite each other's
+cache blobs on every run. The same scope names are used by every workflow, so
+the cache accumulates across them.
 
 The Dockerfiles themselves (`services/api/Dockerfile`,
 `crates/api/Dockerfile`, `crates/indexer/Dockerfile`) already copy manifest
 files (`go.mod`/`go.sum`, `Cargo.toml`/`Cargo.lock`) and build a
 dependency-only stub before `COPY . .`, so dependency-fetch layers stay
-cached across changes that only touch application source. That ordering was
-already correct and is unchanged here.
+cached across changes that only touch application source.
 
 ## Fast feedback vs. heavy jobs
 
 - A workflow-level `concurrency` group cancels superseded runs on the same
   branch/PR, so pushing a fixup commit doesn't leave a stale, doomed run
   burning a runner for another 10+ minutes.
-- `rust`, `go`, `typescript`, `openapi`, `sdk-*`, and `contracts` run in
-  parallel with no `needs`, so lint/unit feedback isn't serialized behind the
-  heavy jobs.
-- `e2e` and `e2e-contract-events` (full Docker Compose stacks, and for the
-  latter, a local Soroban network) are gated behind `needs:` on the jobs that
-  produce their inputs (images, contract WASM), so they only start once
-  there's a reasonable chance the fast checks will also pass, and they never
-  block the fast jobs from reporting first.
+- Lint and unit tests (`ci.yml`) are a separate workflow from the heavy
+  checks (`integration.yml`), so they report first and run in parallel with
+  them; neither workflow waits on the other.
+- Within `integration.yml`, `e2e` and `e2e-contract-events` (full Docker
+  Compose stacks, and for the latter a local Soroban network) `need` only
+  `build-images`, so they start as soon as the images exist.
+- Path filters (above) keep a docs-only or explorer-only PR off the Rust/Go
+  build, E2E and coverage jobs entirely.
 
 ## Verifying the improvement on a PR
 
@@ -91,13 +165,13 @@ wall-clock depends on GitHub's shared-runner load at the time. To verify on a
 real PR:
 
 1. Compare the `rust-integration` job's cache-setup and build step durations
-   against a `rust` job run in the same workflow run — after the first run
+   (`integration.yml`) against the `rust` job (`ci.yml`) on the same commit — after the first run
    populates the `rust-workspace` sccache/rust-cache entries, `sccache
    --show-stats` in `rust-integration` should show a high hit count.
 2. Compare `contracts` vs. `e2e-contract-events`'s "Build the reference token
    contract" step duration — the latter should be dramatically shorter once
    the `contracts-wasm` cache is warm.
-3. In the `docker`, `e2e`, and `e2e-contract-events` job logs, look for
+3. In the `build-images` job logs, look for
    `CACHED` markers on the Dockerfile steps prior to `COPY . .` — these
    should now hit consistently across runs that don't change dependency
    manifests, instead of only on the specific job that most recently wrote
@@ -168,7 +242,7 @@ per the issue's explicit non-goal of a repo-wide coverage mandate.
 
 ## Schema guard: migration lint and schema.sql drift
 
-The `schema-guard` job runs two checks on every PR (issue #436, closes #246).
+The `schema-guard` job runs on every PR that touches `database/`, `api/` or `sdk/` (issue #436, closes #246).
 
 ### Why
 
@@ -279,8 +353,9 @@ publish job refuses to tag unless it matches.
 
 ### Publishing
 
-`publish-sdk.yml` is `workflow_dispatch` only. Pick an SDK (or `all`), give a
-semver version, and optionally check `dry_run`.
+SDKs are published by `release.yml`: every SDK on a `vX.Y.Z` tag, or via
+`workflow_dispatch` to publish one SDK (or `all`) at a semver version of your
+choice, optionally with `dry_run`.
 
 | SDK | Registry | Mechanism |
 |---|---|---|
@@ -297,9 +372,12 @@ that compiles in-workspace but not standalone, or a React package whose
 
 Two things are deliberately not automated:
 
-- **Publishing is never triggered by a push.** Registry uploads are effectively
-  irreversible (npm unpublish is time-limited, crates.io has none, Go module
-  versions are immutable), so a human chooses the moment.
+- **Publishing is never triggered by an ordinary push.** Registry uploads are
+  effectively irreversible (npm unpublish is time-limited, crates.io has none,
+  Go module versions are immutable), so the only triggers are a deliberate
+  `vX.Y.Z` tag -- which `release.yml` refuses to act on unless `ci-ok`,
+  `integration-ok` and `security-ok` are green for that commit -- or a manual
+  dispatch.
 - **The Go publish creates a tag.** Tags are the module version, so republishing
   a version is impossible by design — the job fails rather than trying.
 
@@ -311,4 +389,56 @@ uses the workflow's own `GITHUB_TOKEN` to push a tag.
 
 A first publish of any package also needs the name to be claimed on the registry
 and, for Python, the trusted publisher configured for this repo and workflow.
+**PyPI and TestPyPI trusted publishers pin the workflow file name**: they must
+be pointed at `release.yml` (they previously pointed at `publish-sdk.yml`)
+before the next publish.
 That is a one-time manual setup per registry and cannot be done from CI.
+
+
+## Deploys
+
+`deploy.yml` is one pipeline for both environments (`plan` resolves release
+name, namespace, values file, image tag and URL once). Staging deploys every
+push to `dev` with images built in the workflow; production deploys a release
+tag whose signed images `release.yml` already pushed.
+
+The `deploy` and `rollback` jobs run in the GitHub environment named after the
+target. Configure **required reviewers** on the `production` environment
+(Settings -> Environments) so every production deploy waits for approval
+(#782); the rollback job shares the environment, so its protection rules apply
+to it too. Secrets/variables: `STAGING_*` as before, plus `PRODUCTION_KUBECONFIG`,
+`PRODUCTION_DATABASE_URL`, `PRODUCTION_URL`, `PRODUCTION_API_KEY`,
+`PRODUCTION_NAMESPACE` (optional) and `PRODUCTION_ALERT_WEBHOOK_URL`
+(optional). A release published by `release.yml` itself does not trigger
+`deploy.yml` (GitHub does not chain workflows off `GITHUB_TOKEN` events); run
+it via `workflow_dispatch` with `environment=production` and the release tag.
+
+## Releases
+
+`release.yml` on a `vX.Y.Z` tag: `gate` waits for `ci-ok`, `integration-ok` and
+`security-ok` on the tagged commit (#781) -> `build-images` pushes multi-arch
+images, signs each keylessly with cosign and attaches a SLSA provenance
+attestation (#780) -> every SDK is published -> the GitHub release is created
+with the image digests. Verify an image with:
+
+```bash
+cosign verify \
+  --certificate-identity-regexp 'https://github.com/<org>/<repo>/.github/workflows/release.yml@.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/<org>/trident-go-api@<digest>
+```
+
+## Nightly
+
+`nightly.yml` runs once a day (06:17 UTC) and on dispatch. Every job feeds one
+`notify-failure` step, which posts to `NIGHTLY_ALERT_WEBHOOK_URL` if set and
+always leaves an error annotation and a run summary. Jobs moved here from
+per-PR workflows, and why:
+
+| Job | Was | Reason |
+|---|---|---|
+| `launch-gate` | `ci.yml` | guards `docs/runbooks` launch checklist parsing; nothing a typical PR touches |
+| `backup-restore-drill` | `ci.yml` | exercises `scripts/backup.sh`/`restore.sh` against a scratch DB; slow, and those scripts rarely change |
+| `launch-readiness` (+ config check) | `launch-readiness.yml` | needs live staging + secrets (never available to fork PRs); the PR trigger only covered three docs paths |
+| `explorer-perf` | `explorer-perf.yml` | already scheduled-only (depends on the live testnet API) |
+| `testnet-correctness` | `testnet-correctness.yml` | already scheduled-only |

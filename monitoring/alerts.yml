@@ -198,26 +198,6 @@ groups:
             but missing from soroban_events until replayed.
           runbook_url: "docs/runbooks/alerts.md#tridentindexerpersistdeadletterbacklog"
 
-      # A non-empty persist dead-letter queue is data missing from
-      # soroban_events until someone replays it — a silently growing DLQ is
-      # the same as data loss. Rows leave the pending state only through the
-      # documented replay procedure, so this fires for as long as any exist.
-      - alert: TridentIndexerPersistDeadLetterBacklog
-        expr: trident_indexer_persist_dead_letter_backlog > 0
-        for: 5m
-        labels:
-          severity: warning
-          service: indexer
-        annotations:
-          summary: "Trident indexer has {{ $value | humanize }} event(s) pending replay in failed_events"
-          description: >
-            failed_events has pending rows: at least one well-formed event's
-            database commit failed through its full retry budget and was
-            captured for replay rather than blocking the ingest cursor
-            (issue #508). Data is safe but missing from soroban_events until
-            replayed — see the runbook for the replay procedure.
-          runbook_url: "docs/runbooks/alerts.md#tridentindexerpersistdeadletterbacklog"
-
   # ---------------------------------------------------------------------------
   # Ledger-range reconciliation against the RPC source (#511).
   # ---------------------------------------------------------------------------
@@ -688,6 +668,28 @@ groups:
             signal, firing before the backlog itself crosses a threshold.
           runbook_url: "docs/runbooks/alerts.md#tridentoutboxpublishfailureshigh"
 
+      - alert: TridentOutboxUndecodablePayloads
+        expr: |
+          increase(trident_indexer_outbox_undecodable_total[1h]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: "Trident indexer dead-lettered {{ $value | humanize }} undecodable outbox row(s) in the last hour"
+          description: >
+            trident_indexer_outbox_undecodable_total increased in the last
+            hour. The relay found a stored outbox payload it could not decode
+            (issue #739). Such a row can never be published, so it was
+            dead-lettered instead of being marked published: it is excluded
+            from the backlog gauge and retained in event_outbox for audit.
+            Subscribers never received that event. Check the relay's
+            "Undecodable outbox payload, dead-lettering" log line and the
+            row's dead_letter_reason; a cluster of these points at a producer
+            writing a payload shape the relay's SorobanEvent schema no longer
+            accepts.
+          runbook_url: "docs/runbooks/alerts.md#tridentoutboxundecodablepayloads"
+
       - alert: TridentDeadLetteredEventsHigh
         expr: |
           increase(trident_indexer_dead_lettered_total[1h]) > 0
@@ -744,4 +746,106 @@ groups:
         annotations:
           summary: "Database backup has not succeeded in over 26 hours"
           description: "Automated PostgreSQL backup job has failed or failed to run, risking data loss."
+
+  # ---------------------------------------------------------------------------
+  # Chain integrity & RPC availability signals with no alert yet (issue
+  # #771): reorgs, the RPC circuit breaker tripping open, and a growing
+  # ledger-gap count. All three metrics were already emitted by the indexer
+  # (crates/indexer/src/metrics.rs) but nothing paged on them.
+  # ---------------------------------------------------------------------------
+  - name: trident.indexer.chain_integrity
+    rules:
+      - alert: TridentIndexerReorgDetected
+        expr: increase(trident_indexer_reorgs_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: "Trident indexer detected and repaired {{ $value | humanize }} ledger reorg(s)"
+          description: >
+            trident_indexer_reorgs_total increased. The indexer found a
+            divergence between the RPC's current history and what it had
+            already persisted, and repaired it by deleting the affected rows
+            and rewinding the cursor (issue #196). The data is self-healed,
+            but recent consumers (webhooks, StreamEvents subscribers) may
+            have already seen now-reverted events.
+          runbook_url: "docs/runbooks/alerts.md#tridentindexerreorgdetected"
+
+      - alert: TridentIndexerRPCBreakerOpen
+        expr: trident_indexer_rpc_breaker_state == 1
+        for: 5m
+        labels:
+          severity: critical
+          service: indexer
+        annotations:
+          summary: "Trident indexer RPC circuit breaker is open — ingestion is paused"
+          description: >
+            trident_indexer_rpc_breaker_state has been 1 (Open) for 5
+            minutes: the breaker tripped on repeated RPC failures
+            (trident_indexer_rpc_consecutive_failures) and every poll is
+            being skipped until the cooldown elapses and a probe call
+            succeeds. Ingestion is fully paused — this compounds directly
+            into TridentIndexerLagWarning/Critical if the upstream RPC stays
+            down.
+          runbook_url: "docs/runbooks/alerts.md#tridentindexerrpcbreakeropen"
+
+      - alert: TridentIndexerLedgerGapsPresent
+        expr: trident_indexer_ledger_gaps_total > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: "Trident indexer has {{ $value | humanize }} open ledger gap(s)"
+          description: >
+            trident_indexer_ledger_gaps_total has been above 0 for 15
+            minutes. The periodic gap scan found one or more contiguous
+            runs of missing ledger_metadata sequences that have not yet
+            closed (issue #216) — soroban_events is incomplete for those
+            ledgers until the backfill queue catches up.
+          runbook_url: "docs/runbooks/alerts.md#tridentindexerledgergapspresent"
+
+  # ---------------------------------------------------------------------------
+  # Maintenance-job failures with no alert yet (issue #771): the daily
+  # partition-maintenance job (ensure_future_event_partitions) previously
+  # only logged a tracing::error! on failure with nothing watching it; the
+  # retention-pruning job already emitted trident_retention_job_failure_total
+  # but nothing alerted on it either.
+  # ---------------------------------------------------------------------------
+  - name: trident.indexer.maintenance
+    rules:
+      - alert: TridentIndexerPartitionMaintenanceFailing
+        expr: increase(trident_indexer_partition_maintenance_failures_total[1d]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: "Trident indexer partition-maintenance job failed"
+          description: >
+            ensure_future_event_partitions failed on its daily run (issue
+            #431). This directly feeds trident_indexer_partition_lookahead_ledgers
+            — repeated failures compound toward
+            TridentPartitionExhaustionWarning/Exhausted. Check the indexer
+            logs for the "failed to run ensure_future_event_partitions"
+            error for the underlying cause (permissions, lock contention,
+            a full partition table).
+          runbook_url: "docs/runbooks/alerts.md#tridentindexerpartitionmaintenancefailing"
+
+      - alert: TridentRetentionJobFailing
+        expr: increase(trident_retention_job_failure_total[1d]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: "Trident event-retention pruning job failed"
+          description: >
+            prune_soroban_events failed on its daily run (issue #482).
+            soroban_events will keep growing past its intended retention
+            window until this succeeds again, which risks the disk-capacity
+            alerts above (trident.storage.capacity) firing sooner than
+            projected.
+          runbook_url: "docs/runbooks/alerts.md#tridentretentionjobfailing"
 

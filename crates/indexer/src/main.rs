@@ -3,13 +3,13 @@ use std::net::SocketAddr;
 use clap::{Parser, Subcommand};
 use opentelemetry_otlp::WithExportConfig;
 use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
 use std::time::Duration;
+use tokio::time;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
-use tokio::time;
-use sqlx::PgPool;
 
 mod alerting;
 mod config;
@@ -22,6 +22,7 @@ mod reconcile;
 mod redis_stream;
 mod rpc;
 mod spec;
+mod spec_sync;
 mod storage;
 mod streamer;
 /// Scheduled testnet ingest-correctness suite (issue #419). Test-only; compiled
@@ -100,10 +101,10 @@ async fn run_replay(
         .map_err(|_| "DATABASE_URL must be set to use `trident-indexer replay`")?;
     let db = sqlx::PgPool::connect(&database_url).await?;
 
-    // Replayed rows must be tagged with this deployment's actual network
-    // (issue #595) — `failed_events` has no network column of its own, so
-    // there is nothing to recover it from other than the same `NETWORK` env
-    // var the daemon validates at startup.
+    // Replay is scoped to this deployment's network: only `failed_events` rows
+    // tagged with the same `NETWORK` the daemon validates at startup are listed
+    // or replayed, and replayed events are written under that network (issue
+    // #595).
     let network =
         config::normalize_network(&std::env::var("NETWORK").unwrap_or_else(|_| "testnet".into()))?;
 
@@ -114,7 +115,7 @@ async fn run_replay(
     // everything.
     let list = list || (!all && id.is_none());
     if list {
-        print_pending(&db, limit).await?;
+        print_pending(&db, &network, limit).await?;
     }
     if !all && id.is_none() {
         return Ok(());
@@ -124,7 +125,7 @@ async fn run_replay(
     // full pending table before replaying just that one row.
     let ids: Vec<uuid::Uuid> = match id {
         Some(id) => vec![id],
-        None => db::list_pending_failed_events(&db, limit)
+        None => db::list_pending_failed_events(&db, &network, limit)
             .await?
             .into_iter()
             .map(|row| row.id)
@@ -197,6 +198,12 @@ async fn run_partition_check(min_headroom_ledgers: i64) -> Result<(), Box<dyn st
             pool_max_idle_per_host: cfg.rpc_pool_max_idle_per_host,
             tcp_keepalive: cfg.rpc_tcp_keepalive,
             max_calls_per_sec: cfg.rpc_max_calls_per_sec,
+            headers: Vec::new(),
+            // Merge the global and per-endpoint sets once, at construction:
+            // each endpoint then gets exactly the headers it should send.
+            endpoint_headers: (0..cfg.stellar_rpc_urls.len())
+                .map(|index| cfg.rpc_headers.for_endpoint(index))
+                .collect(),
         },
     )?;
     let tip = rpc.get_latest_ledger().await?;
@@ -223,10 +230,14 @@ async fn run_partition_check(min_headroom_ledgers: i64) -> Result<(), Box<dyn st
     Ok(())
 }
 
-async fn print_pending(db: &sqlx::PgPool, limit: i64) -> Result<(), Box<dyn std::error::Error>> {
-    let pending = db::list_pending_failed_events(db, limit).await?;
+async fn print_pending(
+    db: &sqlx::PgPool,
+    network: &str,
+    limit: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pending = db::list_pending_failed_events(db, network, limit).await?;
     if pending.is_empty() {
-        println!("No pending failed_events rows.");
+        println!("No pending failed_events rows for network {network}.");
         return Ok(());
     }
     println!(
@@ -253,20 +264,44 @@ fn init_tracer() -> Option<opentelemetry_sdk::trace::Tracer> {
     let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok()?;
     let sampling_ratio = std::env::var("OTEL_SAMPLING_RATIO")
         .ok()
-        .and_then(|s| s.parse::<f64>().ok())
+        .and_then(|s| {
+            let parsed = s.parse::<f64>().ok();
+            if !matches!(parsed, Some(v) if (0.0..=1.0).contains(&v)) {
+                eprintln!(
+                    "invalid OTEL_SAMPLING_RATIO {s:?}, must be a float in [0,1]; falling back to default"
+                );
+                return None;
+            }
+            parsed
+        })
         .unwrap_or(0.1);
 
     opentelemetry::global::set_text_map_propagator(
         opentelemetry_sdk::propagation::TraceContextPropagator::new(),
     );
 
+    // Issue #762: traces include request paths, contract ids, key ids and
+    // error messages, so the exporter connection defaults to TLS. Insecure
+    // (plaintext) requires an explicit opt-in via the standard OTel env var
+    // — e.g. for a local collector sidecar in development. Collector auth
+    // headers (OTEL_EXPORTER_OTLP_HEADERS) are already read automatically by
+    // opentelemetry-otlp's tonic exporter, so no extra wiring is needed here.
+    let insecure = std::env::var("OTEL_EXPORTER_OTLP_INSECURE")
+        .ok()
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false);
+
+    let mut tonic_exporter = opentelemetry_otlp::new_exporter()
+        .tonic()
+        .with_endpoint(endpoint);
+    if !insecure {
+        tonic_exporter =
+            tonic_exporter.with_tls_config(tonic::transport::ClientTlsConfig::new());
+    }
+
     match opentelemetry_otlp::new_pipeline()
         .tracing()
-        .with_exporter(
-            opentelemetry_otlp::new_exporter()
-                .tonic()
-                .with_endpoint(endpoint),
-        )
+        .with_exporter(tonic_exporter)
         .with_trace_config(
             opentelemetry_sdk::trace::Config::default()
                 .with_sampler(opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(
@@ -288,35 +323,67 @@ fn init_tracer() -> Option<opentelemetry_sdk::trace::Tracer> {
 
 /// Runs `ensure_future_event_partitions` once per day so the events table's
 /// partition ceiling never catches up with the live chain tip (issue #431).
+/// Guarded by advisory lock to run on one replica (issue #731).
 async fn maintain_partitions(pool: PgPool) {
     let mut interval = time::interval(Duration::from_secs(86400)); // Once per day
+    // Delay first run to avoid re-running on every restart/crash-loop
+    tokio::time::sleep(Duration::from_secs(60)).await;
     loop {
-        interval.tick().await;
-        if let Err(e) = sqlx::query("SELECT ensure_future_event_partitions(3)")
-            .execute(&pool)
+        // Try to acquire advisory lock
+        let mut locked = false;
+        if let Ok(row) = sqlx::query_as::<_, (bool,)>("SELECT pg_try_advisory_lock(123456789, 1)")
+            .fetch_one(&pool)
             .await
         {
-            tracing::error!(error = %e, "failed to run ensure_future_event_partitions");
+            locked = row.0;
         }
+        if locked {
+            if let Err(e) = sqlx::query("SELECT ensure_future_event_partitions(3)")
+                .execute(&pool)
+                .await
+            {
+                tracing::error!(error = %e, "failed to run ensure_future_event_partitions");
+                metrics::record_partition_maintenance_failure();
+            }
+            let _ = sqlx::query("SELECT pg_advisory_unlock(123456789, 1)")
+                .execute(&pool)
+                .await;
+        }
+        interval.tick().await;
     }
 }
 
 /// Prunes `soroban_events` rows older than `days` once per day (issue #482).
+/// Guarded by advisory lock to run on one replica (issue #731).
 async fn run_retention_job(pool: PgPool, days: u64) {
     let mut interval = time::interval(Duration::from_secs(86400));
+    // Delay first run to avoid re-running on every restart/crash-loop
+    tokio::time::sleep(Duration::from_secs(90)).await;
     loop {
-        interval.tick().await;
-        match sqlx::query("SELECT prune_soroban_events($1)")
-            .bind(days as i64)
-            .execute(&pool)
+        let mut locked = false;
+        if let Ok(row) = sqlx::query_as::<_, (bool,)>("SELECT pg_try_advisory_lock(123456789, 2)")
+            .fetch_one(&pool)
             .await
         {
-            Ok(_) => metrics::record_retention_job_success(),
-            Err(e) => {
-                tracing::error!(error = %e, "retention job failed");
-                metrics::record_retention_job_failure();
-            }
+            locked = row.0;
         }
+        if locked {
+            match sqlx::query("SELECT prune_soroban_events($1)")
+                .bind(days as i64)
+                .execute(&pool)
+                .await
+            {
+                Ok(_) => metrics::record_retention_job_success(),
+                Err(e) => {
+                    tracing::error!(error = %e, "retention job failed");
+                    metrics::record_retention_job_failure();
+                }
+            }
+            let _ = sqlx::query("SELECT pg_advisory_unlock(123456789, 2)")
+                .execute(&pool)
+                .await;
+        }
+        interval.tick().await;
     }
 }
 
@@ -386,17 +453,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Database connected with timeout defaults"
     );
 
+    // Redis connection is owned by the outbox relay which can reconnect with backoff (issue #732).
     let redis_client = redis::Client::open(cfg.redis_url.as_str())?;
-    let redis_conn = redis_client.get_multiplexed_async_connection().await?;
-    tracing::info!("Redis connected");
+    let redis_conn = match redis_client.get_multiplexed_async_connection().await {
+        Ok(conn) => {
+            tracing::info!("Redis connected");
+            Some(conn)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Redis unreachable at startup; starting without Redis (relay will reconnect)");
+            None
+        }
+    };
 
     // Spawn health and readiness endpoints on HEALTH_PORT (default 8080, separate
     // from the Prometheus /metrics listener on METRICS_PORT) (#206).
     let health_addr: SocketAddr = ([0, 0, 0, 0], cfg.health_port).into();
     let health_db = db_pool.clone();
     let health_redis_url = cfg.redis_url.clone();
+    let health_network = cfg.network.clone();
     tokio::spawn(async move {
-        health::serve(health_addr, health_db, health_redis_url).await;
+        health::serve(health_addr, health_db, health_redis_url, health_network).await;
     });
 
     let shutdown = CancellationToken::new();
@@ -427,17 +504,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shutdown_trigger.cancel();
     });
 
-    // Outbox relay (issue #200): the poll loop only commits events; this task
+    // Outbox relay (issue #200,#732): the poll loop only commits events; this task
     // delivers them to Redis. It runs alongside the streamer and stops on the
-    // same shutdown signal.
-    let mut relay = redis_stream::relay::OutboxRelay::new(
+    // same shutdown signal. Relay manages its own Redis connection with reconnect.
+    let mut relay = redis_stream::relay::OutboxRelay::new_with_config(
         db_pool.clone(),
-        redis_conn.clone(),
+        cfg.redis_url.clone(),
+        redis_conn,
         redis_stream::relay::RelayConfig {
             interval: cfg.outbox_poll_interval,
             batch_size: cfg.outbox_batch_size,
             backlog_alert_threshold: cfg.outbox_backlog_alert_threshold,
             stream_maxlen: cfg.redis_stream_maxlen,
+            network: cfg.network.clone(),
         },
     );
     let relay_shutdown = shutdown.clone();
@@ -459,6 +538,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 pool_max_idle_per_host: cfg.rpc_pool_max_idle_per_host,
                 tcp_keepalive: cfg.rpc_tcp_keepalive,
                 max_calls_per_sec: cfg.rpc_max_calls_per_sec,
+                headers: Vec::new(),
+                endpoint_headers: (0..cfg.stellar_rpc_urls.len())
+                    .map(|index| cfg.rpc_headers.for_endpoint(index))
+                    .collect(),
             },
         )?;
         let reconciler = reconcile::Reconciler::new(&cfg, db_pool.clone(), reconcile_rpc);
@@ -501,6 +584,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
+
+    // Flush OpenTelemetry spans on shutdown (issue #733)
+    opentelemetry::global::shutdown_tracer_provider();
+
     result?;
 
     tracing::info!("Trident indexer stopped");

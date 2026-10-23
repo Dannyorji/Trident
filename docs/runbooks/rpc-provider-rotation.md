@@ -71,18 +71,14 @@ this is expected, not a bug to work around mid-rotation.
 **Current failover behaviour, so you know what you are actually
 configuring**: `RpcClient::with_endpoints` (`crates/indexer/src/rpc/mod.rs`)
 scores every configured endpoint in memory (0-100, via
-`crates/indexer/src/rpc/health.rs`) and sends *every* call to whichever
-scores highest at that moment — there is no sticky "active" endpoint and no
-per-endpoint cooldown. Scores reset to 100 on every restart. **This means
-`RPC_FAILOVER_THRESHOLD` and `RPC_ENDPOINT_COOLDOWN_MS`, despite being
-documented in [`../ENVIRONMENT.md`](../ENVIRONMENT.md) and
-[`../deployment.md`](../deployment.md) as if they govern live failover
-behaviour, are parsed into config and then never read anywhere in the
-running indexer** — the cooldown-based `EndpointPool` type that would
-consume them (`crates/indexer/src/rpc/endpoints.rs`) is dead code, by its
-own header comment. Do not plan a rotation around those two variables
-actually doing anything; they are a known documentation/implementation gap,
-separate from this issue, worth its own follow-up. What a multi-URL
+`crates/indexer/src/rpc/health.rs`) and sends calls to the highest-scoring
+endpoint, with a sticky selection (a challenger must lead by a hysteresis
+margin) and a per-endpoint circuit breaker. An endpoint that fails
+`RPC_BREAKER_FAILURE_THRESHOLD` consecutive times is parked for
+`RPC_BREAKER_COOLDOWN_MS` and then probed again. Scores reset to 100 on every
+restart. `RPC_FAILOVER_THRESHOLD` and `RPC_ENDPOINT_COOLDOWN_MS` were removed
+(issue #737) because nothing ever read them — setting either now fails
+startup, so plan a rotation around the `RPC_BREAKER_*` pair instead. What a multi-URL
 `STELLAR_RPC_URLS` list actually buys you today is per-call best-of-N
 routing by live health score, not threshold-and-cooldown failover.
 
@@ -217,11 +213,9 @@ afterward that the gap closed.
 
 - [ ] A real walkthrough against staging by someone who did not write this
       document — issue #684's own "done when" criterion.
-- [ ] `RPC_FAILOVER_THRESHOLD`/`RPC_ENDPOINT_COOLDOWN_MS` either wired up to
-      match what `../deployment.md` and `../ENVIRONMENT.md` already claim
-      they do, or those two docs corrected to describe the real per-call
-      health-scoring behaviour instead. Found while writing this runbook;
-      out of scope for issue #684 itself, but it is exactly the kind of gap
-      that misleads an operator mid-rotation.
+- [x] `RPC_FAILOVER_THRESHOLD`/`RPC_ENDPOINT_COOLDOWN_MS` removed and the
+      docs corrected to describe the real health-scoring behaviour (issue
+      #737): the effective failover knobs are `RPC_BREAKER_FAILURE_THRESHOLD`
+      and `RPC_BREAKER_COOLDOWN_MS`.
 - [ ] A reusable script wrapping the precondition `curl` calls above, rather
       than operators retyping them per rotation.

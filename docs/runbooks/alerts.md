@@ -979,6 +979,42 @@ giving earlier warning than `TridentOutboxBacklogWarning` alone.
 
 ---
 
+## TridentOutboxUndecodablePayloads
+
+**Means:** `trident_indexer_outbox_undecodable_total` increased in the last
+hour. The relay found an `event_outbox` row whose stored JSON could not be
+decoded back into a `SorobanEvent` and dead-lettered it (issue #739).
+
+**Why this threshold:** such a row can never be published — retrying cannot
+turn an undecodable payload into a valid one — so the relay marks it instead
+of blocking the queue. The row stays `published = FALSE` (nothing reached
+Redis), is excluded from `trident_indexer_outbox_backlog`, and is retained in
+`event_outbox` with `dead_lettered_at`/`dead_letter_reason` for audit. The
+event is lost to live subscribers, so any increase is worth investigating.
+
+**First steps:**
+1. Find the dead-lettered rows:
+   `SELECT seq, event_id, created_at, dead_letter_reason FROM event_outbox
+   WHERE dead_lettered_at IS NOT NULL ORDER BY seq DESC LIMIT 20;`
+2. Check the relay log for `Undecodable outbox payload, dead-lettering` —
+   it carries the `seq`, `event_id` and full decode error.
+3. Compare the row's `payload` against the current `SorobanEvent` schema
+   (`crates/common/src/types.rs`). A single bad row may be a producer bug; a
+   burst right after a deploy usually means a payload-shape change shipped
+   without a migration or a versioned decoder.
+4. Do not delete the rows while investigating — they are the only copy of
+   the affected events outside `soroban_events`. The original event is still
+   in `soroban_events` (the outbox row references it by deterministic
+   `event_id`), so REST clients can still retrieve it; only stream delivery
+   was skipped.
+5. If the payload shape is understood and fixable, republish by clearing
+   `dead_lettered_at` after correcting the payload (or let a backfill
+   re-commit the event). Note that `published = FALSE AND dead_lettered_at
+   IS NULL` is the relay's fetch predicate, so clearing the marker alone is
+   enough to retry.
+
+---
+
 ## TridentDeadLetteredEventsHigh
 
 **Means:** `trident_indexer_dead_lettered_total` increased in the last
@@ -1157,3 +1193,103 @@ considers this endpoint close to unusable, not merely degraded.
 
 **Escalation:** `severity: page` — this endpoint is near-unusable by the
 scorer's own floor.
+
+## APIAvailabilityFastBurn
+
+**Means:** over 7.2% of API requests returned a 5xx status for both the last
+5 minutes and the last 1 hour (docs/slo.md SLO 3, target 99.5% non-5xx),
+consuming the 28-day error budget at 14.4x — exhausted in under 2 days if
+sustained.
+
+**Why this threshold:** same multi-burn-rate pattern as
+`IngestFreshnessFastBurn` — both the short and long window must agree before
+paging, so a momentary spike alone does not fire this.
+
+**First steps:**
+1. Check whether `TridentAPIHTTP5xxRateHigh` / `TridentAPIHTTP5xxRateCritical`
+   (monitoring/alerts.yml) is also firing — this is the same underlying
+   signal, framed as error-budget consumption instead of a flat threshold.
+2. Check recent deploys to `services/api` for a regression.
+3. Check whether Postgres or Redis availability is degraded — a dependency
+   outage surfaces here before it surfaces anywhere else.
+
+**Escalation:** `severity: page`.
+
+## APIAvailabilitySlowBurn
+
+**Means:** over 3% of API requests returned a 5xx status for a sustained
+share of both the last 30 minutes and the last 6 hours — 6x the error
+budget, exhausted in ~5 days if sustained.
+
+**Why this threshold:** longer windows than the fast-burn rule so this
+doesn't fire on a blip the fast-burn rule would already have caught.
+
+**First steps:** same diagnostic steps as `APIAvailabilityFastBurn`, with
+lower urgency — this is a leading indicator, not an active outage.
+
+**Escalation:** `severity: ticket`.
+
+## APIReadLatencyFastBurn
+
+**Means:** over 72% of GET requests exceeded the 500ms p95 target
+(docs/slo.md SLO 2) for both the last 5 minutes and the last 1 hour — 14.4x
+the error budget (33.6h over 28 days), exhausted in under 2 days if
+sustained.
+
+**Why this threshold:** GET routes (`/v1/events`, `/v1/health`, etc.) are
+read-only and expected to be fast; this is split from write-route latency
+below because the 500ms target is tighter than the 1s write-route target.
+
+**First steps:**
+1. Check `trident_api_http_request_duration_seconds_bucket{method="GET"}`
+   directly to see which route(s) are slow, if the `route` label narrows it
+   down.
+2. Check Postgres query latency and connection pool saturation
+   (`TridentIndexerDBPoolSaturated` if also firing) — read routes are
+   typically DB-bound.
+3. Check whether this correlates with a recent deploy or a traffic spike.
+
+**Escalation:** `severity: page`.
+
+## APIReadLatencySlowBurn
+
+**Means:** over 30% of GET requests exceeded the 500ms p95 target for a
+sustained share of both the last 30 minutes and the last 6 hours.
+
+**Why this threshold:** 6x burn rate over longer windows — a leading
+indicator, not yet urgent enough to page.
+
+**First steps:** same diagnostic steps as `APIReadLatencyFastBurn`, with
+lower urgency.
+
+**Escalation:** `severity: ticket`.
+
+## APIWriteLatencyFastBurn
+
+**Means:** over 72% of non-GET requests exceeded the 1s p95 target
+(docs/slo.md SLO 2) for both the last 5 minutes and the last 1 hour.
+
+**Why this threshold:** write/heavier routes (anything invoking gRPC +
+Postgres) get a looser 1s target than reads; same 14.4x fast-burn pattern.
+
+**First steps:**
+1. Check `trident_api_http_request_duration_seconds_bucket{method!="GET"}`
+   to see which route(s) are slow.
+2. Check the gRPC API's own latency/error metrics — write routes typically
+   proxy through `grpcApi`.
+3. Check Postgres write latency and lock contention.
+
+**Escalation:** `severity: page`.
+
+## APIWriteLatencySlowBurn
+
+**Means:** over 30% of non-GET requests exceeded the 1s p95 target for a
+sustained share of both the last 30 minutes and the last 6 hours.
+
+**Why this threshold:** 6x burn rate over longer windows — a leading
+indicator, not yet urgent enough to page.
+
+**First steps:** same diagnostic steps as `APIWriteLatencyFastBurn`, with
+lower urgency.
+
+**Escalation:** `severity: ticket`.

@@ -78,7 +78,8 @@ metrics-exporter-prometheus = "0.18"
 
 # OpenTelemetry distributed tracing (issue #81)
 opentelemetry = { version = "0.22", features = ["trace"] }
-opentelemetry-otlp = { version = "0.15", features = ["grpc-tonic"] }
+opentelemetry-otlp = { version = "0.15", features = ["grpc-tonic", "tls"] }
+tonic = { version = "0.11", features = ["tls"] }
 opentelemetry_sdk = { version = "0.22", features = ["rt-tokio"] }
 tracing-opentelemetry = "0.23"
 
